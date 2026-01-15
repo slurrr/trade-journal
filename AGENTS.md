@@ -80,3 +80,5 @@ All Python code MUST adhere to:
 
 - ruff (using repo ruff.toml)
 - pyright (default settings unless overridden)
+
+Ruff + Pyright are hygiene only; no refactors requested
