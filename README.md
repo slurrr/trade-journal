@@ -1,0 +1,58 @@
+# ApeX Trade Journal
+
+A private, local-first trade journal that automatically imports data from
+ApeX Omni and provides analytics similar to Tradezella.
+
+This project is optimized for:
+
+- Personal use
+- Transparency
+- Extendability
+- Low operational complexity
+
+## What This Is
+
+- An automated trade journal
+- A post-trade analytics tool
+- A local dashboard for understanding trading behavior
+
+## What This Is Not
+
+- A SaaS product
+- A social platform
+- A polished clone with full feature parity
+- A locked-down or over-specified system
+
+## Core Capabilities (current / intended)
+
+- Automatic import from ApeX Omni
+- Trade reconstruction from source data
+- Per-trade and aggregate analytics
+- Metrics such as MAE, MFE, ETD, expectancy
+- Browser-based local dashboard
+
+## Project Status
+
+Active development.
+Structure and features may evolve as the system grows.
+
+## Repository Structure (high-level)
+
+- `/reference/` — Non-binding research and background material
+- `/src/` — Application code (subject to change)
+- Root docs — Guardrails and contributor context
+
+## Contributing
+
+This is primarily a personal project.
+If you are contributing:
+
+- Keep changes additive where possible
+- Avoid large refactors without discussion
+- Favor clarity over abstraction
+
+## Design Principles
+
+- Ground truth first
+- Explainability over optimization
+- Guardrails, not handcuffs
