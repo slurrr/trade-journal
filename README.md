@@ -1,4 +1,4 @@
-# ApeX Trade Journal
+# ApeX Trade Journal 
 
 A private, local-first trade journal that automatically imports data from
 ApeX Omni and provides analytics similar to Tradezella.
@@ -6,7 +6,7 @@ ApeX Omni and provides analytics similar to Tradezella.
 This project is optimized for:
 
 - Personal use
-- Transparency
+- Transparency 
 - Extendability
 - Low operational complexity
 

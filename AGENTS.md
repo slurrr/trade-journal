@@ -64,3 +64,19 @@ Reference documents inform judgment but do not dictate design.
 - Hidden coupling
 - Implicit state
 - “This will be useful later” abstractions
+
+## Development Environment (Invariant)
+
+- A local virtual environment at `.venv/` is mandatory
+- All tooling must run inside the active `.venv`
+- Install the package in editable mode before development:
+  - `pip install -e .`
+
+Do not modify `sys.path` or bypass the environment.
+
+## Tooling & Style (Binding)
+
+All Python code MUST adhere to:
+
+- ruff (using repo ruff.toml)
+- pyright (default settings unless overridden)
