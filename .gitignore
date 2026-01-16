@@ -43,4 +43,4 @@ exports/
 *.log
 
 # User-requested
-/tests/
+tests/

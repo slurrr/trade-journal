@@ -1,6 +1,6 @@
 # ApeX Trade Journal
 
-A private, local-first trade journal that automatically imports data from
+A private, local-first trade journal based on the popular Tradezella product that automatically imports data from
 ApeX Omni and provides analytics similar to Tradezella.
 
 This project is optimized for:
@@ -38,8 +38,9 @@ Structure and features may evolve as the system grows.
 
 ## Repository Structure (high-level)
 
-- `/reference/` — Non-binding research and background material
-- `/src/` — Application code (subject to change)
+- `reference/` — Non-binding research and background material
+- `src/` — Application code (subject to change)
+- `data/` — temporary local storage
 - Root docs — Guardrails and contributor context
 
 ## Contributing

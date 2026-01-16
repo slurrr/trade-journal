@@ -23,6 +23,7 @@ trade-journal-fetch-funding = "trade_journal.fetch_funding:main"
 trade-journal-reconcile = "trade_journal.reconcile:main"
 trade-journal-sample-fills = "trade_journal.sample_fills:main"
 trade-journal-sanity-report = "trade_journal.sanity_report:main"
+trade-journal-metrics = "trade_journal.metrics_summary:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
