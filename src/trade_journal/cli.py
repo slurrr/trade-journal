@@ -1,0 +1,103 @@
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+from trade_journal.ingest.apex_api import load_dotenv
+from trade_journal.ingest.apex_funding import load_funding
+from trade_journal.ingest.apex_omni import load_fills
+from trade_journal.metrics.excursions import apply_trade_excursions
+from trade_journal.pricing.apex_prices import ApexPriceClient, PriceSeriesConfig
+from trade_journal.reconstruct.funding import apply_funding_events
+from trade_journal.reconstruct.trades import reconstruct_trades
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Reconstruct trades from ApeX Omni fills export.")
+    parser.add_argument(
+        "fills_path",
+        type=Path,
+        nargs="?",
+        default=Path("data/fills.json"),
+        help="Path to ApeX fills export (json/csv/tsv).",
+    )
+    parser.add_argument(
+        "--utc",
+        action="store_true",
+        help="Print timestamps in UTC instead of local timezone.",
+    )
+    parser.add_argument(
+        "--funding",
+        type=Path,
+        default=None,
+        help="Optional funding export (json/csv/tsv) to apply to trades.",
+    )
+    parser.add_argument(
+        "--prices",
+        action="store_true",
+        help="Fetch price series and compute MAE/MFE/ETD for each trade.",
+    )
+    parser.add_argument("--env", type=Path, default=Path(".env"), help="Path to .env file.")
+    args = parser.parse_args(argv)
+
+    result = load_fills(args.fills_path)
+    trades = reconstruct_trades(result.fills)
+
+    if result.skipped:
+        print(f"Skipped {result.skipped} fill rows during normalization.", file=sys.stderr)
+
+    funding_path = args.funding
+    if funding_path is None:
+        default_funding = Path("data/funding.json")
+        if default_funding.exists():
+            funding_path = default_funding
+
+    if funding_path is not None:
+        funding_result = load_funding(funding_path)
+        attributions = apply_funding_events(trades, funding_result.events)
+        unmatched = sum(1 for item in attributions if item.matched_trade_id is None)
+        if funding_result.skipped:
+            print(
+                f"Skipped {funding_result.skipped} funding rows during normalization.",
+                file=sys.stderr,
+            )
+        if unmatched:
+            print(f"Unmatched funding events: {unmatched}.", file=sys.stderr)
+
+    if args.prices:
+        env = dict(os.environ)
+        env.update(load_dotenv(args.env))
+        price_client = ApexPriceClient(PriceSeriesConfig.from_env(env))
+        for trade in trades:
+            bars = price_client.fetch_bars(trade.symbol, trade.entry_time, trade.exit_time)
+            apply_trade_excursions(trade, bars)
+
+    if not trades:
+        print("No trades reconstructed.")
+        return 0
+
+    print("symbol side entry_size exit_size entry_px exit_px close_time funding pnl_net mae mfe etd")
+    for trade in trades:
+        exit_time = trade.exit_time if args.utc else trade.exit_time.astimezone()
+        entry_px = f"{trade.entry_price:.6g}"
+        exit_px = f"{trade.exit_price:.6g}"
+        close_time = exit_time.isoformat()
+        pnl_net = f"{trade.realized_pnl_net:.6g}"
+        mae = _format_metric(trade.mae)
+        mfe = _format_metric(trade.mfe)
+        etd = _format_metric(trade.etd)
+        entry_size = f"{trade.entry_size:.6g}"
+        exit_size = f"{trade.exit_size:.6g}"
+        funding = f"{trade.funding_fees:.6g}"
+        print(
+            f"{trade.symbol} {trade.side} {entry_size} {exit_size} "
+            f"{entry_px} {exit_px} {close_time} {funding} {pnl_net} {mae} {mfe} {etd}"
+        )
+
+    return 0
+
+
+def _format_metric(value: float | None) -> str:
+    return "na" if value is None else f"{value:.6g}"

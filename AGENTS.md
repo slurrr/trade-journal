@@ -45,6 +45,28 @@ Reference documents inform judgment but do not dictate design.
 - Avoid speculative generalization
 - Defer constraints unless correctness demands them
 
+## Decision Records (Required When Semantics Are Chosen)
+
+Some implementation choices materially affect analytics semantics
+(e.g., what data is authoritative, how trades are reconstructed,
+how MAE/MFE/ETD are computed).
+
+When you make such a choice:
+
+- Document it as a decision record under `/docs/decisions/`
+- Keep the record short and explicit
+- Prefer recording _after_ implementation if reality forced the decision
+
+Do NOT create decision records for:
+
+- File structure
+- Naming
+- Refactors
+- Convenience choices
+
+If unsure whether something is a decision:
+Ask, or record it anyway (cheap to do).
+
 ## Working Style
 
 - Propose before implementing when scope is non-trivial

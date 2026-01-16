@@ -1,5 +1,20 @@
 # Tradezella Clone Deep Research
 
+## Section Index
+
+- Executive Summary (What to Build First and Why)
+- TradeZella Feature Map (MVP vs Later)
+- ApeX Omni API Integration Plan (Endpoints, Auth, Sync Strategy)
+- Canonical Data Model (Tables/Entities + Fields + Indexes)
+- Trade Reconstruction Algorithm (Fills → Trades, Edge Cases)
+- Analytics & Metrics Spec (Formulas + Required Fields)
+- Architecture Option A: Fast MVP Monolith
+- Architecture Option B: Scalable Distributed Setup
+- Frontend Page Inventory + UI notes
+- Risks & Mitigations
+- Milestone Plan (week-by-week)
+- Appendix: Links, citations, and any assumptions
+
 ## Executive Summary (What to Build First and Why)
 
 **MVP Focus:** Start with a **TradeZella-inspired core journaling system** that automatically imports ApeX Omni perpetual futures trades and provides essential analytics. The first build (2–4 weeks) should deliver a single-user web app that **logs all trades, groups executions into “round trip” trades, and displays performance metrics and charts**. Key features to prioritize are: **automated trade import**, a **trades database** with fields like date, instrument, side, size, price, fees, etc.[\[1\]](https://www.luxalgo.com/blog/tradezella-review-journaling-and-backtesting-platform/#:~:text=At%20the%20heart%20of%20TradeZella%E2%80%99s,2)[\[2\]](https://www.luxalgo.com/blog/tradezella-review-journaling-and-backtesting-platform/#:~:text=Each%20logged%20trade%20includes%20critical,2), the ability to **add tags/notes to each trade**, and a **dashboard of critical performance stats** (win rate, P\&L, profit factor, etc.). By focusing on these core functions, you get immediate value – an accurate, consolidated trading journal – and create the foundation for advanced features later (e.g. strategy playbooks, trade replay). The initial architecture should be a simple **monolithic Python web app (FastAPI or Django)** with a Postgres DB and a basic React or template-based frontend, which is fastest to develop and sufficient for a single-user deployment. This monolith will handle data ingestion (periodic API pulls) and serve the UI/API in one service.
