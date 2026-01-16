@@ -72,7 +72,7 @@ def compute_trade_excursions(trade: Trade, prices: Iterable[PriceSample]) -> Exc
 
 def compute_trade_excursions_from_bars(trade: Trade, bars: Iterable[PriceBar]) -> ExcursionMetrics:
     bar_list = list(bars)
-    samples = _bar_extremes_as_samples(bar_list)
+    samples = _bar_extremes_as_samples_for_trade(bar_list, trade.entry_time, trade.exit_time)
     metrics = compute_trade_excursions(trade, samples)
     if metrics is None:
         if bar_list:
@@ -119,11 +119,21 @@ def _apply_fill_to_position(size: float, avg_entry: float, fill: Fill) -> tuple[
     return new_size, fill.price
 
 
-def _bar_extremes_as_samples(bars: Iterable[PriceBar]) -> list[PriceSample]:
+def _bar_extremes_as_samples_for_trade(
+    bars: Iterable[PriceBar],
+    entry_time: datetime,
+    exit_time: datetime,
+) -> list[PriceSample]:
     samples: list[PriceSample] = []
     for bar in bars:
+        if bar.end_time < entry_time or bar.start_time > exit_time:
+            continue
         # Use bar end time so fills inside the bar update position before extremes are applied.
+        # Clamp to the trade window to avoid excluding short trades.
         # Note: bar highs/lows may include prices before a fill within the same bar.
-        samples.append(PriceSample(timestamp=bar.end_time, price=bar.high))
-        samples.append(PriceSample(timestamp=bar.end_time, price=bar.low))
+        sample_time = min(bar.end_time, exit_time)
+        if sample_time < entry_time:
+            sample_time = entry_time
+        samples.append(PriceSample(timestamp=sample_time, price=bar.high))
+        samples.append(PriceSample(timestamp=sample_time, price=bar.low))
     return samples

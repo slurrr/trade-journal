@@ -40,6 +40,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Fetch price series and compute MAE/MFE/ETD for each trade.",
     )
     parser.add_argument("--env", type=Path, default=Path(".env"), help="Path to .env file.")
+    parser.add_argument("--out", type=Path, default=None, help="Write summary to a file instead of stdout.")
     args = parser.parse_args(argv)
 
     result = load_fills(args.fills_path)
@@ -71,14 +72,28 @@ def main(argv: list[str] | None = None) -> int:
         env.update(load_dotenv(args.env))
         price_client = ApexPriceClient(PriceSeriesConfig.from_env(env))
         for trade in trades:
-            bars = price_client.fetch_bars(trade.symbol, trade.entry_time, trade.exit_time)
-            apply_trade_excursions(trade, bars)
+            try:
+                bars = price_client.fetch_bars(trade.symbol, trade.entry_time, trade.exit_time)
+                apply_trade_excursions(trade, bars)
+            except RuntimeError as exc:
+                print(
+                    f"Price series missing for {trade.symbol} "
+                    f"{trade.entry_time.isoformat()} -> {trade.exit_time.isoformat()}: {exc}",
+                    file=sys.stderr,
+                )
 
     if not trades:
         print("No trades reconstructed.")
         return 0
 
-    print("symbol side entry_size exit_size entry_px exit_px close_time funding pnl_net mae mfe etd")
+    out_path = args.out
+    if out_path is None:
+        default_out = Path("data/trades_summary.txt")
+        if default_out.exists():
+            out_path = default_out
+
+    output = []
+    output.append("symbol side entry_size exit_size entry_px exit_px close_time funding pnl_net mae mfe etd")
     for trade in trades:
         exit_time = trade.exit_time if args.utc else trade.exit_time.astimezone()
         entry_px = f"{trade.entry_price:.6g}"
@@ -91,10 +106,17 @@ def main(argv: list[str] | None = None) -> int:
         entry_size = f"{trade.entry_size:.6g}"
         exit_size = f"{trade.exit_size:.6g}"
         funding = f"{trade.funding_fees:.6g}"
-        print(
+        output.append(
             f"{trade.symbol} {trade.side} {entry_size} {exit_size} "
             f"{entry_px} {exit_px} {close_time} {funding} {pnl_net} {mae} {mfe} {etd}"
         )
+
+    if out_path is None:
+        for line in output:
+            print(line)
+    else:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text("\n".join(output) + "\n", encoding="utf-8")
 
     return 0
 
