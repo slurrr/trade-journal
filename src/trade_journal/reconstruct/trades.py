@@ -25,6 +25,9 @@ class PositionState:
     fills: list[Fill] = field(default_factory=list)
 
 
+EPSILON = 1e-9
+
+
 def reconstruct_trades(fills: Iterable[Fill]) -> list[Trade]:
     ordered = sorted(fills, key=_sort_key)
     # Assumes one-way position mode per symbol; hedge-mode would need separate buckets.
@@ -51,7 +54,7 @@ def _sort_key(fill: Fill) -> tuple:
 def _apply_fill_to_state(state: PositionState, fill: Fill, trades: list[Trade]) -> None:
     signed_qty = fill.size if fill.side == "BUY" else -fill.size
 
-    if state.size == 0:
+    if abs(state.size) < EPSILON:
         _start_position(state, fill, signed_qty)
         return
 
@@ -108,9 +111,11 @@ def _reduce_or_reverse(state: PositionState, fill: Fill, signed_qty: float, trad
         state.fills.append(fill)
 
     remaining = abs(signed_qty) - close_qty
+    if remaining < EPSILON:
+        remaining = 0.0
     if remaining == 0:
         state.size += signed_qty
-        if abs(state.size) < 1e-12:
+        if abs(state.size) < EPSILON:
             _finalize_trade(state, fill.timestamp, trades)
             _reset_state(state)
         return

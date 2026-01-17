@@ -94,6 +94,12 @@ def _metrics_to_dict(metrics: AggregateMetrics) -> dict[str, float | int | None]
         "total_funding": metrics.total_funding,
         "avg_duration_seconds": metrics.avg_duration_seconds,
         "total_duration_seconds": metrics.total_duration_seconds,
+        "mean_mae": metrics.mean_mae,
+        "median_mae": metrics.median_mae,
+        "mean_mfe": metrics.mean_mfe,
+        "median_mfe": metrics.median_mfe,
+        "mean_etd": metrics.mean_etd,
+        "median_etd": metrics.median_etd,
     }
 
 
@@ -118,6 +124,12 @@ def _format_metrics(metrics: AggregateMetrics) -> str:
         f"total_funding {_format_float(metrics.total_funding)}",
         f"avg_duration_seconds {_format_float(metrics.avg_duration_seconds)}",
         f"total_duration_seconds {_format_float(metrics.total_duration_seconds)}",
+        f"mean_mae {_format_float(metrics.mean_mae)}",
+        f"median_mae {_format_float(metrics.median_mae)}",
+        f"mean_mfe {_format_float(metrics.mean_mfe)}",
+        f"median_mfe {_format_float(metrics.median_mfe)}",
+        f"mean_etd {_format_float(metrics.mean_etd)}",
+        f"median_etd {_format_float(metrics.median_etd)}",
     ]
     return "\n".join(lines)
 

@@ -1,0 +1,437 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="hero">
+  <div>
+    <h1>Seth's Perpetual Learning Curve</h1>
+    <p>Clean summary of your ApeX fills and reconstructed trades. No clutter, just signal.</p>
+  </div>
+  <div class="hero-card">
+    <div class="hero-label">Net P&L</div>
+    <div class="hero-value {{ 'positive' if summary.total_net_pnl and summary.total_net_pnl >= 0 else 'negative' }}">
+      {{ summary.total_net_pnl | money }}
+    </div>
+    <div class="hero-meta">
+      {{ summary.total_trades or 0 }} trades - Win rate {{ summary.win_rate | percent }}
+    </div>
+  </div>
+</section>
+
+<section class="metrics-grid">
+  <div class="metric-card">
+    <div class="metric-label">Win Rate</div>
+    <div class="metric-value">{{ summary.win_rate | percent }}</div>
+    <div class="metric-sub">Wins {{ summary.wins or 0 }} - Losses {{ summary.losses or 0 }}</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">Profit Factor</div>
+    <div class="metric-value">{{ summary.profit_factor | round(2) if summary.profit_factor is not none else 'n/a' }}</div>
+    <div class="metric-sub">Expectancy {{ summary.expectancy | money }}</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">Average Win</div>
+    <div class="metric-value">{{ summary.avg_win | money }}</div>
+    <div class="metric-sub">Average Loss {{ summary.avg_loss | money }}</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">Largest Win</div>
+    <div class="metric-value">{{ summary.largest_win | money }}</div>
+    <div class="metric-sub">Largest Loss {{ summary.largest_loss | money }}</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">Avg Hold Time</div>
+    <div class="metric-value">{{ summary.avg_duration_seconds | duration }}</div>
+    <div class="metric-sub">Max win streak {{ summary.max_consecutive_wins or 0 }}</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">MFE</div>
+    <div class="metric-value">{{ summary.median_mfe | money }}</div>
+    <div class="metric-sub">Average {{ summary.mean_mfe | money }}</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">MAE</div>
+    <div class="metric-value">{{ summary.median_mae | money }}</div>
+    <div class="metric-sub">Average {{ summary.mean_mae | money }}</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">ETD</div>
+    <div class="metric-value">{{ summary.median_etd | money }}</div>
+    <div class="metric-sub">Average {{ summary.mean_etd | money }}</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">Fees + Funding</div>
+    <div class="metric-value">{{ ((summary.total_fees or 0) + (summary.total_funding or 0)) | money }}</div>
+    <div class="metric-sub">Gross P&L {{ summary.total_gross_pnl | money }}</div>
+  </div>
+  <div class="metric-card calendar-card">
+    <div class="metric-label">Calendar Heatmap</div>
+    <div class="metric-value">{{ calendar.month_label }}</div>
+    <a class="calendar-mini" href="/calendar">
+      <div class="calendar-mini-grid">
+        {% for week in calendar.weeks %}
+          {% for day in week %}
+          <span
+            class="calendar-mini-day {{ '' if day.in_month else 'out' }}"
+            data-pnl="{{ day.pnl }}"
+          ></span>
+          {% endfor %}
+        {% endfor %}
+      </div>
+    </a>
+  </div>
+</section>
+
+<section class="chart-grid">
+  <div class="panel">
+    <div class="panel-header">
+      <div>
+        <h2>Equity Curve</h2>
+        <p>Cumulative net P&L after each trade close.</p>
+      </div>
+    </div>
+    <canvas id="equityChart" height="160"></canvas>
+  </div>
+  <div class="panel">
+    <div class="panel-header">
+      <div>
+        <h2>Daily P&L</h2>
+        <p>Net performance by trade close date.</p>
+      </div>
+    </div>
+    <canvas id="dailyChart" height="160"></canvas>
+  </div>
+  <div class="panel">
+    <div class="panel-header">
+      <div>
+        <h2>P&L Distribution</h2>
+        <p>Trade outcome spread.</p>
+      </div>
+    </div>
+    <canvas id="distChart" height="160"></canvas>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-header">
+    <div>
+      <h2>Recent Trades</h2>
+      <p>Latest closes with outcomes.</p>
+    </div>
+    <a class="ghost-link" href="/trades">View all</a>
+  </div>
+  <div class="table-wrap">
+    <table class="table">
+      <thead>
+        <tr>
+          <th>Date</th>
+          <th>Symbol</th>
+          <th>Side</th>
+          <th>Net P&L</th>
+          <th>Return</th>
+          <th>Hold</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% if recent_trades %}
+          {% for trade in recent_trades %}
+          <tr>
+            <td>{{ trade.exit_time | date_only }}</td>
+            <td>{{ trade.symbol }}</td>
+            <td><span class="pill {{ trade.side | lower }}">{{ trade.side }}</span></td>
+            <td class="{{ 'positive' if trade.realized_pnl_net >= 0 else 'negative' }}">{{ trade.realized_pnl_net | money }}</td>
+            <td>{{ trade.return_pct | percent }}</td>
+            <td>{{ trade.duration_seconds | duration }}</td>
+          </tr>
+          {% endfor %}
+        {% else %}
+          <tr><td colspan="6" class="empty">No trades loaded yet.</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-header">
+    <div>
+      <h2>Liquidations</h2>
+      <p>Times and symbols where positions were force-closed.</p>
+    </div>
+  </div>
+  <div class="table-wrap">
+    <table class="table">
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Symbol</th>
+          <th>Side</th>
+          <th>Size</th>
+          <th>P&L</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% if liquidations %}
+          {% for liq in liquidations %}
+          <tr>
+            <td>{{ liq.created_at | timestamp }}</td>
+            <td>{{ liq.symbol }}</td>
+            <td><span class="pill {{ liq.side | lower }}">{{ liq.side }}</span></td>
+            <td>{{ liq.size | round(4) }}</td>
+            <td class="{{ 'positive' if liq.total_pnl and liq.total_pnl >= 0 else 'negative' }}">{{ liq.total_pnl | money }}</td>
+          </tr>
+          {% endfor %}
+        {% else %}
+          <tr><td colspan="5" class="empty">No liquidations found.</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<script>
+  const equityData = {{ equity_curve | json | safe }};
+  const dailyData = {{ daily_pnl | json | safe }};
+  const distData = {{ pnl_distribution | json | safe }};
+
+  const zoomPlugin = window.ChartZoom || window.ChartZoomPlugin || window.chartjsPluginZoom;
+  if (zoomPlugin) {
+    Chart.register(zoomPlugin);
+  } else if (window.Chart && window.Chart.registry) {
+    const message = document.createElement('div');
+    message.className = 'notice';
+    message.textContent = 'Chart zoom plugin failed to load.';
+    document.querySelector('.app')?.prepend(message);
+  }
+
+  const equityPoints = equityData.points.map(point => ({ x: point.t, y: point.v }));
+
+  const enableDragPan = (chart, canvas) => {
+    if (!chart || !canvas || typeof chart.pan !== 'function') {
+      return;
+    }
+    let dragging = false;
+    let lastX = 0;
+    const onDown = event => {
+      dragging = true;
+      lastX = event.clientX;
+      canvas.classList.add('is-panning');
+    };
+    const onUp = () => {
+      dragging = false;
+      canvas.classList.remove('is-panning');
+    };
+    const onMove = event => {
+      if (!dragging) return;
+      const deltaX = event.clientX - lastX;
+      lastX = event.clientX;
+      chart.pan({ x: deltaX, y: 0 });
+    };
+    canvas.addEventListener('pointerdown', onDown);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointerleave', onUp);
+    window.addEventListener('pointermove', onMove);
+  };
+
+  const equityCtx = document.getElementById('equityChart');
+  if (equityCtx) {
+    const equityChart = new Chart(equityCtx, {
+      type: 'line',
+      data: {
+        datasets: [{
+          label: 'Cumulative Net P&L',
+          data: equityPoints,
+          borderColor: '#0b3d3b',
+          backgroundColor: 'rgba(11, 61, 59, 0.15)',
+          tension: 0.25,
+          fill: true,
+          pointRadius: 2,
+          pointBackgroundColor: ctx => {
+            const value = ctx.parsed.y;
+            return value >= 0 ? 'rgba(26, 118, 90, 0.9)' : 'rgba(176, 59, 40, 0.9)';
+          },
+          pointBorderColor: ctx => {
+            const value = ctx.parsed.y;
+            return value >= 0 ? 'rgba(26, 118, 90, 0.9)' : 'rgba(176, 59, 40, 0.9)';
+          },
+          segment: {
+            borderColor: ctx => {
+              const value = ctx.p1.parsed.y;
+              return value >= 0 ? 'rgba(26, 118, 90, 0.9)' : 'rgba(176, 59, 40, 0.9)';
+            },
+            backgroundColor: ctx => {
+              const value = ctx.p1.parsed.y;
+              return value >= 0 ? 'rgba(26, 118, 90, 0.15)' : 'rgba(176, 59, 40, 0.15)';
+            },
+          },
+        }],
+      },
+      options: {
+        responsive: true,
+        interaction: {
+          mode: 'index',
+          intersect: false,
+        },
+        events: ['mousemove', 'mouseout', 'click', 'touchstart', 'touchmove', 'mousedown', 'mouseup'],
+        scales: {
+          x: {
+            type: 'time',
+            time: {
+              displayFormats: {
+                month: 'MMM yyyy',
+                week: 'MMM d',
+                day: 'MMM d',
+                hour: 'MMM d, h a',
+              },
+            },
+            ticks: {
+              autoSkip: true,
+              autoSkipPadding: 18,
+              maxTicksLimit: 7,
+              maxRotation: 0,
+            },
+            grid: { display: false },
+          },
+          y: { grid: { color: 'rgba(0,0,0,0.06)' } },
+        },
+        plugins: {
+          legend: { display: false },
+          zoom: {
+            zoom: {
+              wheel: { enabled: true },
+              pinch: { enabled: true },
+              mode: 'x',
+            },
+            pan: {
+              enabled: true,
+              mode: 'x',
+              threshold: 2,
+              modifierKey: null,
+            },
+          },
+        },
+      },
+    });
+    equityCtx.addEventListener('dblclick', () => equityChart.resetZoom());
+    enableDragPan(equityChart, equityCtx);
+  }
+
+  const dailyPoints = dailyData.series.map(point => ({ x: point.day, y: point.pnl }));
+
+  const dailyCtx = document.getElementById('dailyChart');
+  if (dailyCtx) {
+    const dailyChart = new Chart(dailyCtx, {
+      type: 'bar',
+      data: {
+        datasets: [{
+          data: dailyPoints,
+          backgroundColor: dailyPoints.map(point => point.y >= 0 ? 'rgba(26, 118, 90, 0.7)' : 'rgba(176, 59, 40, 0.7)'),
+          borderRadius: 6,
+        }],
+      },
+      options: {
+        responsive: true,
+        interaction: {
+          mode: 'index',
+          intersect: false,
+        },
+        events: ['mousemove', 'mouseout', 'click', 'touchstart', 'touchmove', 'mousedown', 'mouseup'],
+        scales: {
+          x: {
+            type: 'time',
+            time: {
+              displayFormats: {
+                month: 'MMM yyyy',
+                week: 'MMM d',
+                day: 'MMM d',
+              },
+            },
+            ticks: {
+              autoSkip: true,
+              autoSkipPadding: 18,
+              maxTicksLimit: 7,
+              maxRotation: 0,
+            },
+            grid: { display: false },
+          },
+          y: { grid: { color: 'rgba(0,0,0,0.06)' } },
+        },
+        plugins: {
+          legend: { display: false },
+          zoom: {
+            zoom: {
+              wheel: { enabled: true },
+              pinch: { enabled: true },
+              mode: 'x',
+            },
+            pan: {
+              enabled: true,
+              mode: 'x',
+              threshold: 2,
+              modifierKey: null,
+            },
+          },
+        },
+      },
+    });
+    dailyCtx.addEventListener('dblclick', () => dailyChart.resetZoom());
+    enableDragPan(dailyChart, dailyCtx);
+  }
+
+  const distLabels = distData.bins.map(bin => bin.label);
+  const distValues = distData.bins.map(bin => bin.count);
+  const distColors = distData.bins.map(bin => {
+    if (bin.side === 'neg') return 'rgba(176, 59, 40, 0.7)';
+    if (bin.side === 'pos') return 'rgba(26, 118, 90, 0.7)';
+    return '#d0a253';
+  });
+
+  const distCtx = document.getElementById('distChart');
+  if (distCtx) {
+    const distChart = new Chart(distCtx, {
+      type: 'bar',
+      data: {
+        labels: distLabels,
+        datasets: [{
+          data: distValues,
+          backgroundColor: distColors,
+          borderRadius: 6,
+        }],
+      },
+      options: {
+        responsive: true,
+        interaction: {
+          mode: 'index',
+          intersect: false,
+        },
+        events: ['mousemove', 'mouseout', 'click', 'touchstart', 'touchmove'],
+        scales: {
+          x: {
+            grid: { display: false },
+            ticks: { display: false },
+          },
+          y: {
+            grid: { display: false },
+            ticks: { display: false },
+          },
+        },
+        plugins: { legend: { display: false } },
+      },
+    });
+    distCtx.addEventListener('dblclick', () => distChart.resetZoom());
+  }
+
+  const miniDays = document.querySelectorAll('.calendar-mini-day');
+  if (miniDays.length) {
+    const maxAbs = Math.max(...Array.from(miniDays).map(item => Math.abs(Number(item.dataset.pnl || 0))), 1);
+    miniDays.forEach(day => {
+      const value = Number(day.dataset.pnl || 0);
+      if (!value) return;
+      const intensity = Math.min(Math.abs(value) / maxAbs, 1);
+      const color = value < 0
+        ? `rgba(176, 59, 40, ${0.15 + 0.55 * intensity})`
+        : `rgba(26, 118, 90, ${0.15 + 0.55 * intensity})`;
+      day.style.background = color;
+    });
+  }
+</script>
+{% endblock %}

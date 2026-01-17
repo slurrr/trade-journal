@@ -108,6 +108,13 @@ class ApexApiClient:
         }
         return self._request("GET", "/v3/historical-pnl", params=params)
 
+    def fetch_history_orders(self, limit: int | None = None, page: int = 0) -> Mapping[str, Any]:
+        params = {
+            "limit": str(limit if limit is not None else self._config.fills_limit),
+            "page": str(page),
+        }
+        return self._request("GET", "/v3/history-orders", params=params)
+
     def fetch_funding(
         self,
         limit: int | None = None,

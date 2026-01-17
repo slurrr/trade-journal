@@ -1,0 +1,256 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="page-header">
+  <div>
+    <h1>Calendar</h1>
+    <p>Daily performance heatmap for {{ calendar.month_label }}.</p>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-header">
+    <div>
+      <h2>Calendar</h2>
+      <p>Click a day to view that session's trades.</p>
+    </div>
+    <div class="month-wheel" id="monthWheel">
+      <div class="month-wheel-current" id="monthWheelCurrent">{{ calendar.month_label }}</div>
+      <div class="month-wheel-list" id="monthWheelList" aria-hidden="true">
+        {% for option in calendar.month_options %}
+        <div class="month-wheel-item" data-month="{{ option.key }}">{{ option.label }}</div>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+
+  <div class="calendar-grid">
+    <div class="calendar-header">Mon</div>
+    <div class="calendar-header">Tue</div>
+    <div class="calendar-header">Wed</div>
+    <div class="calendar-header">Thu</div>
+    <div class="calendar-header">Fri</div>
+    <div class="calendar-header">Sat</div>
+    <div class="calendar-header">Sun</div>
+
+    {% for week in calendar.weeks %}
+      {% for day in week %}
+      <button
+        class="calendar-day {{ '' if day.in_month else 'out' }}"
+        data-date="{{ day.date }}"
+        data-pnl="{{ day.pnl }}"
+        data-trades='{{ day.trades | json | safe }}'
+      >
+        <span class="calendar-number">{{ day.day }}</span>
+        <span class="calendar-pnl">{{ day.pnl | money }}</span>
+      </button>
+      {% endfor %}
+    {% endfor %}
+  </div>
+</section>
+
+<section class="panel hidden" id="daySummary">
+  <div class="panel-header">
+    <div>
+      <h2 id="summaryTitle">Day summary</h2>
+      <p id="summarySubtitle">Select a day to see the trades.</p>
+    </div>
+  </div>
+  <div class="table-wrap">
+    <table class="table" id="summaryTable">
+      <thead>
+        <tr>
+          <th>Exit</th>
+          <th>Symbol</th>
+          <th>Side</th>
+          <th>Net P&L</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</section>
+
+<script>
+  const calendar = {{ calendar | json | safe }};
+  const maxAbs = calendar.max_abs_pnl || 1;
+  const tiles = document.querySelectorAll('.calendar-day');
+
+  const colorize = (value) => {
+    if (!value) return '';
+    const intensity = Math.min(Math.abs(value) / maxAbs, 1);
+    if (value < 0) {
+      return `rgba(176, 59, 40, ${0.15 + 0.55 * intensity})`;
+    }
+    return `rgba(26, 118, 90, ${0.15 + 0.55 * intensity})`;
+  };
+
+  tiles.forEach(tile => {
+    const pnl = parseFloat(tile.dataset.pnl || '0');
+    const color = colorize(pnl);
+    if (color) {
+      tile.style.background = color;
+      tile.style.borderColor = 'rgba(0,0,0,0.05)';
+    }
+  });
+
+  const summaryTitle = document.getElementById('summaryTitle');
+  const summarySubtitle = document.getElementById('summarySubtitle');
+  const summaryTableBody = document.querySelector('#summaryTable tbody');
+  const summaryPanel = document.getElementById('daySummary');
+
+  const renderSummary = (date, trades) => {
+    summaryTitle.textContent = date;
+    if (!trades || trades.length === 0) {
+      summaryPanel.classList.add('hidden');
+      summaryTableBody.innerHTML = '';
+      return;
+    }
+    summaryPanel.classList.remove('hidden');
+    summarySubtitle.textContent = `${trades.length} trade(s)`;
+    summaryTableBody.innerHTML = trades.map(trade => {
+      const pnl = Number(trade.pnl || 0);
+      const pnlClass = pnl >= 0 ? 'positive' : 'negative';
+      return `
+        <tr>
+          <td>${new Date(trade.exit_time).toLocaleString()}</td>
+          <td>${trade.symbol}</td>
+          <td><span class="pill ${trade.side.toLowerCase()}">${trade.side}</span></td>
+          <td class="${pnlClass}">${pnl.toLocaleString(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: 2 })}</td>
+        </tr>
+      `;
+    }).join('');
+  };
+
+  tiles.forEach(tile => {
+    tile.addEventListener('click', () => {
+      if (tile.classList.contains('out')) {
+        const date = tile.dataset.date;
+        if (date) {
+          const month = date.slice(0, 7);
+          window.location.href = `/calendar?month=${month}&day=${date}`;
+        }
+        return;
+      }
+      tiles.forEach(item => item.classList.remove('selected'));
+      tile.classList.add('selected');
+      const trades = JSON.parse(tile.dataset.trades || '[]');
+      renderSummary(tile.dataset.date, trades);
+      document.getElementById('daySummary').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+  });
+
+  const params = new URLSearchParams(window.location.search);
+  const dayParam = params.get('day');
+  if (dayParam) {
+    const target = Array.from(tiles).find(tile => tile.dataset.date === dayParam);
+    if (target) {
+      target.click();
+    }
+  }
+
+  const pickerLabel = document.getElementById('monthWheelCurrent');
+  const pickerList = document.getElementById('monthWheelList');
+  const pickerItems = Array.from(document.querySelectorAll('.month-wheel-item'));
+  const pickerWrap = document.getElementById('monthWheel');
+  const currentMonth = '{{ calendar.month_key }}';
+
+  const setActiveMonth = (monthKey) => {
+    pickerItems.forEach(item => {
+      const isActive = item.dataset.month === monthKey;
+      item.classList.toggle('active', isActive);
+      item.classList.toggle('near', false);
+      item.classList.toggle('far', false);
+    });
+    const activeIndex = pickerItems.findIndex(item => item.dataset.month === monthKey);
+    pickerItems.forEach((item, idx) => {
+      if (idx === activeIndex) return;
+      const distance = Math.abs(idx - activeIndex);
+      if (distance === 1) item.classList.add('near');
+      if (distance >= 2) item.classList.add('far');
+    });
+  };
+
+  const scrollToMonth = (monthKey) => {
+    const target = pickerItems.find(item => item.dataset.month === monthKey);
+    if (!target) return;
+    const offset = target.offsetTop - pickerList.clientHeight / 2 + target.clientHeight / 2;
+    pickerList.scrollTop = Math.max(0, offset);
+  };
+
+  const updateActiveFromScroll = () => {
+    const mid = pickerList.scrollTop + pickerList.clientHeight / 2;
+    let closest = pickerItems[0];
+    let closestDist = Infinity;
+    pickerItems.forEach(item => {
+      const itemMid = item.offsetTop + item.clientHeight / 2;
+      const dist = Math.abs(itemMid - mid);
+      if (dist < closestDist) {
+        closest = item;
+        closestDist = dist;
+      }
+    });
+    if (closest) {
+      setActiveMonth(closest.dataset.month);
+    }
+  };
+
+  const openPicker = () => {
+    pickerWrap.classList.add('open');
+    pickerList.setAttribute('aria-hidden', 'false');
+    scrollToMonth(currentMonth);
+    updateActiveFromScroll();
+  };
+
+  const closePicker = () => {
+    pickerWrap.classList.remove('open');
+    pickerList.setAttribute('aria-hidden', 'true');
+  };
+
+  pickerLabel.addEventListener('click', () => {
+    if (pickerWrap.classList.contains('open')) {
+      closePicker();
+    } else {
+      openPicker();
+    }
+  });
+
+  pickerLabel.addEventListener('wheel', event => {
+    event.preventDefault();
+    if (!pickerWrap.classList.contains('open')) {
+      openPicker();
+    }
+    pickerList.scrollTop += event.deltaY;
+    updateActiveFromScroll();
+  });
+
+  pickerList.addEventListener('scroll', () => {
+    updateActiveFromScroll();
+  });
+
+  const goToActiveMonth = () => {
+    const active = pickerItems.find(item => item.classList.contains('active'));
+    if (!active) return;
+    const monthKey = active.dataset.month;
+    window.location.href = `/calendar?month=${monthKey}`;
+  };
+
+  pickerList.addEventListener('click', () => {
+    goToActiveMonth();
+  });
+
+  pickerItems.forEach(item => {
+    item.addEventListener('click', event => {
+      event.stopPropagation();
+      const monthKey = item.dataset.month;
+      window.location.href = `/calendar?month=${monthKey}`;
+    });
+  });
+
+  document.addEventListener('click', event => {
+    if (!pickerWrap.classList.contains('open')) return;
+    if (pickerWrap.contains(event.target)) return;
+    closePicker();
+  });
+</script>
+{% endblock %}

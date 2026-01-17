@@ -47,6 +47,12 @@ class AggregateMetrics:
     total_funding: float
     avg_duration_seconds: float | None
     total_duration_seconds: float
+    mean_mae: float | None
+    median_mae: float | None
+    mean_mfe: float | None
+    median_mfe: float | None
+    mean_etd: float | None
+    median_etd: float | None
 
 
 def compute_trade_metrics(trade: Trade) -> TradeMetrics:
@@ -126,6 +132,9 @@ def compute_aggregate_metrics(trades: Iterable[Trade]) -> AggregateMetrics:
     total_net_pnl = sum(trade.realized_pnl_net for trade in trade_list)
     total_fees = sum(trade.fees for trade in trade_list)
     total_funding = sum(trade.funding_fees for trade in trade_list)
+    mae_values = [trade.mae for trade in trade_list if trade.mae is not None]
+    mfe_values = [trade.mfe for trade in trade_list if trade.mfe is not None]
+    etd_values = [trade.etd for trade in trade_list if trade.etd is not None]
 
     return AggregateMetrics(
         total_trades=total_trades,
@@ -147,6 +156,12 @@ def compute_aggregate_metrics(trades: Iterable[Trade]) -> AggregateMetrics:
         total_funding=total_funding,
         avg_duration_seconds=avg_duration,
         total_duration_seconds=total_duration,
+        mean_mae=_mean(mae_values),
+        median_mae=_median(mae_values),
+        mean_mfe=_mean(mfe_values),
+        median_mfe=_median(mfe_values),
+        mean_etd=_mean(etd_values),
+        median_etd=_median(etd_values),
     )
 
 
@@ -173,3 +188,19 @@ def _max_streaks(trades: Iterable[Trade]) -> tuple[int, int]:
         max_losses = max(max_losses, current_losses)
 
     return max_wins, max_losses
+
+
+def _mean(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    sorted_vals = sorted(values)
+    mid = len(sorted_vals) // 2
+    if len(sorted_vals) % 2 == 1:
+        return sorted_vals[mid]
+    return (sorted_vals[mid - 1] + sorted_vals[mid]) / 2

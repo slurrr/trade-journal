@@ -8,28 +8,42 @@ version = "0.0.0"
 description = "Local-first trade journal based on ApeX Omni data."
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+  "fastapi>=0.111",
+  "jinja2>=3.1",
+  "uvicorn>=0.29",
+]
 
 [project.optional-dependencies]
 dev = [
   "pytest>=7",
 ]
 
+
 [project.scripts]
 trade-journal = "trade_journal.cli:main"
 trade-journal-fetch-fills = "trade_journal.fetch_fills:main"
 trade-journal-fetch-historical-pnl = "trade_journal.fetch_historical_pnl:main"
 trade-journal-fetch-funding = "trade_journal.fetch_funding:main"
+trade-journal-fetch-liquidations = "trade_journal.fetch_liquidations:main"
+trade-journal-fetch-history-orders = "trade_journal.fetch_history_orders:main"
 trade-journal-reconcile = "trade_journal.reconcile:main"
 trade-journal-sample-fills = "trade_journal.sample_fills:main"
 trade-journal-sanity-report = "trade_journal.sanity_report:main"
 trade-journal-metrics = "trade_journal.metrics_summary:main"
+trade-journal-excursions = "trade_journal.compute_excursions:main"
+trade-journal-probe-api = "trade_journal.probe_api:main"
+trade-journal-verify = "trade_journal.verify:main"
+trade-journal-web = "trade_journal.web.app:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"trade_journal.web" = ["templates/*.html", "static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

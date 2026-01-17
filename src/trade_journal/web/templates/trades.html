@@ -1,0 +1,159 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="page-header">
+  <div>
+    <h1>Trades</h1>
+    <p>Filter, scan, and drill into reconstructed trades.</p>
+  </div>
+  <div class="filters">
+    <label>
+      <span>Symbol</span>
+      <select id="symbolFilter">
+        <option value="all">All</option>
+        {% for symbol in symbols %}
+        <option value="{{ symbol }}">{{ symbol }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      <span>Search</span>
+      <input id="searchFilter" type="search" placeholder="BTC, ETH, +$" />
+    </label>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="table-wrap">
+    <table class="table" id="tradesTable">
+      <thead>
+        <tr>
+          <th data-sort="exit">Exit</th>
+          <th data-sort="symbol">Symbol</th>
+          <th data-sort="side">Side</th>
+          <th data-sort="size">Size</th>
+          <th data-sort="nominal">Nominal</th>
+          <th data-sort="pnl">Net P&L</th>
+          <th data-sort="return">Return</th>
+          <th data-sort="hold">Hold</th>
+          <th data-sort="r">R</th>
+          <th data-sort="mfe">MFE</th>
+          <th data-sort="mae">MAE</th>
+          <th data-sort="dte">DTE</th>
+          <th data-sort="liq">REKT</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% if trades %}
+          {% for trade in trades %}
+          <tr
+            data-symbol="{{ trade.symbol }}"
+            data-search="{{ trade.symbol }} {{ trade.side }} {{ trade.realized_pnl_net | money }} {{ 'liquidated' if trade.liquidated else '' }}"
+            data-exit="{{ trade.exit_time | iso }}"
+            data-side="{{ trade.side }}"
+            data-size="{{ trade.exit_size }}"
+            data-nominal="{{ trade.entry_price * trade.entry_size }}"
+            data-pnl="{{ trade.realized_pnl_net }}"
+            data-return="{{ trade.return_pct or 0 }}"
+            data-hold="{{ trade.duration_seconds or 0 }}"
+            data-r="{{ trade.r_multiple or 0 }}"
+            data-mfe="{{ trade.mfe or 0 }}"
+            data-mae="{{ trade.mae or 0 }}"
+            data-dte="{{ trade.etd or 0 }}"
+            data-liq="{{ 1 if trade.liquidated else 0 }}"
+            data-url="/trades/{{ trade.ui_id }}"
+            class="{{ 'trade-rekt' if trade.liquidated else '' }}"
+          >
+            <td>{{ trade.exit_time | timestamp }}</td>
+            <td>{{ trade.symbol | replace('-USDT', '') }}</td>
+            <td><span class="pill {{ trade.side | lower }}">{{ trade.side }}</span></td>
+            <td>{{ trade.exit_size | round(4) }}</td>
+            <td>{{ (trade.entry_price * trade.entry_size) | money }}</td>
+            <td class="{{ 'positive' if trade.realized_pnl_net >= 0 else 'negative' }}">{{ trade.realized_pnl_net | money }}</td>
+            <td>{{ trade.return_pct | percent }}</td>
+            <td>{{ trade.duration_seconds | duration }}</td>
+            <td>{{ trade.r_multiple | round(2) if trade.r_multiple is not none else 'n/a' }}</td>
+            <td>{{ trade.mfe | money }}</td>
+            <td>{{ trade.mae | money }}</td>
+            <td>{{ trade.etd | money }}</td>
+            <td>{{ 'REKT' if trade.liquidated else '—' }}</td>
+          </tr>
+          {% endfor %}
+        {% else %}
+          <tr><td colspan="13" class="empty">No trades loaded yet.</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<script>
+  const symbolFilter = document.getElementById('symbolFilter');
+  const searchFilter = document.getElementById('searchFilter');
+  const table = document.getElementById('tradesTable');
+  const headers = table.querySelectorAll('thead th[data-sort]');
+  let currentSort = { key: 'exit', direction: 'desc' };
+
+  const applyFilters = () => {
+    const symbol = symbolFilter.value;
+    const query = searchFilter.value.toLowerCase();
+    const rows = table.querySelectorAll('tbody tr');
+
+    rows.forEach(row => {
+      const rowSymbol = row.dataset.symbol || '';
+      const search = row.dataset.search || '';
+      const symbolMatch = symbol === 'all' || rowSymbol === symbol;
+      const searchMatch = !query || search.toLowerCase().includes(query);
+      row.style.display = symbolMatch && searchMatch ? '' : 'none';
+    });
+  };
+
+  symbolFilter.addEventListener('change', applyFilters);
+  searchFilter.addEventListener('input', applyFilters);
+
+  const sortRows = (key, direction) => {
+    const rows = Array.from(table.querySelectorAll('tbody tr'));
+    const multiplier = direction === 'asc' ? 1 : -1;
+    const getValue = row => {
+      const value = row.dataset[key] || '';
+      if (key === 'exit') return new Date(value).getTime() || 0;
+      if (key === 'symbol' || key === 'side') return value.toLowerCase();
+      if (key === 'liq') return Number(value) || 0;
+      return Number(value) || 0;
+    };
+    rows.sort((a, b) => {
+      const av = getValue(a);
+      const bv = getValue(b);
+      if (av < bv) return -1 * multiplier;
+      if (av > bv) return 1 * multiplier;
+      return 0;
+    });
+    const body = table.querySelector('tbody');
+    rows.forEach(row => body.appendChild(row));
+  };
+
+  headers.forEach(header => {
+    header.addEventListener('click', () => {
+      const key = header.dataset.sort;
+      if (!key) return;
+      const direction =
+        currentSort.key === key && currentSort.direction === 'desc' ? 'asc' : 'desc';
+      currentSort = { key, direction };
+      sortRows(key, direction);
+    });
+  });
+
+  table.querySelectorAll('tbody tr').forEach(row => {
+    row.addEventListener('click', event => {
+      const target = event.target;
+      if (target instanceof HTMLElement && target.closest('a')) {
+        return;
+      }
+      const url = row.dataset.url;
+      if (url) {
+        window.location.href = url;
+      }
+    });
+  });
+</script>
+{% endblock %}

@@ -1,0 +1,120 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="page-header">
+  <div>
+    <h1>Trade Detail</h1>
+    <p>Zoom in on fills and execution flow.</p>
+  </div>
+  <a class="ghost-link" href="/trades">Back to trades</a>
+</section>
+
+{% if trade %}
+<section class="panel">
+  <div class="trade-header">
+    <div>
+      <div class="trade-title">{{ trade.symbol }} - {{ trade.side }}</div>
+      <div class="trade-sub">{{ trade.entry_time | timestamp }} -> {{ trade.exit_time | timestamp }}</div>
+    </div>
+    <div class="trade-pnl {{ 'positive' if trade.realized_pnl_net >= 0 else 'negative' }}">{{ trade.realized_pnl_net | money }}</div>
+  </div>
+  {% if trade.liquidated %}
+  <div class="liquidation-banner">Liquidated on {{ trade.liquidation.created_at | timestamp }}</div>
+  {% endif %}
+  <div class="trade-grid">
+    <div>
+      <div class="stat-label">Entry Price</div>
+      <div class="stat-value">{{ trade.entry_price | round(4) }}</div>
+    </div>
+    <div>
+      <div class="stat-label">Exit Price</div>
+      <div class="stat-value">{{ trade.exit_price | round(4) }}</div>
+    </div>
+    <div>
+      <div class="stat-label">Max Size</div>
+      <div class="stat-value">{{ trade.max_size | round(4) }}</div>
+    </div>
+    <div>
+      <div class="stat-label">Return</div>
+      <div class="stat-value">{{ trade.return_pct | percent }}</div>
+    </div>
+    <div>
+      <div class="stat-label">Fees</div>
+      <div class="stat-value">{{ trade.fees | money }}</div>
+    </div>
+    <div>
+      <div class="stat-label">Funding</div>
+      <div class="stat-value">{{ trade.funding_fees | money }}</div>
+    </div>
+    <div>
+      <div class="stat-label">Initial Stop</div>
+      <div class="stat-value">{{ trade.initial_stop | round(6) if trade.initial_stop is not none else 'n/a' }}</div>
+    </div>
+    <div>
+      <div class="stat-label">R Multiple</div>
+      <div class="stat-value">{{ trade.r_multiple | round(2) if trade.r_multiple is not none else 'n/a' }}</div>
+    </div>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-header">
+    <div>
+      <h2>Excursion</h2>
+      <p>MAE, MFE, and ETD for this trade.</p>
+    </div>
+  </div>
+  <div class="excursion-grid">
+    <div class="excursion-card negative">
+      <div class="stat-label">MAE</div>
+      <div class="stat-value">{{ trade.mae | money }}</div>
+    </div>
+    <div class="excursion-card positive">
+      <div class="stat-label">MFE</div>
+      <div class="stat-value">{{ trade.mfe | money }}</div>
+    </div>
+    <div class="excursion-card neutral">
+      <div class="stat-label">ETD</div>
+      <div class="stat-value">{{ trade.etd | money }}</div>
+    </div>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-header">
+    <div>
+      <h2>Fill Timeline</h2>
+      <p>Execution sequence across the position.</p>
+    </div>
+  </div>
+  <div class="table-wrap">
+    <table class="table">
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Side</th>
+          <th>Price</th>
+          <th>Size</th>
+          <th>Fee</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for fill in trade.fills %}
+        <tr>
+          <td>{{ fill.timestamp | timestamp }}</td>
+          <td><span class="pill {{ fill.side | lower }}">{{ fill.side }}</span></td>
+          <td>{{ fill.price | round(4) }}</td>
+          <td>{{ fill.size | round(4) }}</td>
+          <td>{{ fill.fee | money }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% else %}
+<section class="panel">
+  <div class="empty">Trade not found. Try selecting from the trades list.</div>
+</section>
+{% endif %}
+{% endblock %}

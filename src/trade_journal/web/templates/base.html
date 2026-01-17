@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Trade Journal</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Fraunces:opsz,wght@9..144,600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="icon" type="image/png" href="/static/favitrade.png" />
+    <link rel="stylesheet" href="/static/app.css" />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/luxon@3.4.4/build/global/luxon.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon@1.3.1/dist/chartjs-adapter-luxon.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <img class="brand-logo" src="/static/logo.png" alt="Trade Journal logo" />
+        </div>
+        <nav class="nav">
+          <a href="/" class="{% if page == 'dashboard' %}active{% endif %}">Dashboard</a>
+          <a href="/trades" class="{% if page == 'trades' %}active{% endif %}">Trades</a>
+          <a href="/calendar" class="{% if page == 'calendar' %}active{% endif %}">Calendar</a>
+        </nav>
+        <button class="theme-toggle" id="themeToggle" aria-label="Toggle theme">Dark</button>
+      </header>
+
+      {% if data_note %}
+      <div class="notice {{ data_note_class }}">{{ data_note }}</div>
+      {% endif %}
+
+      {% block content %}{% endblock %}
+
+      <footer class="footer">Built locally - Data stays on this machine</footer>
+    </div>
+    <script>
+      const root = document.documentElement;
+      const toggle = document.getElementById('themeToggle');
+      const stored = localStorage.getItem('theme');
+      if (stored) {
+        root.dataset.theme = stored;
+      }
+      const setLabel = () => {
+        toggle.textContent = root.dataset.theme === 'dark' ? 'Light' : 'Dark';
+      };
+      setLabel();
+      toggle.addEventListener('click', () => {
+        const next = root.dataset.theme === 'dark' ? 'light' : 'dark';
+        root.dataset.theme = next;
+        localStorage.setItem('theme', next);
+        setLabel();
+      });
+    </script>
+  </body>
+</html>
