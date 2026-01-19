@@ -1,0 +1,196 @@
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+from trade_journal.ingest.apex_funding import load_funding
+from trade_journal.ingest.apex_liquidations import load_liquidations
+from trade_journal.ingest.apex_omni import load_fills
+from trade_journal.ingest.apex_orders import load_orders
+from trade_journal.reconcile import load_historical_pnl
+from trade_journal.storage.sqlite_store import (
+    connect,
+    init_db,
+    upsert_fills,
+    upsert_funding,
+    upsert_historical_pnl,
+    upsert_liquidations,
+    upsert_orders,
+)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Persist ApeX data files into SQLite.")
+    parser.add_argument("--db", type=Path, default=Path("data/trade_journal.sqlite"), help="SQLite DB path.")
+    parser.add_argument("--fills", type=Path, default=Path("data/fills.json"), help="Fills JSON path.")
+    parser.add_argument("--orders", type=Path, default=Path("data/history_orders.json"), help="Orders JSON path.")
+    parser.add_argument("--funding", type=Path, default=Path("data/funding.json"), help="Funding JSON path.")
+    parser.add_argument(
+        "--liquidations",
+        type=Path,
+        default=Path("data/liquidations.json"),
+        help="Liquidations JSON path.",
+    )
+    parser.add_argument(
+        "--historical-pnl",
+        type=Path,
+        default=Path("data/historical_pnl.json"),
+        help="Historical PnL JSON path.",
+    )
+    parser.add_argument(
+        "--report-out",
+        type=Path,
+        default=Path("data/sync_report.json"),
+        help="Write sync validation counts to this file.",
+    )
+    parser.add_argument(
+        "--log-out",
+        type=Path,
+        default=Path("data/last_sync.json"),
+        help="Write last successful sync metadata to this file.",
+    )
+    args = parser.parse_args(argv)
+
+    conn = connect(args.db)
+    init_db(conn)
+
+    total = 0
+    summaries: list[str] = []
+    report: dict[str, dict[str, int]] = {}
+    if args.fills.exists():
+        result = load_fills(args.fills)
+        valid_fills, skipped_invalid = _validate_fills(result.fills)
+        total += upsert_fills(conn, valid_fills)
+        summaries.append(_summary_line("fills", len(valid_fills), result.skipped, skipped_invalid))
+        report["fills"] = _report_entry(len(valid_fills), result.skipped, skipped_invalid)
+    if args.orders.exists():
+        result = load_orders(args.orders)
+        valid_orders, skipped_invalid = _validate_orders(result.orders)
+        total += upsert_orders(conn, valid_orders)
+        summaries.append(_summary_line("orders", len(valid_orders), result.skipped, skipped_invalid))
+        report["orders"] = _report_entry(len(valid_orders), result.skipped, skipped_invalid)
+    if args.funding.exists():
+        result = load_funding(args.funding)
+        valid_funding, skipped_invalid = _validate_funding(result.events)
+        total += upsert_funding(conn, valid_funding)
+        summaries.append(_summary_line("funding", len(valid_funding), result.skipped, skipped_invalid))
+        report["funding"] = _report_entry(len(valid_funding), result.skipped, skipped_invalid)
+    if args.liquidations.exists():
+        result = load_liquidations(args.liquidations)
+        valid_liquidations, skipped_invalid = _validate_liquidations(result.events)
+        total += upsert_liquidations(conn, valid_liquidations)
+        summaries.append(_summary_line("liquidations", len(valid_liquidations), result.skipped, skipped_invalid))
+        report["liquidations"] = _report_entry(len(valid_liquidations), result.skipped, skipped_invalid)
+    if args.historical_pnl.exists():
+        records = load_historical_pnl(args.historical_pnl)
+        valid_pnl, skipped_invalid = _validate_pnl(records)
+        total += upsert_historical_pnl(conn, valid_pnl)
+        summaries.append(_summary_line("historical_pnl", len(valid_pnl), 0, skipped_invalid))
+        report["historical_pnl"] = _report_entry(len(valid_pnl), 0, skipped_invalid)
+
+    print(f"upserted_rows {total}")
+    for line in summaries:
+        print(line)
+    if args.report_out is not None:
+        args.report_out.parent.mkdir(parents=True, exist_ok=True)
+        args.report_out.write_text(_report_json(report), encoding="utf-8")
+    if args.log_out is not None:
+        args.log_out.parent.mkdir(parents=True, exist_ok=True)
+        args.log_out.write_text(_log_json(args.db, total, report), encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+def _validate_fills(items):
+    valid = []
+    skipped = 0
+    for fill in items:
+        if fill.size <= 0 or fill.price <= 0:
+            skipped += 1
+            continue
+        valid.append(fill)
+    return valid, skipped
+
+
+def _validate_orders(items):
+    valid = []
+    skipped = 0
+    for order in items:
+        if order.size <= 0:
+            skipped += 1
+            continue
+        if order.price is not None and order.price <= 0:
+            skipped += 1
+            continue
+        valid.append(order)
+    return valid, skipped
+
+
+def _validate_funding(items):
+    valid = []
+    skipped = 0
+    for event in items:
+        if event.symbol.strip().lower() in {"", "none", "null"}:
+            skipped += 1
+            continue
+        valid.append(event)
+    return valid, skipped
+
+
+def _validate_liquidations(items):
+    valid = []
+    skipped = 0
+    for event in items:
+        if event.size <= 0:
+            skipped += 1
+            continue
+        valid.append(event)
+    return valid, skipped
+
+
+def _validate_pnl(items):
+    valid = []
+    skipped = 0
+    for record in items:
+        if record.size <= 0:
+            skipped += 1
+            continue
+        if record.symbol.strip().lower() in {"", "none", "null"}:
+            skipped += 1
+            continue
+        valid.append(record)
+    return valid, skipped
+
+
+def _summary_line(name: str, accepted: int, skipped_parse: int, skipped_invalid: int) -> str:
+    return f"{name} accepted={accepted} skipped_parse={skipped_parse} skipped_invalid={skipped_invalid}"
+
+
+def _report_entry(accepted: int, skipped_parse: int, skipped_invalid: int) -> dict[str, int]:
+    return {
+        "accepted": accepted,
+        "skipped_parse": skipped_parse,
+        "skipped_invalid": skipped_invalid,
+    }
+
+
+def _report_json(report: dict[str, dict[str, int]]) -> str:
+    import json
+
+    return json.dumps(report, indent=2, sort_keys=True) + "\n"
+
+
+def _log_json(db_path: Path, total: int, report: dict[str, dict[str, int]]) -> str:
+    import json
+    from datetime import datetime, timezone
+
+    payload = {
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "db_path": str(db_path),
+        "upserted_rows": total,
+        "report": report,
+    }
+    return json.dumps(payload, indent=2, sort_keys=True) + "\n"

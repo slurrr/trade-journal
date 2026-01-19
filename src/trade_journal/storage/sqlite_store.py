@@ -110,6 +110,32 @@ def init_db(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sync_state (
+            endpoint TEXT PRIMARY KEY,
+            last_timestamp_ms INTEGER,
+            last_id TEXT,
+            last_success_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_version (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            schema_version INTEGER NOT NULL,
+            metrics_version INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO schema_version (id, schema_version, metrics_version, updated_at)
+        VALUES (1, 1, 1, CURRENT_TIMESTAMP)
+        """
+    )
     conn.commit()
 
 

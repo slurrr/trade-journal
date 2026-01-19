@@ -15,6 +15,8 @@ from typing import Any, Mapping
 DEFAULT_BASE_URL = "https://omni.apex.exchange"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_FILLS_LIMIT = 100
+DEFAULT_RETRY_ATTEMPTS = 3
+DEFAULT_RETRY_BACKOFF_SECONDS = 0.75
 
 
 @dataclass(frozen=True)
@@ -26,6 +28,8 @@ class ApexApiConfig:
     debug: bool
     timeout_seconds: float
     fills_limit: int
+    retry_attempts: int
+    retry_backoff_seconds: float
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "ApexApiConfig":
@@ -48,6 +52,10 @@ class ApexApiConfig:
         base_url = _normalize_base_url(env.get("APEX_BASE_URL", DEFAULT_BASE_URL))
         timeout_seconds = _to_float(env.get("APEX_TIMEOUT_SECONDS"), default=DEFAULT_TIMEOUT_SECONDS)
         fills_limit = int(env.get("APEX_FILLS_LIMIT", str(DEFAULT_FILLS_LIMIT)))
+        retry_attempts = int(env.get("APEX_RETRY_ATTEMPTS", str(DEFAULT_RETRY_ATTEMPTS)))
+        retry_backoff_seconds = _to_float(
+            env.get("APEX_RETRY_BACKOFF_SECONDS"), default=DEFAULT_RETRY_BACKOFF_SECONDS
+        )
 
         return cls(
             base_url=base_url,
@@ -57,6 +65,8 @@ class ApexApiConfig:
             debug=env.get("APEX_DEBUG", "").lower() in {"1", "true", "yes"},
             timeout_seconds=timeout_seconds,
             fills_limit=fills_limit,
+            retry_attempts=retry_attempts,
+            retry_backoff_seconds=retry_backoff_seconds,
         )
 
 
@@ -167,7 +177,7 @@ class ApexApiClient:
                 signature_encoding="base64",
             )
 
-            payload = _send_request(
+            payload = _send_with_retry(
                 url=url,
                 method=method,
                 api_key=self._config.api_key,
@@ -176,6 +186,8 @@ class ApexApiClient:
                 timestamp=timestamp,
                 timeout_seconds=self._config.timeout_seconds,
                 data_string=data_string if method.upper() != "GET" else None,
+                attempts=self._config.retry_attempts,
+                backoff_seconds=self._config.retry_backoff_seconds,
             )
 
             if _is_signature_error(payload):
@@ -238,6 +250,42 @@ def _send_request(
         raise RuntimeError(
             f"Non-JSON response (status {status}, content-type {content_type}, url {url}){hint}: {snippet}"
         ) from exc
+
+
+def _send_with_retry(
+    url: str,
+    method: str,
+    api_key: str,
+    passphrase: str,
+    signature: str,
+    timestamp: str,
+    timeout_seconds: float,
+    data_string: str | None,
+    attempts: int,
+    backoff_seconds: float,
+) -> Mapping[str, Any]:
+    last_error: Exception | None = None
+    for attempt in range(max(1, attempts)):
+        try:
+            return _send_request(
+                url=url,
+                method=method,
+                api_key=api_key,
+                passphrase=passphrase,
+                signature=signature,
+                timestamp=timestamp,
+                timeout_seconds=timeout_seconds,
+                data_string=data_string,
+            )
+        except Exception as exc:  # noqa: BLE001 - we only rethrow after retry policy
+            last_error = exc
+            if not _should_retry(exc, attempt, attempts):
+                raise
+            sleep_seconds = backoff_seconds * (2**attempt)
+            time.sleep(sleep_seconds)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Request retry loop exited without sending.")
 
 
 # NOTE: Signature payload follows ApeX docs for REST API key auth.
@@ -324,3 +372,28 @@ def _to_float(value: str | None, default: float) -> float:
         return float(value)
     except ValueError:
         return default
+
+
+def _should_retry(exc: Exception, attempt: int, attempts: int) -> bool:
+    if attempt >= attempts - 1:
+        return False
+    message = str(exc).lower()
+    if "non-json response" in message:
+        return False
+    if "signature" in message:
+        return False
+    if "empty response body" in message:
+        return True
+    if "timed out" in message:
+        return True
+    if "temporary failure" in message:
+        return True
+    if "http 429" in message:
+        return True
+    if "http 5" in message:
+        return True
+    if "http 408" in message:
+        return True
+    if "http 502" in message or "http 503" in message or "http 504" in message:
+        return True
+    return False

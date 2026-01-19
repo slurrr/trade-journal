@@ -1,10 +1,10 @@
 # 0018 – Initial Stop Used for R Multiple
 
 ## Decision
-R multiple is computed using the initial stop attached to the entry order. If the entry order does not carry an open stop, use the first TPSL stop order created after entry (within the trade window) as the initial stop. Later stop modifications do not change R.
+R multiple is computed using a size-weighted average of the stop-loss prices attached to entry fills (from `openSlParam` on the corresponding entry orders). If no entry stop is available, use the first TPSL stop order created after entry (within the trade window) as the initial stop. Later stop modifications do not change R.
 
 ## Rationale
-R is intended to reflect the planned risk at trade inception. Using the earliest stop preserves that intent while still allowing automated extraction from ApeX data.
+The size-weighted entry stop matches how entry price is computed during scale-ins. Falling back to the earliest TPSL stop preserves a usable R estimate when entry stops are unavailable.
 
 ## Status
 Provisional

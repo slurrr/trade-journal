@@ -73,6 +73,9 @@ def _fetch_all_pages(
     page = 0
     while page < max_pages:
         payload = client.fetch_historical_pnl(limit=limit, page=page)
+        error = _payload_error(payload)
+        if error:
+            raise RuntimeError(f"ApeX error while paging: {error}")
         page_records = extract_liquidations(payload).events
         if not page_records:
             break
@@ -81,6 +84,18 @@ def _fetch_all_pages(
             break
         page += 1
     return {"data": {"historicalPnl": records}}
+
+
+def _payload_error(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    code = payload.get("code")
+    if code is None:
+        return None
+    if str(code) in {"0", "200"}:
+        return None
+    msg = payload.get("msg", "")
+    return f"code={code} msg={msg}"
 
 
 if __name__ == "__main__":
