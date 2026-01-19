@@ -375,6 +375,14 @@ canvas.is-panning {
   color: var(--danger);
 }
 
+.table tbody tr.trade-rekt td.positive {
+  color: #1a765a;
+}
+
+.table tbody tr.trade-rekt td.negative {
+  color: var(--danger);
+}
+
 .pill {
   padding: 4px 8px;
   border-radius: 999px;

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from statistics import pstdev
+from typing import Any, Iterable
 
 from trade_journal.models import Trade
 
@@ -53,6 +54,13 @@ class AggregateMetrics:
     median_mfe: float | None
     mean_etd: float | None
     median_etd: float | None
+    payoff_ratio: float | None
+    max_drawdown: float | None
+    max_drawdown_pct: float | None
+    avg_r: float | None
+    max_r: float | None
+    min_r: float | None
+    pct_r_below_minus_one: float | None
 
 
 def compute_trade_metrics(trade: Trade) -> TradeMetrics:
@@ -135,6 +143,20 @@ def compute_aggregate_metrics(trades: Iterable[Trade]) -> AggregateMetrics:
     mae_values = [trade.mae for trade in trade_list if trade.mae is not None]
     mfe_values = [trade.mfe for trade in trade_list if trade.mfe is not None]
     etd_values = [trade.etd for trade in trade_list if trade.etd is not None]
+    payoff_ratio = None
+    if avg_win is not None and avg_loss is not None and avg_loss != 0:
+        payoff_ratio = avg_win / abs(avg_loss)
+
+    max_drawdown, max_drawdown_pct = _max_drawdown(trade_list)
+
+    r_values = _extract_r_values(trade_list)
+    avg_r = _mean(r_values)
+    max_r = max(r_values, default=None)
+    min_r = min(r_values, default=None)
+    pct_r_below_minus_one = None
+    if r_values:
+        below = sum(1 for value in r_values if value < -1.0)
+        pct_r_below_minus_one = below / len(r_values)
 
     return AggregateMetrics(
         total_trades=total_trades,
@@ -162,6 +184,13 @@ def compute_aggregate_metrics(trades: Iterable[Trade]) -> AggregateMetrics:
         median_mfe=_median(mfe_values),
         mean_etd=_mean(etd_values),
         median_etd=_median(etd_values),
+        payoff_ratio=payoff_ratio,
+        max_drawdown=max_drawdown,
+        max_drawdown_pct=max_drawdown_pct,
+        avg_r=avg_r,
+        max_r=max_r,
+        min_r=min_r,
+        pct_r_below_minus_one=pct_r_below_minus_one,
     )
 
 
@@ -204,3 +233,221 @@ def _median(values: list[float]) -> float | None:
     if len(sorted_vals) % 2 == 1:
         return sorted_vals[mid]
     return (sorted_vals[mid - 1] + sorted_vals[mid]) / 2
+
+
+def _max_drawdown(trades: list[Trade]) -> tuple[float | None, float | None]:
+    ordered = sorted(trades, key=lambda trade: trade.exit_time)
+    peak = 0.0
+    max_dd = 0.0
+    equity = 0.0
+    max_dd_pct: float | None = None
+
+    for trade in ordered:
+        equity += trade.realized_pnl_net
+        if equity > peak:
+            peak = equity
+        drawdown = peak - equity
+        if drawdown > max_dd:
+            max_dd = drawdown
+            max_dd_pct = (drawdown / peak) if peak > 0 else None
+
+    if max_dd == 0.0:
+        return None, None
+    return max_dd, max_dd_pct
+
+
+def _extract_r_values(trades: list[Trade]) -> list[float]:
+    values = []
+    for trade in trades:
+        r_value = getattr(trade, "r_multiple", None)
+        if r_value is None:
+            continue
+        try:
+            values.append(float(r_value))
+        except (TypeError, ValueError):
+            continue
+    return values
+
+
+def compute_time_performance(trades: Iterable[Trade]) -> dict[str, list[dict[str, float | int]]]:
+    hourly: dict[int, list[float]] = {}
+    weekday: dict[int, list[float]] = {}
+    for trade in trades:
+        exit_local = trade.exit_time.astimezone()
+        hour = exit_local.hour
+        day = exit_local.weekday()
+        hourly.setdefault(hour, []).append(trade.realized_pnl_net)
+        weekday.setdefault(day, []).append(trade.realized_pnl_net)
+
+    hourly_rows = [_bucket_summary(hour, values) for hour, values in sorted(hourly.items())]
+    weekday_rows = [_bucket_summary(day, values) for day, values in sorted(weekday.items())]
+    return {"hourly": hourly_rows, "weekday": weekday_rows}
+
+
+def compute_symbol_breakdown(trades: Iterable[Trade]) -> list[dict[str, float | int | str | None]]:
+    buckets: dict[str, list[Trade]] = {}
+    for trade in trades:
+        buckets.setdefault(trade.symbol, []).append(trade)
+
+    rows: list[dict[str, float | int | str | None]] = []
+    for symbol, items in sorted(buckets.items(), key=lambda item: item[0]):
+        metrics = compute_aggregate_metrics(items)
+        rows.append(
+            {
+                "symbol": symbol,
+                "trades": metrics.total_trades,
+                "win_rate": metrics.win_rate,
+                "total_net_pnl": metrics.total_net_pnl,
+                "avg_net_pnl": metrics.expectancy,
+                "avg_win": metrics.avg_win,
+                "avg_loss": metrics.avg_loss,
+                "profit_factor": metrics.profit_factor,
+            }
+        )
+    return rows
+
+
+def compute_pnl_distribution(
+    trades: Iterable[Trade],
+    bins: int = 20,
+) -> dict[str, float | int | list[dict[str, float | int]]]:
+    values = [trade.realized_pnl_net for trade in trades]
+    if not values:
+        return {"min": 0.0, "max": 0.0, "bins": []}
+    min_val = min(values)
+    max_val = max(values)
+    if min_val == max_val:
+        return {
+            "min": min_val,
+            "max": max_val,
+            "bins": [{"start": min_val, "end": max_val, "count": len(values)}],
+        }
+    width = (max_val - min_val) / bins
+    counts = [0] * bins
+    for value in values:
+        idx = int((value - min_val) / width)
+        if idx >= bins:
+            idx = bins - 1
+        counts[idx] += 1
+    buckets = []
+    for idx, count in enumerate(counts):
+        start = min_val + idx * width
+        end = start + width
+        buckets.append({"start": start, "end": end, "count": count})
+    return {"min": min_val, "max": max_val, "bins": buckets}
+
+
+def _bucket_summary(key: int, values: list[float]) -> dict[str, float | int | None]:
+    wins = sum(1 for value in values if value > 0)
+    losses = sum(1 for value in values if value < 0)
+    total = len(values)
+    win_rate = wins / (wins + losses) if wins + losses else None
+    return {
+        "bucket": key,
+        "count": total,
+        "total_pnl": sum(values),
+        "avg_pnl": sum(values) / total if total else 0.0,
+        "win_rate": win_rate,
+    }
+
+
+def compute_zella_score(trades: Iterable[Trade], metrics: AggregateMetrics) -> dict[str, Any]:
+    weights = {
+        "profit_factor": 0.25,
+        "max_drawdown": 0.20,
+        "avg_win_loss": 0.20,
+        "win_rate": 0.15,
+        "recovery_factor": 0.10,
+        "consistency": 0.10,
+    }
+
+    profit_factor_score = _score_ratio(metrics.profit_factor, cap=3.0)
+    avg_win_loss_score = _score_ratio(metrics.payoff_ratio, cap=3.0)
+    win_rate_score = _score_range(metrics.win_rate, low=0.30, high=0.70)
+    max_drawdown_score = _score_inverse(metrics.max_drawdown_pct, cap=0.40)
+
+    recovery_factor = None
+    if metrics.max_drawdown is not None and metrics.max_drawdown > 0:
+        recovery_factor = metrics.total_net_pnl / metrics.max_drawdown
+    recovery_factor_score = _score_ratio(recovery_factor, cap=5.0)
+
+    consistency_raw = _consistency_ratio(trades)
+    consistency_score = _score_ratio(consistency_raw, cap=1.0)
+
+    component_scores = {
+        "profit_factor": profit_factor_score,
+        "max_drawdown": max_drawdown_score,
+        "avg_win_loss": avg_win_loss_score,
+        "win_rate": win_rate_score,
+        "recovery_factor": recovery_factor_score,
+        "consistency": consistency_score,
+    }
+
+    total_weight = sum(weights[key] for key, value in component_scores.items() if value is not None)
+    if total_weight == 0:
+        overall = None
+    else:
+        weighted_sum = sum(
+            component_scores[key] * weights[key]
+            for key in component_scores
+            if component_scores[key] is not None
+        )
+        overall = weighted_sum / total_weight
+
+    return {
+        "score": overall,
+        "components": component_scores,
+        "weights": weights,
+        "raw": {
+            "profit_factor": metrics.profit_factor,
+            "avg_win_loss": metrics.payoff_ratio,
+            "win_rate": metrics.win_rate,
+            "max_drawdown_pct": metrics.max_drawdown_pct,
+            "recovery_factor": recovery_factor,
+            "consistency": consistency_raw,
+        },
+    }
+
+
+def _score_ratio(value: float | None, cap: float) -> float | None:
+    if value is None:
+        return None
+    return _clamp(value / cap) * 100.0
+
+
+def _score_range(value: float | None, low: float, high: float) -> float | None:
+    if value is None:
+        return None
+    return _clamp((value - low) / (high - low)) * 100.0
+
+
+def _score_inverse(value: float | None, cap: float) -> float | None:
+    if value is None:
+        return None
+    return _clamp(1.0 - (value / cap)) * 100.0
+
+
+def _clamp(value: float) -> float:
+    if value < 0:
+        return 0.0
+    if value > 1:
+        return 1.0
+    return value
+
+
+def _consistency_ratio(trades: Iterable[Trade]) -> float | None:
+    daily = _daily_pnls(trades)
+    if len(daily) < 2:
+        return None
+    abs_mean = _mean([abs(value) for value in daily]) or 0.0
+    scale = max(1.0, abs_mean * 2.0)
+    deviation = pstdev(daily)
+    return _clamp(1.0 - (deviation / scale))
+
+
+def _daily_pnls(trades: Iterable[Trade]) -> list[float]:
+    buckets: dict[str, float] = {}
+    for trade in trades:
+        day = trade.exit_time.astimezone().date().isoformat()
+        buckets[day] = buckets.get(day, 0.0) + trade.realized_pnl_net
+    return list(buckets.values())

@@ -7,7 +7,16 @@ from pathlib import Path
 
 from trade_journal.ingest.apex_funding import load_funding
 from trade_journal.ingest.apex_omni import load_fills
-from trade_journal.metrics.summary import AggregateMetrics, compute_aggregate_metrics
+from trade_journal.ingest.apex_orders import load_orders
+from trade_journal.metrics.risk import initial_stop_for_trade
+from trade_journal.metrics.summary import (
+    AggregateMetrics,
+    compute_aggregate_metrics,
+    compute_pnl_distribution,
+    compute_symbol_breakdown,
+    compute_time_performance,
+    compute_zella_score,
+)
 from trade_journal.reconstruct.funding import apply_funding_events
 from trade_journal.reconstruct.trades import reconstruct_trades
 
@@ -26,6 +35,12 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=None,
         help="Optional funding export (json/csv/tsv) to apply to trades.",
+    )
+    parser.add_argument(
+        "--orders",
+        type=Path,
+        default=None,
+        help="Optional orders export (json/csv/tsv) for R metrics.",
     )
     parser.add_argument("--json", action="store_true", help="Print JSON output.")
     parser.add_argument("--out", type=Path, default=None, help="Write output to a file instead of stdout.")
@@ -55,7 +70,23 @@ def main(argv: list[str] | None = None) -> int:
         if unmatched:
             print(f"Unmatched funding events: {unmatched}.", file=sys.stderr)
 
+    orders_path = args.orders
+    if orders_path is None:
+        default_orders = Path("data/history_orders.json")
+        if default_orders.exists():
+            orders_path = default_orders
+
+    if orders_path is not None and orders_path.exists():
+        orders_result = load_orders(orders_path)
+        for trade in trades:
+            risk = initial_stop_for_trade(trade, orders_result.orders)
+            setattr(trade, "r_multiple", risk.r_multiple)
+
     metrics = compute_aggregate_metrics(trades)
+    time_perf = compute_time_performance(trades)
+    symbol_breakdown = compute_symbol_breakdown(trades)
+    pnl_distribution = compute_pnl_distribution(trades)
+    zella_score = compute_zella_score(trades, metrics)
 
     out_path = args.out
     if out_path is None:
@@ -63,6 +94,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.json or out_path.suffix.lower() == ".json":
         payload = _metrics_to_dict(metrics)
+        payload["time_performance"] = time_perf
+        payload["symbol_breakdown"] = symbol_breakdown
+        payload["pnl_distribution"] = pnl_distribution
+        payload["zella_score"] = zella_score
         text = json.dumps(payload, indent=2, sort_keys=True)
     else:
         text = _format_metrics(metrics)
@@ -100,6 +135,13 @@ def _metrics_to_dict(metrics: AggregateMetrics) -> dict[str, float | int | None]
         "median_mfe": metrics.median_mfe,
         "mean_etd": metrics.mean_etd,
         "median_etd": metrics.median_etd,
+        "payoff_ratio": metrics.payoff_ratio,
+        "max_drawdown": metrics.max_drawdown,
+        "max_drawdown_pct": metrics.max_drawdown_pct,
+        "avg_r": metrics.avg_r,
+        "max_r": metrics.max_r,
+        "min_r": metrics.min_r,
+        "pct_r_below_minus_one": metrics.pct_r_below_minus_one,
     }
 
 
@@ -130,6 +172,13 @@ def _format_metrics(metrics: AggregateMetrics) -> str:
         f"median_mfe {_format_float(metrics.median_mfe)}",
         f"mean_etd {_format_float(metrics.mean_etd)}",
         f"median_etd {_format_float(metrics.median_etd)}",
+        f"payoff_ratio {_format_float(metrics.payoff_ratio)}",
+        f"max_drawdown {_format_float(metrics.max_drawdown)}",
+        f"max_drawdown_pct {_format_float(metrics.max_drawdown_pct)}",
+        f"avg_r {_format_float(metrics.avg_r)}",
+        f"max_r {_format_float(metrics.max_r)}",
+        f"min_r {_format_float(metrics.min_r)}",
+        f"pct_r_below_minus_one {_format_float(metrics.pct_r_below_minus_one)}",
     ]
     return "\n".join(lines)
 

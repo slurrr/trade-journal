@@ -17,7 +17,11 @@ from trade_journal.ingest.apex_funding import load_funding
 from trade_journal.ingest.apex_liquidations import load_liquidations
 from trade_journal.ingest.apex_omni import load_fills
 from trade_journal.metrics.risk import initial_stop_for_trade
-from trade_journal.metrics.summary import compute_aggregate_metrics, compute_trade_metrics
+from trade_journal.metrics.summary import (
+    compute_aggregate_metrics,
+    compute_trade_metrics,
+    compute_zella_score,
+)
 from trade_journal.ingest.apex_orders import load_orders
 from trade_journal.reconstruct.funding import apply_funding_events
 from trade_journal.reconstruct.trades import reconstruct_trades
@@ -158,11 +162,11 @@ def _load_journal_state() -> dict[str, Any]:
     liquidation_matches: dict[str, dict[str, Any]] = {}
     if liquidations_path is not None:
         liquidation_result = load_liquidations(liquidations_path)
-        liquidation_events = [_liquidation_payload(event) for event in liquidation_result.events]
         if liquidation_result.skipped:
             data_note = _append_note(data_note, f"Skipped {liquidation_result.skipped} liquidation rows.")
 
         liquidation_matches = _match_liquidations(trades, liquidation_result.events)
+        liquidation_events = _build_liquidation_events(trades, liquidation_result.events, liquidation_matches)
 
     excursions_map: dict[str, dict[str, Any]] = {}
     if excursions_path is not None:
@@ -176,14 +180,22 @@ def _load_journal_state() -> dict[str, Any]:
     if excursions_map:
         _apply_excursions_cache(trades, excursions_map)
 
+    risk_map: dict[str, Any] = {}
+    if orders:
+        for trade in trades:
+            risk = initial_stop_for_trade(trade, orders)
+            setattr(trade, "r_multiple", risk.r_multiple)
+            risk_map[trade.trade_id] = risk
+
     metrics = compute_aggregate_metrics(trades) if trades else None
     summary = _summary_payload(metrics) if metrics else _empty_summary()
+    zella_score = compute_zella_score(trades, metrics) if metrics else None
 
     trade_items = [
         _trade_payload(
             trade,
             liquidation_matches.get(trade.trade_id),
-            initial_stop_for_trade(trade, orders) if orders else None,
+            risk_map.get(trade.trade_id),
         )
         for trade in trades
     ]
@@ -194,6 +206,9 @@ def _load_journal_state() -> dict[str, Any]:
         "equity_curve": _equity_curve(trade_items),
         "daily_pnl": _daily_pnl(trade_items),
         "pnl_distribution": _pnl_distribution(trade_items),
+        "time_performance": _time_performance(trade_items),
+        "symbol_breakdown": _symbol_breakdown(trade_items),
+        "zella_score": zella_score,
         "recent_trades": trade_items[:6],
         "trades": trade_items,
         "symbols": sorted({item["symbol"] for item in trade_items}),
@@ -387,6 +402,28 @@ def _liquidation_payload(event) -> dict[str, Any]:
     }
 
 
+def _build_liquidation_events(
+    trades: list,
+    events: list,
+    matches: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for trade in trades:
+        match = matches.get(trade.trade_id)
+        if match is None:
+            continue
+        payload = dict(match)
+        if payload.get("total_pnl") is None:
+            payload["total_pnl"] = trade.realized_pnl_net
+        output.append(payload)
+
+    if not output:
+        output = [_liquidation_payload(event) for event in events]
+
+    output.sort(key=lambda item: item["created_at"], reverse=True)
+    return output
+
+
 def _match_liquidations(trades: list, events: list, window_seconds: int = 21600) -> dict[str, dict[str, Any]]:
     remaining = list(events)
     matches: dict[str, dict[str, Any]] = {}
@@ -438,6 +475,7 @@ def _summary_payload(metrics) -> dict[str, Any]:
         "expectancy": metrics.expectancy,
         "avg_win": metrics.avg_win,
         "avg_loss": metrics.avg_loss,
+        "payoff_ratio": metrics.payoff_ratio,
         "largest_win": metrics.largest_win,
         "largest_loss": metrics.largest_loss,
         "max_consecutive_wins": metrics.max_consecutive_wins,
@@ -447,6 +485,12 @@ def _summary_payload(metrics) -> dict[str, Any]:
         "total_fees": metrics.total_fees,
         "total_funding": metrics.total_funding,
         "avg_duration_seconds": metrics.avg_duration_seconds,
+        "max_drawdown": metrics.max_drawdown,
+        "max_drawdown_pct": metrics.max_drawdown_pct,
+        "avg_r": metrics.avg_r,
+        "max_r": metrics.max_r,
+        "min_r": metrics.min_r,
+        "pct_r_below_minus_one": metrics.pct_r_below_minus_one,
         "mean_mae": metrics.mean_mae,
         "median_mae": metrics.median_mae,
         "mean_mfe": metrics.mean_mfe,
@@ -467,6 +511,7 @@ def _empty_summary() -> dict[str, Any]:
         "expectancy": None,
         "avg_win": None,
         "avg_loss": None,
+        "payoff_ratio": None,
         "largest_win": None,
         "largest_loss": None,
         "max_consecutive_wins": 0,
@@ -476,6 +521,12 @@ def _empty_summary() -> dict[str, Any]:
         "total_fees": 0.0,
         "total_funding": 0.0,
         "avg_duration_seconds": None,
+        "max_drawdown": None,
+        "max_drawdown_pct": None,
+        "avg_r": None,
+        "max_r": None,
+        "min_r": None,
+        "pct_r_below_minus_one": None,
         "mean_mae": None,
         "median_mae": None,
         "mean_mfe": None,
@@ -514,6 +565,63 @@ def _daily_pnl(trades: list[dict[str, Any]]) -> dict[str, Any]:
         for day, pnl in sorted(buckets.items(), key=lambda pair: pair[0])
     ]
     return {"series": series}
+
+
+def _time_performance(trades: list[dict[str, Any]]) -> dict[str, Any]:
+    hourly: dict[int, list[float]] = defaultdict(list)
+    weekday: dict[int, list[float]] = defaultdict(list)
+    for item in trades:
+        exit_local = item["exit_time"].astimezone()
+        hourly[exit_local.hour].append(item["realized_pnl_net"])
+        weekday[exit_local.weekday()].append(item["realized_pnl_net"])
+    return {
+        "hourly": [_bucket_summary(hour, values) for hour, values in sorted(hourly.items())],
+        "weekday": [_bucket_summary(day, values) for day, values in sorted(weekday.items())],
+    }
+
+
+def _symbol_breakdown(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for item in trades:
+        buckets[item["symbol"]].append(item)
+    rows = []
+    for symbol, items in sorted(buckets.items(), key=lambda pair: pair[0]):
+        wins = sum(1 for item in items if item["realized_pnl_net"] > 0)
+        losses = sum(1 for item in items if item["realized_pnl_net"] < 0)
+        total = len(items)
+        win_rate = wins / (wins + losses) if wins + losses else None
+        total_net = sum(item["realized_pnl_net"] for item in items)
+        total_win = sum(item["realized_pnl_net"] for item in items if item["realized_pnl_net"] > 0)
+        total_loss = sum(item["realized_pnl_net"] for item in items if item["realized_pnl_net"] < 0)
+        profit_factor = None
+        if total_loss < 0:
+            profit_factor = total_win / abs(total_loss)
+        avg_net = total_net / total if total else 0.0
+        rows.append(
+            {
+                "symbol": symbol,
+                "trades": total,
+                "win_rate": win_rate,
+                "total_net_pnl": total_net,
+                "avg_net_pnl": avg_net,
+                "profit_factor": profit_factor,
+            }
+        )
+    return rows
+
+
+def _bucket_summary(key: int, values: list[float]) -> dict[str, Any]:
+    wins = sum(1 for value in values if value > 0)
+    losses = sum(1 for value in values if value < 0)
+    total = len(values)
+    win_rate = wins / (wins + losses) if wins + losses else None
+    return {
+        "bucket": key,
+        "count": total,
+        "total_pnl": sum(values),
+        "avg_pnl": sum(values) / total if total else 0.0,
+        "win_rate": win_rate,
+    }
 
 
 def _calendar_data(trades: list[dict[str, Any]], month_param: str | None = None) -> dict[str, Any]:
