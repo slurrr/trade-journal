@@ -12,7 +12,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from jinja2 import Undefined
 
+from trade_journal.config.accounts import resolve_account_context, resolve_data_path
 from trade_journal.ingest.apex_funding import load_funding
 from trade_journal.ingest.apex_liquidations import load_liquidations
 from trade_journal.ingest.apex_omni import load_fills
@@ -110,6 +112,19 @@ def analytics_page(request: Request) -> HTMLResponse:
     daily_pnl = _daily_pnl(filtered_items)
     equity_curve = _equity_curve(filtered_items)
     diagnostics = _diagnostics_payload(filtered_items)
+    diagnostics_table = [
+        {
+            "symbol": row["symbol"],
+            "pnl": row["pnl"],
+            "mae": row["mae"],
+            "mfe": row["mfe"],
+            "etd": row["etd"],
+            "capture_pct": row.get("capture_pct"),
+            "heat_pct": row.get("heat_pct"),
+        }
+        for row in diagnostics.get("table", [])
+    ]
+    calendar_data = _calendar_data(filtered_items)
 
     context = {
         "request": request,
@@ -123,8 +138,12 @@ def analytics_page(request: Request) -> HTMLResponse:
         "pnl_distribution": pnl_distribution,
         "time_performance": time_perf,
         "symbol_breakdown": symbol_breakdown,
+        "direction_stats": _direction_analysis(filtered_trades),
         "diagnostics": diagnostics,
+        "scatter": diagnostics,
+        "diagnostics_table": diagnostics_table,
         "trades": filtered_items,
+        "calendar": calendar_data,
         "symbols": payload["symbols"],
         "query_base": filters["query_base"],
         "data_note": payload.get("data_note"),
@@ -165,10 +184,15 @@ def trades_api() -> list[dict[str, Any]]:
 
 
 def _load_journal_state() -> dict[str, Any]:
-    fills_path, funding_path, liquidations_path, excursions_path, orders_path = _resolve_paths()
+    context = resolve_account_context(env=os.environ)
+    fills_path, funding_path, liquidations_path, excursions_path, orders_path = _resolve_paths(context)
     data_note = None
 
     if fills_path is None:
+        note = (
+            "No fills file found. "
+            f"Place a fills export at {context.data_dir}/fills.json or set TRADE_JOURNAL_FILLS."
+        )
         return {
             "summary": {},
             "equity_curve": {},
@@ -178,17 +202,17 @@ def _load_journal_state() -> dict[str, Any]:
             "trades": [],
             "symbols": [],
             "liquidations": [],
-            "data_note": "No fills file found. Place a fills export at data/fills.json or set TRADE_JOURNAL_FILLS.",
+            "data_note": note,
         }
 
-    ingest_result = load_fills(fills_path)
+    ingest_result = load_fills(fills_path, source=context.source, account_id=context.account_id)
     trades = reconstruct_trades(ingest_result.fills)
 
     if ingest_result.skipped:
         data_note = f"Skipped {ingest_result.skipped} fill rows during normalization."
 
     if funding_path is not None:
-        funding_result = load_funding(funding_path)
+        funding_result = load_funding(funding_path, source=context.source, account_id=context.account_id)
         attributions = apply_funding_events(trades, funding_result.events)
         unmatched = sum(1 for item in attributions if item.matched_trade_id is None)
         if funding_result.skipped:
@@ -198,7 +222,7 @@ def _load_journal_state() -> dict[str, Any]:
 
     orders: list[Any] = []
     if orders_path is not None:
-        orders_result = load_orders(orders_path)
+        orders_result = load_orders(orders_path, source=context.source, account_id=context.account_id)
         orders = orders_result.orders
         if orders_result.skipped:
             data_note = _append_note(data_note, f"Skipped {orders_result.skipped} order rows.")
@@ -208,7 +232,9 @@ def _load_journal_state() -> dict[str, Any]:
     liquidation_events: list[dict[str, Any]] = []
     liquidation_matches: dict[str, dict[str, Any]] = {}
     if liquidations_path is not None:
-        liquidation_result = load_liquidations(liquidations_path)
+        liquidation_result = load_liquidations(
+            liquidations_path, source=context.source, account_id=context.account_id
+        )
         if liquidation_result.skipped:
             data_note = _append_note(data_note, f"Skipped {liquidation_result.skipped} liquidation rows.")
 
@@ -257,7 +283,13 @@ def _load_journal_state() -> dict[str, Any]:
         "time_performance": _time_performance(trade_items),
         "symbol_breakdown": _symbol_breakdown(trade_items),
         "performance_score": performance_score,
-        "account": _load_account_snapshot(),
+        "account": _load_account_snapshot(context),
+        "account_context": {
+            "name": context.name,
+            "source": context.source,
+            "account_id": context.account_id,
+            "data_dir": str(context.data_dir),
+        },
         "recent_trades": trade_items[:6],
         "trades": trade_items,
         "trade_objects": trades,
@@ -267,16 +299,18 @@ def _load_journal_state() -> dict[str, Any]:
     }
 
 
-def _resolve_paths() -> tuple[Path | None, Path | None, Path | None, Path | None, Path | None]:
+def _resolve_paths(
+    context,
+) -> tuple[Path | None, Path | None, Path | None, Path | None, Path | None]:
     fills_env = os.environ.get("TRADE_JOURNAL_FILLS")
     funding_env = os.environ.get("TRADE_JOURNAL_FUNDING")
     liquidations_env = os.environ.get("TRADE_JOURNAL_LIQUIDATIONS")
     excursions_env = os.environ.get("TRADE_JOURNAL_EXCURSIONS")
     orders_env = os.environ.get("TRADE_JOURNAL_ORDERS")
 
-    fills_path = Path(fills_env) if fills_env else Path("data/fills.json")
+    fills_path = Path(fills_env) if fills_env else resolve_data_path(None, context, "fills.json")
     if not fills_path.exists():
-        fills_path = Path("data/fills.csv")
+        fills_path = resolve_data_path(None, context, "fills.csv")
     if not fills_path.exists():
         fills_path = None
 
@@ -286,7 +320,7 @@ def _resolve_paths() -> tuple[Path | None, Path | None, Path | None, Path | None
         if candidate.exists():
             funding_path = candidate
     else:
-        candidate = Path("data/funding.json")
+        candidate = resolve_data_path(None, context, "funding.json")
         if candidate.exists():
             funding_path = candidate
     liquidations_path = None
@@ -295,11 +329,11 @@ def _resolve_paths() -> tuple[Path | None, Path | None, Path | None, Path | None
         if candidate.exists():
             liquidations_path = candidate
     else:
-        candidate = Path("data/liquidations.json")
+        candidate = resolve_data_path(None, context, "liquidations.json")
         if candidate.exists():
             liquidations_path = candidate
         else:
-            candidate = Path("data/historical_pnl.json")
+            candidate = resolve_data_path(None, context, "historical_pnl.json")
             if candidate.exists():
                 liquidations_path = candidate
 
@@ -309,7 +343,7 @@ def _resolve_paths() -> tuple[Path | None, Path | None, Path | None, Path | None
         if candidate.exists():
             excursions_path = candidate
     else:
-        candidate = Path("data/excursions.json")
+        candidate = resolve_data_path(None, context, "excursions.json")
         if candidate.exists():
             excursions_path = candidate
 
@@ -319,11 +353,11 @@ def _resolve_paths() -> tuple[Path | None, Path | None, Path | None, Path | None
         if candidate.exists():
             orders_path = candidate
     else:
-        candidate = Path("data/history_orders.json")
+        candidate = resolve_data_path(None, context, "history_orders.json")
         if candidate.exists():
             orders_path = candidate
         else:
-            candidate = Path("data/open_orders.json")
+            candidate = resolve_data_path(None, context, "open_orders.json")
             if candidate.exists():
                 orders_path = candidate
 
@@ -361,9 +395,12 @@ def _trade_payload(
 ) -> dict[str, Any]:
     metrics = compute_trade_metrics(trade)
     ui_id = _trade_ui_id(trade)
+    capture_pct, heat_pct = _capture_heat_pct(trade)
     return {
         "ui_id": ui_id,
         "trade_id": trade.trade_id,
+        "source": trade.source,
+        "account_id": trade.account_id,
         "symbol": trade.symbol,
         "side": trade.side,
         "entry_time": trade.entry_time,
@@ -380,6 +417,8 @@ def _trade_payload(
         "mae": trade.mae,
         "mfe": trade.mfe,
         "etd": trade.etd,
+        "capture_pct": capture_pct,
+        "heat_pct": heat_pct,
         "fills": trade.fills,
         "outcome": metrics.outcome,
         "return_pct": metrics.return_pct,
@@ -395,6 +434,8 @@ def _trade_payload(
 
 def _trade_ui_id(trade) -> str:
     parts = [
+        trade.source,
+        trade.account_id or "",
         trade.symbol,
         trade.side,
         trade.entry_time.isoformat(),
@@ -411,6 +452,8 @@ def _trade_ui_id(trade) -> str:
 
 def _excursions_key(trade, use_local: bool = False) -> str:
     parts = [
+        trade.source,
+        trade.account_id or "",
         trade.symbol,
         trade.side,
         (trade.entry_time.astimezone() if use_local else trade.entry_time).isoformat(),
@@ -424,16 +467,44 @@ def _excursions_key(trade, use_local: bool = False) -> str:
     return "|".join(parts)
 
 
+def _capture_heat_pct(trade) -> tuple[float | None, float | None]:
+    mfe = trade.mfe
+    if mfe is None or mfe <= 0:
+        return None, None
+    capture_pct = (trade.realized_pnl_net / mfe) * 100.0
+    heat_pct = (trade.mae / mfe) * 100.0 if trade.mae is not None else None
+    return capture_pct, heat_pct
+
+
 def _apply_excursions_cache(trades: list, excursions_map: dict[str, dict[str, Any]]) -> None:
     for trade in trades:
         excursions = excursions_map.get(_excursions_key(trade))
         if excursions is None:
             excursions = excursions_map.get(_excursions_key(trade, use_local=True))
+        if excursions is None:
+            excursions = excursions_map.get(_excursions_key_legacy(trade))
+        if excursions is None:
+            excursions = excursions_map.get(_excursions_key_legacy(trade, use_local=True))
         if not excursions:
             continue
         trade.mae = excursions.get("mae")
         trade.mfe = excursions.get("mfe")
         trade.etd = excursions.get("etd")
+
+
+def _excursions_key_legacy(trade, use_local: bool = False) -> str:
+    parts = [
+        trade.symbol,
+        trade.side,
+        (trade.entry_time.astimezone() if use_local else trade.entry_time).isoformat(),
+        (trade.exit_time.astimezone() if use_local else trade.exit_time).isoformat(),
+        f"{trade.entry_price:.8f}",
+        f"{trade.exit_price:.8f}",
+        f"{trade.entry_size:.8f}",
+        f"{trade.exit_size:.8f}",
+        f"{trade.realized_pnl:.8f}",
+    ]
+    return "|".join(parts)
 
 
 def _liquidation_payload(event) -> dict[str, Any]:
@@ -608,9 +679,9 @@ def _initial_equity() -> float | None:
         return None
 
 
-def _load_account_snapshot() -> dict[str, Any] | None:
+def _load_account_snapshot(context) -> dict[str, Any] | None:
     env_path = os.environ.get("TRADE_JOURNAL_ACCOUNT", "").strip()
-    path = Path(env_path) if env_path else Path("data/account.json")
+    path = Path(env_path) if env_path else resolve_data_path(None, context, "account.json")
     if not path.exists():
         return None
     try:
@@ -749,6 +820,8 @@ def _diagnostics_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
             "mae": item["mae"],
             "mfe": item["mfe"],
             "etd": item["etd"],
+            "capture_pct": item.get("capture_pct"),
+            "heat_pct": item.get("heat_pct"),
         }
         for item in items
     ]
@@ -757,6 +830,21 @@ def _diagnostics_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
         "mfe_pnl": mfe_pnl,
         "table": table,
     }
+
+
+def _direction_analysis(trades: list) -> dict[str, dict[str, Any]]:
+    output: dict[str, dict[str, Any]] = {}
+    for side in ("long", "short"):
+        side_trades = [trade for trade in trades if trade.side.lower() == side]
+        metrics = compute_aggregate_metrics(side_trades) if side_trades else None
+        output[side] = {
+            "trades": len(side_trades),
+            "win_rate": metrics.win_rate if metrics else None,
+            "profit_factor": metrics.profit_factor if metrics else None,
+            "expectancy": metrics.expectancy if metrics else None,
+            "net_pnl": metrics.total_net_pnl if metrics else 0.0,
+        }
+    return output
 
 
 def _first_timestamp(data: dict[str, Any], *keys: str) -> str | None:
@@ -1058,10 +1146,14 @@ def _format_duration(seconds: float | None) -> str:
 
 
 def money_filter(value: float | None) -> str:
-    if value is None:
+    if value is None or isinstance(value, Undefined):
         return "n/a"
-    sign = "-" if value < 0 else ""
-    return f"{sign}${abs(value):,.2f}"
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    sign = "-" if amount < 0 else ""
+    return f"{sign}${abs(amount):,.2f}"
 
 
 def percent_filter(value: float | None) -> str:

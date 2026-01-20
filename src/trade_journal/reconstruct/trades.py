@@ -10,6 +10,8 @@ from trade_journal.models import Fill, Trade
 
 @dataclass
 class PositionState:
+    source: str
+    account_id: str | None
     symbol: str
     size: float = 0.0
     avg_entry_price: float = 0.0
@@ -31,16 +33,17 @@ EPSILON = 1e-9
 def reconstruct_trades(fills: Iterable[Fill]) -> list[Trade]:
     ordered = sorted(fills, key=_sort_key)
     # Assumes one-way position mode per symbol; hedge-mode would need separate buckets.
-    states: dict[str, PositionState] = {}
+    states: dict[tuple[str, str | None, str], PositionState] = {}
     trades: list[Trade] = []
 
     for fill in ordered:
         if fill.size == 0:
             continue
-        state = states.get(fill.symbol)
+        key = (fill.source, fill.account_id, fill.symbol)
+        state = states.get(key)
         if state is None:
-            state = PositionState(symbol=fill.symbol)
-            states[fill.symbol] = state
+            state = PositionState(source=fill.source, account_id=fill.account_id, symbol=fill.symbol)
+            states[key] = state
         _apply_fill_to_state(state, fill, trades)
 
     return trades
@@ -48,7 +51,7 @@ def reconstruct_trades(fills: Iterable[Fill]) -> list[Trade]:
 
 def _sort_key(fill: Fill) -> tuple:
     tie = fill.fill_id or fill.order_id or ""
-    return (fill.timestamp, tie)
+    return (fill.source, fill.account_id or "", fill.timestamp, tie)
 
 
 def _apply_fill_to_state(state: PositionState, fill: Fill, trades: list[Trade]) -> None:
@@ -148,6 +151,8 @@ def _finalize_trade(state: PositionState, exit_time: datetime, trades: list[Trad
 
     trade = Trade(
         trade_id=str(uuid4()),
+        source=state.source,
+        account_id=state.account_id,
         symbol=state.symbol,
         side=state.side,
         entry_time=state.entry_time,
@@ -195,5 +200,7 @@ def _slice_fill(fill: Fill, size: float, fee: float, suffix: str, reason: str) -
         fee=fee,
         fee_asset=fill.fee_asset,
         timestamp=fill.timestamp,
+        source=fill.source,
+        account_id=fill.account_id,
         raw=raw,
     )

@@ -11,6 +11,8 @@ from typing import Any, Iterable, Mapping
 @dataclass(frozen=True)
 class LiquidationEvent:
     liquidation_id: str | None
+    source: str
+    account_id: str | None
     symbol: str
     side: str
     size: float
@@ -30,35 +32,48 @@ class LiquidationIngestResult:
     skipped: int = 0
 
 
-def load_liquidations(path: str | Path) -> LiquidationIngestResult:
-    source = Path(path)
-    suffix = source.suffix.lower()
+def load_liquidations(
+    path: str | Path, *, source: str | None = None, account_id: str | None = None
+) -> LiquidationIngestResult:
+    source_path = Path(path)
+    suffix = source_path.suffix.lower()
     if suffix == ".json":
-        return _load_liquidations_json(source)
+        return _load_liquidations_json(source_path, source_name=source, account_id=account_id)
     if suffix in {".csv", ".tsv"}:
-        return _load_liquidations_csv(source, delimiter="\t" if suffix == ".tsv" else ",")
-    raise ValueError(f"Unsupported file type: {source.suffix}")
+        return _load_liquidations_csv(
+            source_path,
+            delimiter="\t" if suffix == ".tsv" else ",",
+            source_name=source,
+            account_id=account_id,
+        )
+    raise ValueError(f"Unsupported file type: {source_path.suffix}")
 
 
-def extract_liquidations(payload: Any) -> LiquidationIngestResult:
+def extract_liquidations(
+    payload: Any, *, source: str | None = None, account_id: str | None = None
+) -> LiquidationIngestResult:
     records = _extract_records(payload)
-    events, skipped = _normalize_records(records)
+    events, skipped = _normalize_records(records, source_name=source, account_id=account_id)
     return LiquidationIngestResult(events=events, skipped=skipped)
 
 
-def _load_liquidations_json(path: Path) -> LiquidationIngestResult:
+def _load_liquidations_json(
+    path: Path, *, source_name: str | None, account_id: str | None
+) -> LiquidationIngestResult:
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
 
     records = _extract_records(payload)
-    events, skipped = _normalize_records(records)
+    events, skipped = _normalize_records(records, source_name=source_name, account_id=account_id)
     return LiquidationIngestResult(events=events, skipped=skipped)
 
 
-def _load_liquidations_csv(path: Path, delimiter: str) -> LiquidationIngestResult:
+def _load_liquidations_csv(
+    path: Path, delimiter: str, *, source_name: str | None, account_id: str | None
+) -> LiquidationIngestResult:
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter=delimiter)
-        events, skipped = _normalize_records(reader)
+        events, skipped = _normalize_records(reader, source_name=source_name, account_id=account_id)
     return LiquidationIngestResult(events=events, skipped=skipped)
 
 
@@ -79,21 +94,29 @@ def _extract_records(payload: Any) -> Iterable[Mapping[str, Any]]:
     return []
 
 
-def _normalize_records(records: Iterable[Mapping[str, Any]]) -> tuple[list[LiquidationEvent], int]:
+def _normalize_records(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    source_name: str | None,
+    account_id: str | None,
+) -> tuple[list[LiquidationEvent], int]:
     events: list[LiquidationEvent] = []
     skipped = 0
     for raw in records:
         if not _is_liquidation(raw):
             continue
         try:
-            events.append(_normalize_event(raw))
+            events.append(_normalize_event(raw, source_name=source_name, account_id=account_id))
         except ValueError:
             skipped += 1
     return events, skipped
 
 
-def _normalize_event(raw: Mapping[str, Any]) -> LiquidationEvent:
+def _normalize_event(
+    raw: Mapping[str, Any], *, source_name: str | None, account_id: str | None
+) -> LiquidationEvent:
     liquidation_id = _pick(raw, "id", "liquidationId")
+    resolved_account = account_id or _pick(raw, "accountId", "account_id")
     symbol = _pick(raw, "symbol", "market")
     side = _normalize_side(_pick(raw, "side"))
     size = _to_float(_pick(raw, "size", "qty", "positionSize"), default=None)
@@ -112,6 +135,8 @@ def _normalize_event(raw: Mapping[str, Any]) -> LiquidationEvent:
 
     return LiquidationEvent(
         liquidation_id=str(liquidation_id) if liquidation_id is not None else None,
+        source=str(source_name or "apex"),
+        account_id=str(resolved_account) if resolved_account is not None else None,
         symbol=str(symbol),
         side=side,
         size=size,

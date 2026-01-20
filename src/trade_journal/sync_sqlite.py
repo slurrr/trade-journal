@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from trade_journal.config.accounts import resolve_account_context, resolve_data_path
 from trade_journal.ingest.apex_funding import load_funding
 from trade_journal.ingest.apex_liquidations import load_liquidations
 from trade_journal.ingest.apex_omni import load_fills
@@ -22,34 +23,47 @@ from trade_journal.storage.sqlite_store import (
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Persist ApeX data files into SQLite.")
     parser.add_argument("--db", type=Path, default=Path("data/trade_journal.sqlite"), help="SQLite DB path.")
-    parser.add_argument("--fills", type=Path, default=Path("data/fills.json"), help="Fills JSON path.")
-    parser.add_argument("--orders", type=Path, default=Path("data/history_orders.json"), help="Orders JSON path.")
-    parser.add_argument("--funding", type=Path, default=Path("data/funding.json"), help="Funding JSON path.")
+    parser.add_argument("--account", type=str, default=None, help="Account name from accounts config.")
+    parser.add_argument("--fills", type=Path, default=None, help="Fills JSON path.")
+    parser.add_argument("--orders", type=Path, default=None, help="Orders JSON path.")
+    parser.add_argument("--funding", type=Path, default=None, help="Funding JSON path.")
     parser.add_argument(
         "--liquidations",
         type=Path,
-        default=Path("data/liquidations.json"),
+        default=None,
         help="Liquidations JSON path.",
     )
     parser.add_argument(
         "--historical-pnl",
         type=Path,
-        default=Path("data/historical_pnl.json"),
+        default=None,
         help="Historical PnL JSON path.",
     )
     parser.add_argument(
         "--report-out",
         type=Path,
-        default=Path("data/sync_report.json"),
+        default=None,
         help="Write sync validation counts to this file.",
     )
     parser.add_argument(
         "--log-out",
         type=Path,
-        default=Path("data/last_sync.json"),
+        default=None,
         help="Write last successful sync metadata to this file.",
     )
     args = parser.parse_args(argv)
+
+    context = resolve_account_context(args.account)
+    fills_path = args.fills
+    if fills_path is None:
+        fills_path = resolve_data_path(None, context, "fills.json")
+        if not fills_path.exists():
+            candidate = resolve_data_path(None, context, "fills.csv")
+            fills_path = candidate if candidate.exists() else fills_path
+    orders_path = args.orders or resolve_data_path(None, context, "history_orders.json")
+    funding_path = args.funding or resolve_data_path(None, context, "funding.json")
+    liquidations_path = args.liquidations or resolve_data_path(None, context, "liquidations.json")
+    historical_pnl_path = args.historical_pnl or resolve_data_path(None, context, "historical_pnl.json")
 
     conn = connect(args.db)
     init_db(conn)
@@ -57,32 +71,32 @@ def main(argv: list[str] | None = None) -> int:
     total = 0
     summaries: list[str] = []
     report: dict[str, dict[str, int]] = {}
-    if args.fills.exists():
-        result = load_fills(args.fills)
+    if fills_path.exists():
+        result = load_fills(fills_path, source=context.source, account_id=context.account_id)
         valid_fills, skipped_invalid = _validate_fills(result.fills)
         total += upsert_fills(conn, valid_fills)
         summaries.append(_summary_line("fills", len(valid_fills), result.skipped, skipped_invalid))
         report["fills"] = _report_entry(len(valid_fills), result.skipped, skipped_invalid)
-    if args.orders.exists():
-        result = load_orders(args.orders)
+    if orders_path.exists():
+        result = load_orders(orders_path, source=context.source, account_id=context.account_id)
         valid_orders, skipped_invalid = _validate_orders(result.orders)
         total += upsert_orders(conn, valid_orders)
         summaries.append(_summary_line("orders", len(valid_orders), result.skipped, skipped_invalid))
         report["orders"] = _report_entry(len(valid_orders), result.skipped, skipped_invalid)
-    if args.funding.exists():
-        result = load_funding(args.funding)
+    if funding_path.exists():
+        result = load_funding(funding_path, source=context.source, account_id=context.account_id)
         valid_funding, skipped_invalid = _validate_funding(result.events)
         total += upsert_funding(conn, valid_funding)
         summaries.append(_summary_line("funding", len(valid_funding), result.skipped, skipped_invalid))
         report["funding"] = _report_entry(len(valid_funding), result.skipped, skipped_invalid)
-    if args.liquidations.exists():
-        result = load_liquidations(args.liquidations)
+    if liquidations_path.exists():
+        result = load_liquidations(liquidations_path, source=context.source, account_id=context.account_id)
         valid_liquidations, skipped_invalid = _validate_liquidations(result.events)
         total += upsert_liquidations(conn, valid_liquidations)
         summaries.append(_summary_line("liquidations", len(valid_liquidations), result.skipped, skipped_invalid))
         report["liquidations"] = _report_entry(len(valid_liquidations), result.skipped, skipped_invalid)
-    if args.historical_pnl.exists():
-        records = load_historical_pnl(args.historical_pnl)
+    if historical_pnl_path.exists():
+        records = load_historical_pnl(historical_pnl_path, source=context.source, account_id=context.account_id)
         valid_pnl, skipped_invalid = _validate_pnl(records)
         total += upsert_historical_pnl(conn, valid_pnl)
         summaries.append(_summary_line("historical_pnl", len(valid_pnl), 0, skipped_invalid))
@@ -91,12 +105,14 @@ def main(argv: list[str] | None = None) -> int:
     print(f"upserted_rows {total}")
     for line in summaries:
         print(line)
-    if args.report_out is not None:
-        args.report_out.parent.mkdir(parents=True, exist_ok=True)
-        args.report_out.write_text(_report_json(report), encoding="utf-8")
-    if args.log_out is not None:
-        args.log_out.parent.mkdir(parents=True, exist_ok=True)
-        args.log_out.write_text(_log_json(args.db, total, report), encoding="utf-8")
+    report_out = args.report_out or resolve_data_path(None, context, "sync_report.json")
+    log_out = args.log_out or resolve_data_path(None, context, "last_sync.json")
+    if report_out is not None:
+        report_out.parent.mkdir(parents=True, exist_ok=True)
+        report_out.write_text(_report_json(report), encoding="utf-8")
+    if log_out is not None:
+        log_out.parent.mkdir(parents=True, exist_ok=True)
+        log_out.write_text(_log_json(args.db, total, report), encoding="utf-8")
     return 0
 
 

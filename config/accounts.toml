@@ -1,0 +1,8 @@
+default_account = "main"
+
+[accounts.main]
+source = "apex"
+# Optional: the accountId from ApeX payloads.
+account_id = "744071692601524323"
+# Where this account's data files live.
+data_dir = "data/main"

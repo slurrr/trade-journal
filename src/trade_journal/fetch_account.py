@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from trade_journal.config.accounts import resolve_account_context, resolve_data_path
 from trade_journal.ingest.apex_api import ApexApiClient, ApexApiConfig, load_dotenv
 
 
@@ -14,7 +15,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--raw", action="store_true", help="Print raw JSON response.")
     parser.add_argument("--env", type=Path, default=Path(".env"), help="Path to .env file.")
     parser.add_argument("--base-url", type=str, default=None, help="Override APEX_BASE_URL.")
-    parser.add_argument("--out", type=Path, default=Path("data/account.json"), help="Output file.")
+    parser.add_argument("--account", type=str, default=None, help="Account name from accounts config.")
+    parser.add_argument("--out", type=Path, default=None, help="Output file.")
     args = parser.parse_args(argv)
 
     env = dict(os.environ)
@@ -23,6 +25,7 @@ def main(argv: list[str] | None = None) -> int:
         env["APEX_BASE_URL"] = args.base_url
     config = ApexApiConfig.from_env(env)
     client = ApexApiClient(config)
+    context = resolve_account_context(args.account, env=env)
 
     payload = client.fetch_account()
     text = json.dumps(payload, indent=2, sort_keys=True)
@@ -31,8 +34,9 @@ def main(argv: list[str] | None = None) -> int:
         print(text)
         return 0
 
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(text + "\n", encoding="utf-8")
+    out_path = args.out or resolve_data_path(None, context, "account.json")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(text + "\n", encoding="utf-8")
     return 0
 
 

@@ -46,6 +46,10 @@ body {
   background: var(--bg);
 }
 
+html {
+  scrollbar-gutter: stable;
+}
+
 body::before {
   content: "";
   position: fixed;
@@ -526,12 +530,53 @@ canvas.is-panning {
   color: var(--danger);
 }
 
-.table tbody tr.trade-rekt td.positive {
+.table tbody tr.trade-rekt td.negative {
+  color: var(--danger);
+}
+
+.table tbody tr.trade-rekt td.pnl-positive,
+.table tbody tr.trade-rekt td.mfe-positive {
   color: #1a765a;
 }
 
-.table tbody tr.trade-rekt td.negative {
-  color: var(--danger);
+.capture-80 {
+  color: #0f4f3f;
+}
+
+.capture-60 {
+  color: #1a765a;
+}
+
+.capture-40 {
+  color: #d0a253;
+}
+
+.capture-20 {
+  color: #d97a3a;
+}
+
+.capture-1 {
+  color: #b03b28;
+}
+
+.capture-0 {
+  color: #7a2d1f;
+}
+
+.heat-20 {
+  color: #1a765a;
+}
+
+.heat-40 {
+  color: #d0a253;
+}
+
+.heat-60 {
+  color: #d97a3a;
+}
+
+.heat-80 {
+  color: #b03b28;
 }
 
 .pill {
@@ -656,6 +701,63 @@ canvas.is-panning {
   font-size: 1.1rem;
   font-weight: 600;
   margin-top: 6px;
+}
+
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 16px;
+}
+
+.stat-card {
+  padding: 16px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: rgba(255, 250, 242, 0.8);
+}
+
+:root[data-theme="dark"] .stat-card {
+  background: rgba(28, 24, 22, 0.8);
+}
+
+.stat-sub {
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin-top: 6px;
+}
+
+.direction-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 16px;
+}
+
+.direction-card {
+  padding: 18px;
+  border-radius: 16px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  box-shadow: var(--shadow);
+}
+
+.direction-title {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+.direction-value {
+  font-size: 1.8rem;
+  font-weight: 600;
+  margin: 8px 0;
+}
+
+.direction-metrics {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.9rem;
 }
 
 .excursion-grid {
@@ -953,6 +1055,16 @@ canvas.is-panning {
   margin-top: 8px;
   width: 100%;
   max-width: 220px;
+}
+
+.calendar-grid.compact {
+  margin-top: 12px;
+  gap: 6px;
+}
+
+.calendar-day.compact {
+  min-height: 64px;
+  padding: 8px;
 }
 
 .calendar-mini-day {

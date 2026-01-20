@@ -16,29 +16,40 @@ class FundingIngestResult:
     skipped: int = 0
 
 
-def load_funding(path: str | Path) -> FundingIngestResult:
-    source = Path(path)
-    suffix = source.suffix.lower()
+def load_funding(
+    path: str | Path, *, source: str | None = None, account_id: str | None = None
+) -> FundingIngestResult:
+    source_path = Path(path)
+    suffix = source_path.suffix.lower()
     if suffix == ".json":
-        return _load_funding_json(source)
+        return _load_funding_json(source_path, source_name=source, account_id=account_id)
     if suffix in {".csv", ".tsv"}:
-        return _load_funding_csv(source, delimiter="\t" if suffix == ".tsv" else ",")
-    raise ValueError(f"Unsupported file type: {source.suffix}")
+        return _load_funding_csv(
+            source_path,
+            delimiter="\t" if suffix == ".tsv" else ",",
+            source_name=source,
+            account_id=account_id,
+        )
+    raise ValueError(f"Unsupported file type: {source_path.suffix}")
 
 
-def _load_funding_json(path: Path) -> FundingIngestResult:
+def _load_funding_json(
+    path: Path, *, source_name: str | None, account_id: str | None
+) -> FundingIngestResult:
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
 
     records = _extract_records(payload)
-    events, skipped = _normalize_records(records)
+    events, skipped = _normalize_records(records, source_name=source_name, account_id=account_id)
     return FundingIngestResult(events=events, skipped=skipped)
 
 
-def _load_funding_csv(path: Path, delimiter: str) -> FundingIngestResult:
+def _load_funding_csv(
+    path: Path, delimiter: str, *, source_name: str | None, account_id: str | None
+) -> FundingIngestResult:
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter=delimiter)
-        events, skipped = _normalize_records(reader)
+        events, skipped = _normalize_records(reader, source_name=source_name, account_id=account_id)
     return FundingIngestResult(events=events, skipped=skipped)
 
 
@@ -57,20 +68,28 @@ def _extract_records(payload: Any) -> Iterable[Mapping[str, Any]]:
     raise ValueError("Unsupported JSON format for funding payload")
 
 
-def _normalize_records(records: Iterable[Mapping[str, Any]]) -> tuple[list[FundingEvent], int]:
+def _normalize_records(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    source_name: str | None,
+    account_id: str | None,
+) -> tuple[list[FundingEvent], int]:
     events: list[FundingEvent] = []
     skipped = 0
     for raw in records:
         try:
-            events.append(_normalize_event(raw))
+            events.append(_normalize_event(raw, source_name=source_name, account_id=account_id))
         except ValueError:
             skipped += 1
     return events, skipped
 
 
-def _normalize_event(raw: Mapping[str, Any]) -> FundingEvent:
+def _normalize_event(
+    raw: Mapping[str, Any], *, source_name: str | None, account_id: str | None
+) -> FundingEvent:
     funding_id = _pick(raw, "id", "fundingId")
     transaction_id = _pick(raw, "transactionId", "txId")
+    resolved_account = account_id or _pick(raw, "accountId", "account_id")
     symbol = _pick(raw, "symbol", "market", "instrument")
     side = _normalize_side(_pick(raw, "side", "positionSide"))
     rate = _to_float(_pick(raw, "rate", "fundingRate"), default=0.0)
@@ -94,6 +113,8 @@ def _normalize_event(raw: Mapping[str, Any]) -> FundingEvent:
         funding_time=funding_time,
         funding_value=funding_value,
         status=str(status) if status is not None else None,
+        source=str(source_name or "apex"),
+        account_id=str(resolved_account) if resolved_account is not None else None,
         raw=dict(raw),
     )
 

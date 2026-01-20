@@ -144,42 +144,50 @@
 </section>
 
 {% elif tab == 'diagnostics' %}
-<section class="metrics-grid">
-  <div class="metric-card">
-    <div class="metric-label">Mean MAE</div>
-    <div class="metric-value">{{ summary.mean_mae | money }}</div>
-    <div class="metric-sub">Median {{ summary.median_mae | money }}</div>
+<section class="chart-grid analytics-charts">
+  <div class="panel">
+    <div class="panel-header">
+      <div>
+        <h2>Heat</h2>
+        <p>MAE vs MFE</p>
+      </div>
+    </div>
+    <canvas id="maeMfeChart" height="180"></canvas>
   </div>
-  <div class="metric-card">
-    <div class="metric-label">Mean MFE</div>
-    <div class="metric-value">{{ summary.mean_mfe | money }}</div>
-    <div class="metric-sub">Median {{ summary.median_mfe | money }}</div>
-  </div>
-  <div class="metric-card">
-    <div class="metric-label">Mean ETD</div>
-    <div class="metric-value">{{ summary.mean_etd | money }}</div>
-    <div class="metric-sub">Median {{ summary.median_etd | money }}</div>
+  <div class="panel">
+    <div class="panel-header">
+      <div>
+        <h2>Capture</h2>
+        <p>MFE vs Realized P&amp;L</p>
+      </div>
+    </div>
+    <canvas id="mfePnlChart" height="180"></canvas>
   </div>
 </section>
 
-<section class="analytics-grid">
-  <div class="panel">
-    <div class="panel-header">
-      <div>
-        <h2>MAE vs MFE</h2>
-        <p>Execution extremes per trade.</p>
-      </div>
+<section class="panel">
+  <div class="panel-header">
+    <div>
+      <h2>Efficiency Metrics</h2>
+      <p>Mean and median excursion stats.</p>
     </div>
-    <canvas id="maeMfeScatter" height="220"></canvas>
   </div>
-  <div class="panel">
-    <div class="panel-header">
-      <div>
-        <h2>MFE vs Realized P&amp;L</h2>
-        <p>Captured vs potential.</p>
-      </div>
+  <div class="stat-grid">
+    <div class="stat-card">
+      <div class="stat-label">Mean MAE</div>
+      <div class="stat-value">{{ summary.mean_mae | money }}</div>
+      <div class="stat-sub">Median {{ summary.median_mae | money }}</div>
     </div>
-    <canvas id="mfePnlScatter" height="220"></canvas>
+    <div class="stat-card">
+      <div class="stat-label">Mean MFE</div>
+      <div class="stat-value">{{ summary.mean_mfe | money }}</div>
+      <div class="stat-sub">Median {{ summary.median_mfe | money }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Mean ETD</div>
+      <div class="stat-value">{{ summary.mean_etd | money }}</div>
+      <div class="stat-sub">Median {{ summary.median_etd | money }}</div>
+    </div>
   </div>
 </section>
 
@@ -187,32 +195,68 @@
   <div class="panel-header">
     <div>
       <h2>Diagnostics Table</h2>
-      <p>Trade-level MAE/MFE metrics.</p>
+      <p>Excursions by symbol.</p>
     </div>
   </div>
   <div class="table-wrap">
-    <table class="table">
+    <table class="table" id="diagnosticsTable">
       <thead>
         <tr>
-          <th>Symbol</th>
-          <th>Net P&amp;L</th>
-          <th>MAE</th>
-          <th>MFE</th>
-          <th>ETD</th>
+          <th data-sort="symbol">Symbol</th>
+          <th data-sort="pnl">P&amp;L</th>
+          <th data-sort="mfe">MFE</th>
+          <th data-sort="mae">MAE</th>
+          <th data-sort="capture">Capture</th>
+          <th data-sort="heat">Heat</th>
+          <th data-sort="etd">ETD</th>
         </tr>
       </thead>
       <tbody>
-        {% for row in diagnostics.table %}
-        <tr>
-          <td>{{ row.symbol }}</td>
-          <td class="{{ 'positive' if row.pnl >= 0 else 'negative' }}">{{ row.pnl | money }}</td>
-          <td>{{ row.mae | money }}</td>
-          <td>{{ row.mfe | money }}</td>
-          <td>{{ row.etd | money }}</td>
-        </tr>
+        {% if diagnostics_table %}
+          {% for row in diagnostics_table %}
+          <tr
+            data-symbol="{{ row.symbol }}"
+            data-pnl="{{ row.pnl or 0 }}"
+            data-mfe="{{ row.mfe or 0 }}"
+            data-mae="{{ row.mae or 0 }}"
+            data-capture="{{ row.capture_pct or 0 }}"
+            data-heat="{{ row.heat_pct or 0 }}"
+            data-etd="{{ row.etd or 0 }}"
+          >
+            <td>{{ row.symbol }}</td>
+            <td class="{{ 'positive' if row.pnl >= 0 else 'negative' }}">{{ row.pnl | money }}</td>
+            <td>{{ row.mfe | money }}</td>
+            <td>{{ row.mae | money }}</td>
+            <td class="
+              {% if row.capture_pct is not none %}
+                {% if row.capture_pct >= 80 %}capture-80
+                {% elif row.capture_pct >= 60 %}capture-60
+                {% elif row.capture_pct >= 40 %}capture-40
+                {% elif row.capture_pct >= 20 %}capture-20
+                {% elif row.capture_pct >= 1 %}capture-1
+                {% else %}capture-0
+                {% endif %}
+              {% endif %}
+            ">
+              {{ row.capture_pct | round(1) if row.capture_pct is not none else 'n/a' }}{% if row.capture_pct is not none %}%{% endif %}
+            </td>
+            <td class="
+              {% if row.heat_pct is not none %}
+                {% if row.heat_pct < 20 %}heat-20
+                {% elif row.heat_pct < 40 %}heat-40
+                {% elif row.heat_pct < 60 %}heat-60
+                {% else %}heat-80
+                {% endif %}
+              {% endif %}
+            ">
+              {{ row.heat_pct | round(1) if row.heat_pct is not none else 'n/a' }}{% if row.heat_pct is not none %}%{% endif %}
+            </td>
+            <td>{{ row.etd | money }}</td>
+          </tr>
+          {% endfor %}
         {% else %}
-        <tr><td colspan="5" class="empty">No diagnostics data.</td></tr>
-        {% endfor %}
+          <tr><td colspan="7" class="empty">No diagnostics available for the current filter.</td></tr>
+        {% endif %}
       </tbody>
     </table>
   </div>
@@ -222,8 +266,41 @@
 <section class="panel">
   <div class="panel-header">
     <div>
+      <h2>Direction Analysis</h2>
+      <p>Long vs short performance.</p>
+    </div>
+  </div>
+  <div class="direction-grid">
+    <div class="direction-card">
+      <div class="direction-title">Long</div>
+      <div class="direction-value {{ 'positive' if direction_stats.long.net_pnl >= 0 else 'negative' }}">
+        {{ direction_stats.long.net_pnl | money }}
+      </div>
+      <div class="direction-metrics">
+        <div>Win rate: {{ direction_stats.long.win_rate | percent }}</div>
+        <div>Profit factor: {{ direction_stats.long.profit_factor | round(2) if direction_stats.long.profit_factor is not none else 'n/a' }}</div>
+        <div>Expectancy: {{ direction_stats.long.expectancy | money }}</div>
+      </div>
+    </div>
+    <div class="direction-card">
+      <div class="direction-title">Short</div>
+      <div class="direction-value {{ 'positive' if direction_stats.short.net_pnl >= 0 else 'negative' }}">
+        {{ direction_stats.short.net_pnl | money }}
+      </div>
+      <div class="direction-metrics">
+        <div>Win rate: {{ direction_stats.short.win_rate | percent }}</div>
+        <div>Profit factor: {{ direction_stats.short.profit_factor | round(2) if direction_stats.short.profit_factor is not none else 'n/a' }}</div>
+        <div>Expectancy: {{ direction_stats.short.expectancy | money }}</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-header">
+    <div>
       <h2>Symbol Attribution</h2>
-      <p>Performance by symbol.</p>
+      <p>Which markets drive performance.</p>
     </div>
   </div>
   <div class="table-wrap">
@@ -233,85 +310,106 @@
           <th>Symbol</th>
           <th>Trades</th>
           <th>Win %</th>
-          <th>PF</th>
+          <th>Profit Factor</th>
           <th>Expectancy</th>
           <th>Net P&amp;L</th>
         </tr>
       </thead>
       <tbody>
-        {% for row in symbol_breakdown %}
-        <tr>
-          <td>{{ row.symbol }}</td>
-          <td>{{ row.trades }}</td>
-          <td>{{ row.win_rate | percent }}</td>
-          <td>{{ row.profit_factor | round(2) if row.profit_factor is not none else 'n/a' }}</td>
-          <td>{{ row.avg_net_pnl | money }}</td>
-          <td class="{{ 'positive' if row.total_net_pnl >= 0 else 'negative' }}">{{ row.total_net_pnl | money }}</td>
-        </tr>
+        {% if symbol_breakdown %}
+          {% for row in symbol_breakdown %}
+          <tr>
+            <td>{{ row.symbol }}</td>
+            <td>{{ row.trades }}</td>
+            <td>{{ row.win_rate | percent }}</td>
+            <td>{{ row.profit_factor | round(2) if row.profit_factor is not none else 'n/a' }}</td>
+            <td>{{ row.avg_net_pnl | money }}</td>
+            <td class="{{ 'positive' if row.total_net_pnl >= 0 else 'negative' }}">{{ row.total_net_pnl | money }}</td>
+          </tr>
+          {% endfor %}
         {% else %}
-        <tr><td colspan="6" class="empty">No symbol breakdown yet.</td></tr>
-        {% endfor %}
+          <tr><td colspan="6" class="empty">No trades available for attribution.</td></tr>
+        {% endif %}
       </tbody>
     </table>
   </div>
 </section>
 
-<section class="analytics-grid">
-  <div class="panel">
-    <div class="panel-header">
-      <div>
-        <h2>Direction Summary</h2>
-        <p>Long vs short performance.</p>
-      </div>
-    </div>
-    <div class="metrics-grid">
-      <div class="metric-card">
-        <div class="metric-label">Long Win %</div>
-        <div class="metric-value">{{ summary.win_rate | percent }}</div>
-        <div class="metric-sub">Filtered set</div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-label">Profit Factor</div>
-        <div class="metric-value">{{ summary.profit_factor | round(2) if summary.profit_factor is not none else 'n/a' }}</div>
-        <div class="metric-sub">Filtered set</div>
-      </div>
-    </div>
-  </div>
-</section>
-
 {% elif tab == 'time' %}
-<section class="analytics-grid">
+<section class="chart-grid analytics-charts">
   <div class="panel">
     <div class="panel-header">
       <div>
         <h2>P&amp;L by Hour</h2>
-        <p>Net P&amp;L by trade close hour.</p>
+        <p>Net performance by local exit hour.</p>
       </div>
     </div>
-    <canvas id="hourPnlChart" height="220"></canvas>
+    <canvas id="hourPnlChart" height="180"></canvas>
   </div>
   <div class="panel">
     <div class="panel-header">
       <div>
-        <h2>P&amp;L by Weekday</h2>
-        <p>Net performance by day of week.</p>
+        <h2>Win Rate by Hour</h2>
+        <p>Execution quality by time.</p>
       </div>
     </div>
-    <canvas id="weekdayPnlChart" height="220"></canvas>
+    <canvas id="hourWinChart" height="180"></canvas>
+  </div>
+</section>
+
+<section class="chart-grid analytics-charts">
+  <div class="panel">
+    <div class="panel-header">
+      <div>
+        <h2>P&amp;L by Weekday</h2>
+        <p>Performance by day of week.</p>
+      </div>
+    </div>
+    <canvas id="weekdayPnlChart" height="180"></canvas>
+  </div>
+  <div class="panel">
+    <div class="panel-header">
+      <div>
+        <h2>Trades by Weekday</h2>
+        <p>Volume cadence by day.</p>
+      </div>
+    </div>
+    <canvas id="weekdayTradesChart" height="180"></canvas>
   </div>
 </section>
 
 <section class="panel">
   <div class="panel-header">
     <div>
-      <h2>Daily Heatmap</h2>
-      <p>Daily net P&amp;L.</p>
+      <h2>Calendar Heatmap</h2>
+      <p>Daily net P&amp;L heatmap.</p>
     </div>
   </div>
-  <div class="calendar-mini-grid analytics-calendar">
-    {% for day in daily_pnl.series %}
-    <span class="calendar-mini-day" data-pnl="{{ day.pnl }}" title="{{ day.day }} {{ day.pnl | money }}"></span>
+  <div class="calendar-grid compact">
+    <div class="calendar-header">Mon</div>
+    <div class="calendar-header">Tue</div>
+    <div class="calendar-header">Wed</div>
+    <div class="calendar-header">Thu</div>
+    <div class="calendar-header">Fri</div>
+    <div class="calendar-header">Sat</div>
+    <div class="calendar-header">Sun</div>
+    {% for week in calendar.weeks %}
+      {% for day in week %}
+      <div class="calendar-day compact {{ '' if day.in_month else 'out' }}" data-pnl="{{ day.pnl }}">
+        <span class="calendar-number">{{ day.day }}</span>
+        <span class="calendar-pnl">{{ day.pnl | money }}</span>
+      </div>
+      {% endfor %}
     {% endfor %}
+  </div>
+  <div class="legend">
+    <span>Low</span>
+    <span class="legend-bar">
+      <span class="legend-neg"></span>
+      <span class="legend-mid"></span>
+      <span class="legend-pos"></span>
+    </span>
+    <span>High</span>
   </div>
 </section>
 
@@ -324,34 +422,62 @@
     </div>
   </div>
   <div class="table-wrap">
-    <table class="table">
+    <table class="table" id="analyticsTradesTable">
       <thead>
         <tr>
-          <th>Date</th>
-          <th>Symbol</th>
-          <th>Side</th>
-          <th>Net P&amp;L</th>
-          <th>R</th>
-          <th>MAE</th>
-          <th>MFE</th>
-          <th>Duration</th>
+          <th data-sort="exit">Date</th>
+          <th data-sort="symbol">Symbol</th>
+          <th data-sort="side">Side</th>
+          <th data-sort="size">Size</th>
+          <th data-sort="nominal">Nominal</th>
+          <th data-sort="pnl">Net P&amp;L</th>
+          <th data-sort="return">Return</th>
+          <th data-sort="hold">Hold</th>
+          <th data-sort="r">R</th>
+          <th data-sort="mfe">MFE</th>
+          <th data-sort="mae">MAE</th>
+          <th data-sort="dte">ETD</th>
+          <th data-sort="liq">REKT</th>
         </tr>
       </thead>
       <tbody>
-        {% for trade in trades %}
-        <tr>
-          <td>{{ trade.exit_time | date_only }}</td>
-          <td>{{ trade.symbol }}</td>
-          <td><span class="pill {{ trade.side | lower }}">{{ trade.side }}</span></td>
-          <td class="{{ 'positive' if trade.realized_pnl_net >= 0 else 'negative' }}">{{ trade.realized_pnl_net | money }}</td>
-          <td>{{ trade.r_multiple | round(2) if trade.r_multiple is not none else 'n/a' }}</td>
-          <td>{{ trade.mae | money }}</td>
-          <td>{{ trade.mfe | money }}</td>
-          <td>{{ trade.duration_seconds | duration }}</td>
-        </tr>
+        {% if trades %}
+          {% for trade in trades %}
+          <tr
+            data-exit="{{ trade.exit_time | iso }}"
+            data-symbol="{{ trade.symbol | replace('-USDT', '') }}"
+            data-side="{{ trade.side }}"
+            data-size="{{ trade.exit_size }}"
+            data-nominal="{{ trade.entry_price * trade.entry_size }}"
+            data-pnl="{{ trade.realized_pnl_net }}"
+            data-return="{{ trade.return_pct or 0 }}"
+            data-hold="{{ trade.duration_seconds or 0 }}"
+            data-r="{{ trade.r_multiple or 0 }}"
+            data-mfe="{{ trade.mfe or 0 }}"
+            data-mae="{{ trade.mae or 0 }}"
+            data-dte="{{ trade.etd or 0 }}"
+            data-liq="{{ 1 if trade.liquidated else 0 }}"
+            data-url="/trades/{{ trade.ui_id }}"
+            class="{{ 'trade-rekt' if trade.liquidated else '' }}"
+          >
+            <td>{{ trade.exit_time | date_only }}</td>
+            <td>{{ trade.symbol | replace('-USDT', '') }}</td>
+            <td><span class="pill {{ trade.side | lower }}">{{ trade.side }}</span></td>
+            <td>{{ trade.exit_size | round(4) }}</td>
+            <td>{{ (trade.entry_price * trade.entry_size) | money }}</td>
+            <td class="{{ 'positive' if trade.realized_pnl_net >= 0 else 'negative' }} pnl-positive">{{ trade.realized_pnl_net | money }}</td>
+            <td>{{ trade.return_pct | percent }}</td>
+            <td>{{ trade.duration_seconds | duration }}</td>
+            <td>{{ trade.r_multiple | round(2) if trade.r_multiple is not none else 'n/a' }}</td>
+            <td class="{{ 'positive' if trade.mfe is not none and trade.mfe >= 0 else 'negative' }} mfe-positive">{{ trade.mfe | money }}</td>
+            <td>{{ trade.mae | money }}</td>
+            <td>{{ trade.etd | money }}</td>
+            <td>{{ 'REKT' if trade.liquidated else '—' }}</td>
+          </tr>
+          {% endfor %}
         {% else %}
-        <tr><td colspan="8" class="empty">No trades match the current filters.</td></tr>
-        {% endfor %}
+          <tr><td colspan="13" class="empty">No trades match the current filters.</td></tr>
+        {% endif %}
       </tbody>
     </table>
   </div>
@@ -363,7 +489,9 @@
   const dailySeries = {{ daily_pnl | default({}, true) | json | safe }};
   const distData = {{ pnl_distribution | default({}, true) | json | safe }};
   const diagnostics = {{ diagnostics | default({}, true) | json | safe }};
+  const scatterData = {{ scatter | default({}, true) | json | safe }};
   const timePerf = {{ time_performance | default({}, true) | json | safe }};
+  const calendarData = {{ calendar | default({}, true) | json | safe }};
 
   const palette = {
     pos: '#2fbf71',
@@ -495,105 +623,269 @@
     });
   }
 
-  const maeCanvas = document.getElementById('maeMfeScatter');
-  if (maeCanvas && diagnostics.mae_mfe) {
-    new Chart(maeCanvas, {
+  const maeCtx = document.getElementById('maeMfeChart');
+  if (maeCtx) {
+    new Chart(maeCtx, {
       type: 'scatter',
       data: {
         datasets: [{
-          data: diagnostics.mae_mfe,
-          backgroundColor: 'rgba(154, 107, 255, 0.7)'
-        }]
+          label: 'MAE vs MFE',
+          data: scatterData.mae_mfe,
+          backgroundColor: palette.pos,
+        }],
       },
       options: {
+        responsive: true,
         plugins: { legend: { display: false } },
         scales: {
-          x: { title: { display: true, text: 'MAE' }, ticks: { color: palette.ink } },
-          y: { title: { display: true, text: 'MFE' }, ticks: { color: palette.ink } },
+          x: { title: { display: true, text: 'MAE' }, grid: { color: 'rgba(0,0,0,0.06)' } },
+          y: { title: { display: true, text: 'MFE' }, grid: { color: 'rgba(0,0,0,0.06)' } },
         }
       }
     });
   }
 
-  const mfeCanvas = document.getElementById('mfePnlScatter');
-  if (mfeCanvas && diagnostics.mfe_pnl) {
-    new Chart(mfeCanvas, {
+  const mfeCtx = document.getElementById('mfePnlChart');
+  if (mfeCtx) {
+    new Chart(mfeCtx, {
       type: 'scatter',
       data: {
         datasets: [{
-          data: diagnostics.mfe_pnl,
-          backgroundColor: 'rgba(47, 191, 113, 0.6)'
-        }]
+          label: 'MFE vs Realized',
+          data: scatterData.mfe_pnl,
+          backgroundColor: palette.neg,
+        }],
       },
       options: {
+        responsive: true,
         plugins: { legend: { display: false } },
         scales: {
-          x: { title: { display: true, text: 'MFE' }, ticks: { color: palette.ink } },
-          y: { title: { display: true, text: 'Net P&L' }, ticks: { color: palette.ink } },
+          x: { title: { display: true, text: 'MFE' }, grid: { color: 'rgba(0,0,0,0.06)' } },
+          y: { title: { display: true, text: 'Realized Net P&L' }, grid: { color: 'rgba(0,0,0,0.06)' } },
         }
       }
     });
   }
 
-  const hourCanvas = document.getElementById('hourPnlChart');
-  if (hourCanvas && timePerf.hourly) {
-    const labels = timePerf.hourly.map(item => item.bucket);
-    const values = timePerf.hourly.map(item => item.total_pnl);
-    new Chart(hourCanvas, {
+  const buildHourSeries = () => {
+    const hours = Array.from({ length: 24 }, (_, idx) => idx);
+    const totals = Array(24).fill(0);
+    const winRates = Array(24).fill(null);
+    timePerf.hourly.forEach(row => {
+      totals[row.bucket] = row.total_pnl;
+      winRates[row.bucket] = row.win_rate !== null ? row.win_rate * 100 : null;
+    });
+    return { hours, totals, winRates };
+  };
+
+  const hourData = buildHourSeries();
+
+  const hourPnlCtx = document.getElementById('hourPnlChart');
+  if (hourPnlCtx) {
+    new Chart(hourPnlCtx, {
       type: 'bar',
       data: {
-        labels,
+        labels: hourData.hours.map(value => `${value}:00`),
         datasets: [{
-          data: values,
-          backgroundColor: values.map(value => value >= 0 ? palette.pos : palette.neg),
+          data: hourData.totals,
+          backgroundColor: hourData.totals.map(value => value >= 0 ? palette.pos : palette.neg),
           borderRadius: 6,
-        }]
+        }],
       },
       options: {
-        plugins: { legend: { display: false } },
+        responsive: true,
         scales: {
-          x: { ticks: { color: palette.ink } },
-          y: { ticks: { color: palette.ink } },
-        }
-      }
+          x: { grid: { display: false } },
+          y: { grid: { color: 'rgba(0,0,0,0.06)' } },
+        },
+        plugins: { legend: { display: false } },
+      },
     });
   }
 
-  const weekdayCanvas = document.getElementById('weekdayPnlChart');
-  if (weekdayCanvas && timePerf.weekday) {
-    const labels = timePerf.weekday.map(item => ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][item.bucket] || item.bucket);
-    const values = timePerf.weekday.map(item => item.total_pnl);
-    new Chart(weekdayCanvas, {
+  const hourWinCtx = document.getElementById('hourWinChart');
+  if (hourWinCtx) {
+    new Chart(hourWinCtx, {
+      type: 'line',
+      data: {
+        labels: hourData.hours.map(value => `${value}:00`),
+        datasets: [{
+          data: hourData.winRates,
+          borderColor: palette.line,
+          backgroundColor: palette.fill,
+          tension: 0.25,
+          spanGaps: true,
+          pointRadius: 2,
+        }],
+      },
+      options: {
+        responsive: true,
+        scales: {
+          x: { grid: { display: false } },
+          y: {
+            ticks: { callback: value => `${value}%` },
+            grid: { color: 'rgba(0,0,0,0.06)' },
+            suggestedMin: 0,
+            suggestedMax: 100,
+          },
+        },
+        plugins: { legend: { display: false } },
+      },
+    });
+  }
+
+  const weekdayLabels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  const weekdayTotals = Array(7).fill(0);
+  const weekdayTrades = Array(7).fill(0);
+  timePerf.weekday.forEach(row => {
+    weekdayTotals[row.bucket] = row.total_pnl;
+    weekdayTrades[row.bucket] = row.count;
+  });
+
+  const weekdayPnlCtx = document.getElementById('weekdayPnlChart');
+  if (weekdayPnlCtx) {
+    new Chart(weekdayPnlCtx, {
       type: 'bar',
       data: {
-        labels,
+        labels: weekdayLabels,
         datasets: [{
-          data: values,
-          backgroundColor: values.map(value => value >= 0 ? palette.pos : palette.neg),
+          data: weekdayTotals,
+          backgroundColor: weekdayTotals.map(value => value >= 0 ? palette.pos : palette.neg),
           borderRadius: 6,
-        }]
+        }],
       },
       options: {
-        plugins: { legend: { display: false } },
+        responsive: true,
         scales: {
-          x: { ticks: { color: palette.ink } },
-          y: { ticks: { color: palette.ink } },
-        }
-      }
+          x: { grid: { display: false } },
+          y: { grid: { color: 'rgba(0,0,0,0.06)' } },
+        },
+        plugins: { legend: { display: false } },
+      },
     });
   }
 
-  const miniDays = document.querySelectorAll('.calendar-mini-day');
-  if (miniDays.length) {
-    const maxAbs = Math.max(...Array.from(miniDays).map(item => Math.abs(Number(item.dataset.pnl || 0))), 1);
-    miniDays.forEach(day => {
-      const value = Number(day.dataset.pnl || 0);
+  const weekdayTradesCtx = document.getElementById('weekdayTradesChart');
+  if (weekdayTradesCtx) {
+    new Chart(weekdayTradesCtx, {
+      type: 'bar',
+      data: {
+        labels: weekdayLabels,
+        datasets: [{
+          data: weekdayTrades,
+          backgroundColor: 'rgba(11, 61, 59, 0.45)',
+          borderRadius: 6,
+        }],
+      },
+      options: {
+        responsive: true,
+        scales: {
+          x: { grid: { display: false } },
+          y: { grid: { color: 'rgba(0,0,0,0.06)' } },
+        },
+        plugins: { legend: { display: false } },
+      },
+    });
+  }
+
+  const calendarTiles = document.querySelectorAll('.calendar-day.compact');
+  if (calendarTiles.length) {
+    const maxAbs = Math.max(calendarData.max_abs_pnl || 0, 1);
+    Array.from(calendarTiles).forEach(tile => {
+      const value = Number(tile.dataset.pnl || 0);
       if (!value) return;
       const intensity = Math.min(Math.abs(value) / maxAbs, 1);
       const color = value < 0
         ? `rgba(176, 59, 40, ${0.15 + 0.55 * intensity})`
         : `rgba(26, 118, 90, ${0.15 + 0.55 * intensity})`;
-      day.style.background = color;
+      tile.style.background = color;
+    });
+  }
+
+  const diagnosticsTable = document.getElementById('diagnosticsTable');
+  if (diagnosticsTable) {
+    const headers = diagnosticsTable.querySelectorAll('thead th[data-sort]');
+    let currentSort = { key: 'pnl', direction: 'desc' };
+
+    const sortRows = (key, direction) => {
+      const rows = Array.from(diagnosticsTable.querySelectorAll('tbody tr'));
+      const multiplier = direction === 'asc' ? 1 : -1;
+      const getValue = row => {
+        const value = row.dataset[key] || '';
+        if (key === 'symbol') return value.toLowerCase();
+        return Number(value) || 0;
+      };
+      rows.sort((a, b) => {
+        const av = getValue(a);
+        const bv = getValue(b);
+        if (av < bv) return -1 * multiplier;
+        if (av > bv) return 1 * multiplier;
+        return 0;
+      });
+      const body = diagnosticsTable.querySelector('tbody');
+      rows.forEach(row => body.appendChild(row));
+    };
+
+    headers.forEach(header => {
+      header.addEventListener('click', () => {
+        const key = header.dataset.sort;
+        if (!key) return;
+        const direction =
+          currentSort.key === key && currentSort.direction === 'desc' ? 'asc' : 'desc';
+        currentSort = { key, direction };
+        sortRows(key, direction);
+      });
+    });
+  }
+
+  const analyticsTable = document.getElementById('analyticsTradesTable');
+  if (analyticsTable) {
+    const headers = analyticsTable.querySelectorAll('thead th[data-sort]');
+    let currentSort = { key: 'exit', direction: 'desc' };
+
+    const sortRows = (key, direction) => {
+      const rows = Array.from(analyticsTable.querySelectorAll('tbody tr'));
+      const multiplier = direction === 'asc' ? 1 : -1;
+      const getValue = row => {
+        const value = row.dataset[key] || '';
+        if (key === 'exit') return new Date(value).getTime() || 0;
+        if (key === 'symbol' || key === 'side') return value.toLowerCase();
+        if (key === 'liq') return Number(value) || 0;
+        return Number(value) || 0;
+      };
+      rows.sort((a, b) => {
+        const av = getValue(a);
+        const bv = getValue(b);
+        if (av < bv) return -1 * multiplier;
+        if (av > bv) return 1 * multiplier;
+        return 0;
+      });
+      const body = analyticsTable.querySelector('tbody');
+      rows.forEach(row => body.appendChild(row));
+    };
+
+    headers.forEach(header => {
+      header.addEventListener('click', () => {
+        const key = header.dataset.sort;
+        if (!key) return;
+        const direction =
+          currentSort.key === key && currentSort.direction === 'desc' ? 'asc' : 'desc';
+        currentSort = { key, direction };
+        sortRows(key, direction);
+      });
+    });
+
+    analyticsTable.querySelectorAll('tbody tr').forEach(row => {
+      row.addEventListener('click', event => {
+        const target = event.target;
+        if (target instanceof HTMLElement && target.closest('a')) {
+          return;
+        }
+        const url = row.dataset.url;
+        if (url) {
+          window.location.href = url;
+        }
+      });
     });
   }
 </script>

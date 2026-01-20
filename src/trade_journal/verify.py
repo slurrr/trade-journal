@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from trade_journal.config.accounts import resolve_account_context, resolve_data_path
 from trade_journal.ingest.apex_funding import load_funding
 from trade_journal.ingest.apex_omni import load_fills
 from trade_journal.ingest.apex_orders import load_orders
@@ -36,34 +37,35 @@ def main(argv: list[str] | None = None) -> int:
         "fills_path",
         type=Path,
         nargs="?",
-        default=Path("data/fills.json"),
+        default=None,
         help="Path to ApeX fills export (json/csv/tsv).",
     )
     parser.add_argument(
         "--historical-pnl",
         type=Path,
-        default=Path("data/historical_pnl.json"),
+        default=None,
         help="Historical PnL JSON path.",
     )
     parser.add_argument(
         "--funding",
         type=Path,
-        default=Path("data/funding.json"),
+        default=None,
         help="Optional funding export path.",
     )
     parser.add_argument(
         "--orders",
         type=Path,
-        default=Path("data/history_orders.json"),
+        default=None,
         help="Optional history orders export path.",
     )
     parser.add_argument(
         "--excursions",
         type=Path,
-        default=Path("data/excursions.json"),
+        default=None,
         help="Optional excursions cache path.",
     )
-    parser.add_argument("--out", type=Path, default=Path("data/verify_report.json"), help="Output file.")
+    parser.add_argument("--account", type=str, default=None, help="Account name from accounts config.")
+    parser.add_argument("--out", type=Path, default=None, help="Output file.")
     parser.add_argument("--strict", action="store_true", help="Exit non-zero if critical issues found.")
     parser.add_argument(
         "--funding-table",
@@ -120,17 +122,32 @@ def main(argv: list[str] | None = None) -> int:
         funding_since=_parse_datetime_arg(args.funding_since) if args.funding_since else None,
     )
 
+    context = resolve_account_context(args.account)
+    fills_path = args.fills_path or resolve_data_path(None, context, "fills.json")
+    if not fills_path.exists():
+        candidate = resolve_data_path(None, context, "fills.csv")
+        fills_path = candidate if candidate.exists() else fills_path
+
+    historical_pnl_path = args.historical_pnl or resolve_data_path(None, context, "historical_pnl.json")
+    funding_path = args.funding or resolve_data_path(None, context, "funding.json")
+    orders_path = args.orders or resolve_data_path(None, context, "history_orders.json")
+    excursions_path = args.excursions or resolve_data_path(None, context, "excursions.json")
+
     report = _run_checks(
-        fills_path=args.fills_path,
-        historical_pnl_path=args.historical_pnl,
-        funding_path=args.funding,
-        orders_path=args.orders,
-        excursions_path=args.excursions,
+        fills_path=fills_path,
+        historical_pnl_path=historical_pnl_path,
+        funding_path=funding_path,
+        orders_path=orders_path,
+        excursions_path=excursions_path,
         config=config,
+        context=context,
+        source=context.source,
+        account_id=context.account_id,
     )
 
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    out_path = args.out or resolve_data_path(None, context, "verify_report.json")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     _print_summary(report)
 
@@ -152,16 +169,19 @@ def _run_checks(
     orders_path: Path,
     excursions_path: Path,
     config: VerifyConfig,
+    context,
+    source: str,
+    account_id: str | None,
 ) -> dict[str, Any]:
-    ingest = load_fills(fills_path)
+    ingest = load_fills(fills_path, source=source, account_id=account_id)
     fills = ingest.fills
     trades = reconstruct_trades(fills)
 
     funding_unmatched: list[dict[str, Any]] = []
     funding_open_matches: list[dict[str, Any]] = []
-    open_positions = _load_open_positions()
+    open_positions = _load_open_positions(context)
     if funding_path.exists():
-        funding_result = load_funding(funding_path)
+        funding_result = load_funding(funding_path, source=source, account_id=account_id)
         attributions = apply_funding_events(trades, funding_result.events)
         for item in attributions:
             if item.matched_trade_id is None:
@@ -185,12 +205,18 @@ def _run_checks(
                 else:
                     funding_unmatched.append(record)
 
-    orders = load_orders(orders_path).orders if orders_path.exists() else []
+    orders = (
+        load_orders(orders_path, source=source, account_id=account_id).orders if orders_path.exists() else []
+    )
     excursions_map = _load_excursions(excursions_path) if excursions_path.exists() else {}
     if excursions_map:
         _apply_excursions_cache(trades, excursions_map)
 
-    historical_records = load_historical_pnl(historical_pnl_path) if historical_pnl_path.exists() else []
+    historical_records = (
+        load_historical_pnl(historical_pnl_path, source=source, account_id=account_id)
+        if historical_pnl_path.exists()
+        else []
+    )
     matches = match_trades(trades, historical_records, window_seconds=config.match_window_seconds)
 
     fill_issues = _check_fills(fills)
@@ -573,9 +599,9 @@ def _parse_datetime_arg(value: str) -> datetime:
     return parsed
 
 
-def _load_open_positions() -> list[dict[str, Any]]:
+def _load_open_positions(context) -> list[dict[str, Any]]:
     env_path = os.environ.get("TRADE_JOURNAL_ACCOUNT", "").strip()
-    path = Path(env_path) if env_path else Path("data/account.json")
+    path = Path(env_path) if env_path else resolve_data_path(None, context, "account.json")
     if not path.exists():
         return []
     try:

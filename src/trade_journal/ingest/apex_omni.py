@@ -16,29 +16,40 @@ class IngestResult:
     skipped: int = 0
 
 
-def load_fills(path: str | Path) -> IngestResult:
-    source = Path(path)
-    suffix = source.suffix.lower()
+def load_fills(
+    path: str | Path, *, source: str | None = None, account_id: str | None = None
+) -> IngestResult:
+    source_path = Path(path)
+    suffix = source_path.suffix.lower()
     if suffix == ".json":
-        return _load_fills_json(source)
+        return _load_fills_json(source_path, source_name=source, account_id=account_id)
     if suffix in {".csv", ".tsv"}:
-        return _load_fills_csv(source, delimiter="\t" if suffix == ".tsv" else ",")
-    raise ValueError(f"Unsupported file type: {source.suffix}")
+        return _load_fills_csv(
+            source_path,
+            delimiter="\t" if suffix == ".tsv" else ",",
+            source_name=source,
+            account_id=account_id,
+        )
+    raise ValueError(f"Unsupported file type: {source_path.suffix}")
 
 
-def _load_fills_json(path: Path) -> IngestResult:
+def _load_fills_json(
+    path: Path, *, source_name: str | None, account_id: str | None
+) -> IngestResult:
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
 
     records = _extract_records(payload)
-    fills, skipped = _normalize_records(records)
+    fills, skipped = _normalize_records(records, source_name=source_name, account_id=account_id)
     return IngestResult(fills=fills, skipped=skipped)
 
 
-def _load_fills_csv(path: Path, delimiter: str) -> IngestResult:
+def _load_fills_csv(
+    path: Path, delimiter: str, *, source_name: str | None, account_id: str | None
+) -> IngestResult:
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter=delimiter)
-        fills, skipped = _normalize_records(reader)
+        fills, skipped = _normalize_records(reader, source_name=source_name, account_id=account_id)
     return IngestResult(fills=fills, skipped=skipped)
 
 
@@ -57,20 +68,28 @@ def _extract_records(payload: Any) -> Iterable[Mapping[str, Any]]:
     raise ValueError("Unsupported JSON format for fills payload")
 
 
-def _normalize_records(records: Iterable[Mapping[str, Any]]) -> tuple[list[Fill], int]:
+def _normalize_records(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    source_name: str | None,
+    account_id: str | None,
+) -> tuple[list[Fill], int]:
     fills: list[Fill] = []
     skipped = 0
     for raw in records:
         try:
-            fills.append(_normalize_fill(raw))
+            fills.append(_normalize_fill(raw, source_name=source_name, account_id=account_id))
         except ValueError:
             skipped += 1
     return fills, skipped
 
 
-def _normalize_fill(raw: Mapping[str, Any]) -> Fill:
+def _normalize_fill(
+    raw: Mapping[str, Any], *, source_name: str | None, account_id: str | None
+) -> Fill:
     fill_id = _pick(raw, "id", "fill_id", "fillId", "matchFillId")
     order_id = _pick(raw, "order_id", "orderId")
+    resolved_account = account_id or _pick(raw, "accountId", "account_id")
     symbol = _pick(raw, "symbol", "market", "instrument")
     side = _normalize_side(_pick(raw, "side", "direction", "tradeSide"))
     price = _to_float(_pick(raw, "price", "fill_price", "avg_price", "latestMatchFillPrice"))
@@ -92,6 +111,8 @@ def _normalize_fill(raw: Mapping[str, Any]) -> Fill:
         fee=fee,
         fee_asset=str(fee_asset) if fee_asset is not None else None,
         timestamp=timestamp,
+        source=str(source_name or "apex"),
+        account_id=str(resolved_account) if resolved_account is not None else None,
         raw=dict(raw),
     )
 

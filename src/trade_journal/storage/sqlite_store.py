@@ -27,6 +27,8 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS fills (
             fill_id TEXT PRIMARY KEY,
             order_id TEXT,
+            source TEXT NOT NULL,
+            account_id TEXT,
             symbol TEXT NOT NULL,
             side TEXT NOT NULL,
             price REAL NOT NULL,
@@ -43,6 +45,8 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS orders (
             order_id TEXT PRIMARY KEY,
             client_order_id TEXT,
+            source TEXT NOT NULL,
+            account_id TEXT,
             symbol TEXT NOT NULL,
             side TEXT NOT NULL,
             size REAL NOT NULL,
@@ -67,6 +71,8 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS funding (
             funding_id TEXT PRIMARY KEY,
             transaction_id TEXT,
+            source TEXT NOT NULL,
+            account_id TEXT,
             symbol TEXT NOT NULL,
             side TEXT NOT NULL,
             rate REAL NOT NULL,
@@ -83,6 +89,8 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
         CREATE TABLE IF NOT EXISTS liquidations (
             liquidation_id TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            account_id TEXT,
             symbol TEXT NOT NULL,
             side TEXT NOT NULL,
             size REAL NOT NULL,
@@ -101,6 +109,8 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
         CREATE TABLE IF NOT EXISTS historical_pnl (
             record_id TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            account_id TEXT,
             symbol TEXT NOT NULL,
             side TEXT NOT NULL,
             size REAL NOT NULL,
@@ -114,6 +124,8 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
         CREATE TABLE IF NOT EXISTS sync_state (
             endpoint TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            account_id TEXT,
             last_timestamp_ms INTEGER,
             last_id TEXT,
             last_success_at TEXT NOT NULL
@@ -136,14 +148,41 @@ def init_db(conn: sqlite3.Connection) -> None:
         VALUES (1, 1, 1, CURRENT_TIMESTAMP)
         """
     )
+    _ensure_columns(conn)
     conn.commit()
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    _ensure_column(conn, "fills", "source", "TEXT")
+    _ensure_column(conn, "fills", "account_id", "TEXT")
+    _ensure_column(conn, "orders", "source", "TEXT")
+    _ensure_column(conn, "orders", "account_id", "TEXT")
+    _ensure_column(conn, "funding", "source", "TEXT")
+    _ensure_column(conn, "funding", "account_id", "TEXT")
+    _ensure_column(conn, "liquidations", "source", "TEXT")
+    _ensure_column(conn, "liquidations", "account_id", "TEXT")
+    _ensure_column(conn, "historical_pnl", "source", "TEXT")
+    _ensure_column(conn, "historical_pnl", "account_id", "TEXT")
+    _ensure_column(conn, "sync_state", "source", "TEXT")
+    _ensure_column(conn, "sync_state", "account_id", "TEXT")
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, col_type: str) -> None:
+    existing = {
+        row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column in existing:
+        return
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
 
 
 def upsert_fills(conn: sqlite3.Connection, fills: Iterable[Fill]) -> int:
     rows = []
     for fill in fills:
-        fill_id = fill.fill_id or _hash_id(
+        fill_id = _scoped_id(fill.source, fill.account_id, fill.fill_id) or _hash_id(
             "fill",
+            fill.source,
+            fill.account_id,
             fill.symbol,
             fill.side,
             fill.price,
@@ -153,10 +192,13 @@ def upsert_fills(conn: sqlite3.Connection, fills: Iterable[Fill]) -> int:
             fill.order_id,
             fill.timestamp,
         )
+        order_id = _scoped_id(fill.source, fill.account_id, fill.order_id)
         rows.append(
             {
                 "fill_id": fill_id,
-                "order_id": fill.order_id,
+                "order_id": order_id,
+                "source": fill.source,
+                "account_id": fill.account_id,
                 "symbol": fill.symbol,
                 "side": fill.side,
                 "price": fill.price,
@@ -170,13 +212,15 @@ def upsert_fills(conn: sqlite3.Connection, fills: Iterable[Fill]) -> int:
     conn.executemany(
         """
         INSERT INTO fills (
-            fill_id, order_id, symbol, side, price, size, fee, fee_asset, timestamp, raw_json
+            fill_id, order_id, source, account_id, symbol, side, price, size, fee, fee_asset, timestamp, raw_json
         )
         VALUES (
-            :fill_id, :order_id, :symbol, :side, :price, :size, :fee, :fee_asset, :timestamp, :raw_json
+            :fill_id, :order_id, :source, :account_id, :symbol, :side, :price, :size, :fee, :fee_asset, :timestamp, :raw_json
         )
         ON CONFLICT(fill_id) DO UPDATE SET
             order_id=excluded.order_id,
+            source=excluded.source,
+            account_id=excluded.account_id,
             symbol=excluded.symbol,
             side=excluded.side,
             price=excluded.price,
@@ -195,8 +239,10 @@ def upsert_fills(conn: sqlite3.Connection, fills: Iterable[Fill]) -> int:
 def upsert_orders(conn: sqlite3.Connection, orders: Iterable[OrderRecord]) -> int:
     rows = []
     for order in orders:
-        order_id = order.order_id or _hash_id(
+        order_id = _scoped_id(order.source, order.account_id, order.order_id) or _hash_id(
             "order",
+            order.source,
+            order.account_id,
             order.symbol,
             order.side,
             order.size,
@@ -209,6 +255,8 @@ def upsert_orders(conn: sqlite3.Connection, orders: Iterable[OrderRecord]) -> in
             {
                 "order_id": order_id,
                 "client_order_id": order.client_order_id,
+                "source": order.source,
+                "account_id": order.account_id,
                 "symbol": order.symbol,
                 "side": order.side,
                 "size": order.size,
@@ -230,17 +278,19 @@ def upsert_orders(conn: sqlite3.Connection, orders: Iterable[OrderRecord]) -> in
     conn.executemany(
         """
         INSERT INTO orders (
-            order_id, client_order_id, symbol, side, size, price, reduce_only,
+            order_id, client_order_id, source, account_id, symbol, side, size, price, reduce_only,
             is_position_tpsl, is_open_tpsl, is_set_open_sl, is_set_open_tp,
             open_sl_param, open_tp_param, trigger_price, order_type, status, created_at, raw_json
         )
         VALUES (
-            :order_id, :client_order_id, :symbol, :side, :size, :price, :reduce_only,
+            :order_id, :client_order_id, :source, :account_id, :symbol, :side, :size, :price, :reduce_only,
             :is_position_tpsl, :is_open_tpsl, :is_set_open_sl, :is_set_open_tp,
             :open_sl_param, :open_tp_param, :trigger_price, :order_type, :status, :created_at, :raw_json
         )
         ON CONFLICT(order_id) DO UPDATE SET
             client_order_id=excluded.client_order_id,
+            source=excluded.source,
+            account_id=excluded.account_id,
             symbol=excluded.symbol,
             side=excluded.side,
             size=excluded.size,
@@ -267,20 +317,28 @@ def upsert_orders(conn: sqlite3.Connection, orders: Iterable[OrderRecord]) -> in
 def upsert_funding(conn: sqlite3.Connection, events: Iterable[FundingEvent]) -> int:
     rows = []
     for event in events:
-        funding_id = event.transaction_id or event.funding_id or _hash_id(
-            "funding",
-            event.symbol,
-            event.side,
-            event.funding_time,
-            event.position_size,
-            event.funding_value,
-            event.rate,
-            event.price,
+        funding_id = (
+            _scoped_id(event.source, event.account_id, event.transaction_id)
+            or _scoped_id(event.source, event.account_id, event.funding_id)
+            or _hash_id(
+                "funding",
+                event.source,
+                event.account_id,
+                event.symbol,
+                event.side,
+                event.funding_time,
+                event.position_size,
+                event.funding_value,
+                event.rate,
+                event.price,
+            )
         )
         rows.append(
             {
                 "funding_id": funding_id,
                 "transaction_id": event.transaction_id,
+                "source": event.source,
+                "account_id": event.account_id,
                 "symbol": event.symbol,
                 "side": event.side,
                 "rate": event.rate,
@@ -295,15 +353,17 @@ def upsert_funding(conn: sqlite3.Connection, events: Iterable[FundingEvent]) -> 
     conn.executemany(
         """
         INSERT INTO funding (
-            funding_id, transaction_id, symbol, side, rate, position_size, price,
+            funding_id, transaction_id, source, account_id, symbol, side, rate, position_size, price,
             funding_time, funding_value, status, raw_json
         )
         VALUES (
-            :funding_id, :transaction_id, :symbol, :side, :rate, :position_size, :price,
+            :funding_id, :transaction_id, :source, :account_id, :symbol, :side, :rate, :position_size, :price,
             :funding_time, :funding_value, :status, :raw_json
         )
         ON CONFLICT(funding_id) DO UPDATE SET
             transaction_id=excluded.transaction_id,
+            source=excluded.source,
+            account_id=excluded.account_id,
             symbol=excluded.symbol,
             side=excluded.side,
             rate=excluded.rate,
@@ -323,8 +383,10 @@ def upsert_funding(conn: sqlite3.Connection, events: Iterable[FundingEvent]) -> 
 def upsert_liquidations(conn: sqlite3.Connection, events: Iterable[LiquidationEvent]) -> int:
     rows = []
     for event in events:
-        liquidation_id = event.liquidation_id or _hash_id(
+        liquidation_id = _scoped_id(event.source, event.account_id, event.liquidation_id) or _hash_id(
             "liquidation",
+            event.source,
+            event.account_id,
             event.symbol,
             event.side,
             event.size,
@@ -336,6 +398,8 @@ def upsert_liquidations(conn: sqlite3.Connection, events: Iterable[LiquidationEv
         rows.append(
             {
                 "liquidation_id": liquidation_id,
+                "source": event.source,
+                "account_id": event.account_id,
                 "symbol": event.symbol,
                 "side": event.side,
                 "size": event.size,
@@ -352,14 +416,16 @@ def upsert_liquidations(conn: sqlite3.Connection, events: Iterable[LiquidationEv
     conn.executemany(
         """
         INSERT INTO liquidations (
-            liquidation_id, symbol, side, size, entry_price, exit_price, total_pnl,
+            liquidation_id, source, account_id, symbol, side, size, entry_price, exit_price, total_pnl,
             fee, liquidate_fee, created_at, exit_type, raw_json
         )
         VALUES (
-            :liquidation_id, :symbol, :side, :size, :entry_price, :exit_price, :total_pnl,
+            :liquidation_id, :source, :account_id, :symbol, :side, :size, :entry_price, :exit_price, :total_pnl,
             :fee, :liquidate_fee, :created_at, :exit_type, :raw_json
         )
         ON CONFLICT(liquidation_id) DO UPDATE SET
+            source=excluded.source,
+            account_id=excluded.account_id,
             symbol=excluded.symbol,
             side=excluded.side,
             size=excluded.size,
@@ -381,8 +447,10 @@ def upsert_liquidations(conn: sqlite3.Connection, events: Iterable[LiquidationEv
 def upsert_historical_pnl(conn: sqlite3.Connection, records: Iterable[PnlRecord]) -> int:
     rows = []
     for record in records:
-        record_id = record.record_id or _hash_id(
+        record_id = _scoped_id(record.source, record.account_id, record.record_id) or _hash_id(
             "pnl",
+            record.source,
+            record.account_id,
             record.symbol,
             record.side,
             record.size,
@@ -392,6 +460,8 @@ def upsert_historical_pnl(conn: sqlite3.Connection, records: Iterable[PnlRecord]
         rows.append(
             {
                 "record_id": record_id,
+                "source": record.source,
+                "account_id": record.account_id,
                 "symbol": record.symbol,
                 "side": record.side,
                 "size": record.size,
@@ -403,12 +473,14 @@ def upsert_historical_pnl(conn: sqlite3.Connection, records: Iterable[PnlRecord]
     conn.executemany(
         """
         INSERT INTO historical_pnl (
-            record_id, symbol, side, size, exit_time, total_pnl, raw_json
+            record_id, source, account_id, symbol, side, size, exit_time, total_pnl, raw_json
         )
         VALUES (
-            :record_id, :symbol, :side, :size, :exit_time, :total_pnl, :raw_json
+            :record_id, :source, :account_id, :symbol, :side, :size, :exit_time, :total_pnl, :raw_json
         )
         ON CONFLICT(record_id) DO UPDATE SET
+            source=excluded.source,
+            account_id=excluded.account_id,
             symbol=excluded.symbol,
             side=excluded.side,
             size=excluded.size,
@@ -431,6 +503,13 @@ def _hash_id(prefix: str, *parts: object) -> str:
             normalized.append("" if part is None else str(part))
     digest = hashlib.sha1("|".join(normalized).encode("utf-8")).hexdigest()
     return f"{prefix}:{digest}"
+
+
+def _scoped_id(source: str, account_id: str | None, raw_id: str | None) -> str | None:
+    if raw_id is None:
+        return None
+    account = account_id or "unknown"
+    return f"{source}:{account}:{raw_id}"
 
 
 def _json_dump(value: object) -> str:

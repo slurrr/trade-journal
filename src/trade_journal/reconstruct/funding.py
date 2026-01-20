@@ -14,18 +14,20 @@ class FundingAttribution:
 
 
 def apply_funding_events(trades: Iterable[Trade], events: Iterable[FundingEvent]) -> list[FundingAttribution]:
-    trades_by_symbol: dict[str, list[Trade]] = {}
+    trades_by_symbol: dict[tuple[str, str | None, str], list[Trade]] = {}
     trade_list = list(trades)
     for trade in trade_list:
         trade.funding_fees = 0.0
-        trades_by_symbol.setdefault(trade.symbol, []).append(trade)
+        key = (trade.source, trade.account_id, trade.symbol)
+        trades_by_symbol.setdefault(key, []).append(trade)
 
     for trade_group in trades_by_symbol.values():
         trade_group.sort(key=lambda t: t.entry_time)
 
     attributions: list[FundingAttribution] = []
     for event in sorted(events, key=_event_sort_key):
-        matched = _find_trade_for_event(trades_by_symbol.get(event.symbol, []), event)
+        key = (event.source, event.account_id, event.symbol)
+        matched = _find_trade_for_event(trades_by_symbol.get(key, []), event)
         if matched is not None:
             matched.funding_fees += event.funding_value
         attributions.append(

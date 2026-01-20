@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from trade_journal.config.accounts import resolve_account_context, resolve_data_path
 from trade_journal.ingest.apex_omni import load_fills
 
 
@@ -12,9 +13,10 @@ def main(argv: list[str] | None = None) -> int:
         "fills_path",
         type=Path,
         nargs="?",
-        default=Path("data/fills.json"),
+        default=None,
         help="Path to fills JSON file.",
     )
+    parser.add_argument("--account", type=str, default=None, help="Account name from accounts config.")
     parser.add_argument("--symbol", type=str, default=None, help="Filter by symbol.")
     parser.add_argument("--limit", type=int, default=20, help="Max fills to print.")
     parser.add_argument(
@@ -29,7 +31,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    result = load_fills(args.fills_path)
+    context = resolve_account_context(args.account)
+    fills_path = args.fills_path or resolve_data_path(None, context, "fills.json")
+    if not fills_path.exists():
+        candidate = resolve_data_path(None, context, "fills.csv")
+        fills_path = candidate if candidate.exists() else fills_path
+
+    result = load_fills(fills_path, source=context.source, account_id=context.account_id)
     fills = result.fills
     if args.symbol:
         fills = [fill for fill in fills if fill.symbol == args.symbol]

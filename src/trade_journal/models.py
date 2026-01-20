@@ -16,6 +16,8 @@ class Fill:
     fee: float
     fee_asset: str | None
     timestamp: datetime
+    source: str = "apex"
+    account_id: str | None = None
     raw: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -31,6 +33,8 @@ class FundingEvent:
     funding_time: datetime
     funding_value: float
     status: str | None
+    source: str = "apex"
+    account_id: str | None = None
     raw: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -48,6 +52,8 @@ class Trade:
     max_size: float
     realized_pnl: float
     fees: float
+    source: str = "apex"
+    account_id: str | None = None
     funding_fees: float = 0.0
     fills: list[Fill] = field(default_factory=list)
     mae: float | None = None
