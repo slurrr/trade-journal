@@ -4,6 +4,8 @@
 
 - Max drawdown is computed from the cumulative net PnL curve (ordered by trade exit time), as peak-to-trough drop in absolute terms and percentage of the prior peak.
 - Time-of-day and day-of-week performance buckets use trade **exit time** converted to the local timezone.
+- ROI uses an optional `TRADE_JOURNAL_INITIAL_EQUITY` baseline; if unset, ROI is omitted.
+- Behavioral rollups include trades-per-day and average PnL of trades following a loss.
 
 ## Rationale
 

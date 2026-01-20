@@ -15,7 +15,7 @@ from trade_journal.metrics.summary import (
     compute_pnl_distribution,
     compute_symbol_breakdown,
     compute_time_performance,
-    compute_zella_score,
+    compute_performance_score,
 )
 from trade_journal.reconstruct.funding import apply_funding_events
 from trade_journal.reconstruct.trades import reconstruct_trades
@@ -44,6 +44,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--json", action="store_true", help="Print JSON output.")
     parser.add_argument("--out", type=Path, default=None, help="Write output to a file instead of stdout.")
+    parser.add_argument(
+        "--initial-equity",
+        type=float,
+        default=None,
+        help="Optional initial equity used for ROI calculations.",
+    )
     args = parser.parse_args(argv)
 
     result = load_fills(args.fills_path)
@@ -82,11 +88,11 @@ def main(argv: list[str] | None = None) -> int:
             risk = initial_stop_for_trade(trade, orders_result.orders)
             setattr(trade, "r_multiple", risk.r_multiple)
 
-    metrics = compute_aggregate_metrics(trades)
+    metrics = compute_aggregate_metrics(trades, initial_equity=args.initial_equity)
     time_perf = compute_time_performance(trades)
     symbol_breakdown = compute_symbol_breakdown(trades)
     pnl_distribution = compute_pnl_distribution(trades)
-    zella_score = compute_zella_score(trades, metrics)
+    performance_score = compute_performance_score(trades, metrics)
 
     out_path = args.out
     if out_path is None:
@@ -97,7 +103,7 @@ def main(argv: list[str] | None = None) -> int:
         payload["time_performance"] = time_perf
         payload["symbol_breakdown"] = symbol_breakdown
         payload["pnl_distribution"] = pnl_distribution
-        payload["zella_score"] = zella_score
+        payload["performance_score"] = performance_score
         text = json.dumps(payload, indent=2, sort_keys=True)
     else:
         text = _format_metrics(metrics)
@@ -142,6 +148,12 @@ def _metrics_to_dict(metrics: AggregateMetrics) -> dict[str, float | int | None]
         "max_r": metrics.max_r,
         "min_r": metrics.min_r,
         "pct_r_below_minus_one": metrics.pct_r_below_minus_one,
+        "roi_pct": metrics.roi_pct,
+        "initial_equity": metrics.initial_equity,
+        "net_return": metrics.net_return,
+        "avg_trades_per_day": metrics.avg_trades_per_day,
+        "max_trades_in_day": metrics.max_trades_in_day,
+        "avg_pnl_after_loss": metrics.avg_pnl_after_loss,
     }
 
 
@@ -179,6 +191,12 @@ def _format_metrics(metrics: AggregateMetrics) -> str:
         f"max_r {_format_float(metrics.max_r)}",
         f"min_r {_format_float(metrics.min_r)}",
         f"pct_r_below_minus_one {_format_float(metrics.pct_r_below_minus_one)}",
+        f"roi_pct {_format_float(metrics.roi_pct)}",
+        f"initial_equity {_format_float(metrics.initial_equity)}",
+        f"net_return {_format_float(metrics.net_return)}",
+        f"avg_trades_per_day {_format_float(metrics.avg_trades_per_day)}",
+        f"max_trades_in_day {metrics.max_trades_in_day}",
+        f"avg_pnl_after_loss {_format_float(metrics.avg_pnl_after_loss)}",
     ]
     return "\n".join(lines)
 

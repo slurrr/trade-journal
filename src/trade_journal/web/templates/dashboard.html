@@ -154,9 +154,10 @@
 <section class="panel">
   <div class="panel-header">
     <div>
-      <h2>Liquidations</h2>
-      <p>Times and symbols where positions were force-closed.</p>
+      <h2>Recent Liquidations</h2>
+      <p>Latest force-closed positions.</p>
     </div>
+    <a class="ghost-link" href="/trades">View all</a>
   </div>
   <div class="table-wrap">
     <table class="table">
@@ -165,23 +166,21 @@
           <th>Time</th>
           <th>Symbol</th>
           <th>Side</th>
-          <th>Size</th>
           <th>P&L</th>
         </tr>
       </thead>
       <tbody>
         {% if liquidations %}
-          {% for liq in liquidations %}
+          {% for liq in liquidations[:6] %}
           <tr>
             <td>{{ liq.created_at | timestamp }}</td>
             <td>{{ liq.symbol }}</td>
             <td><span class="pill {{ liq.side | lower }}">{{ liq.side }}</span></td>
-            <td>{{ liq.size | round(4) }}</td>
             <td class="{{ 'positive' if liq.total_pnl and liq.total_pnl >= 0 else 'negative' }}">{{ liq.total_pnl | money }}</td>
           </tr>
           {% endfor %}
         {% else %}
-          <tr><td colspan="5" class="empty">No liquidations found.</td></tr>
+          <tr><td colspan="4" class="empty">No liquidations found.</td></tr>
         {% endif %}
       </tbody>
     </table>

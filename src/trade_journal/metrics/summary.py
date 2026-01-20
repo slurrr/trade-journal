@@ -61,6 +61,12 @@ class AggregateMetrics:
     max_r: float | None
     min_r: float | None
     pct_r_below_minus_one: float | None
+    roi_pct: float | None
+    initial_equity: float | None
+    net_return: float | None
+    avg_trades_per_day: float | None
+    max_trades_in_day: int
+    avg_pnl_after_loss: float | None
 
 
 def compute_trade_metrics(trade: Trade) -> TradeMetrics:
@@ -91,7 +97,10 @@ def classify_outcome(net_pnl: float, entry_notional: float) -> Outcome:
     return OUTCOME_WIN if net_pnl > 0 else OUTCOME_LOSS
 
 
-def compute_aggregate_metrics(trades: Iterable[Trade]) -> AggregateMetrics:
+def compute_aggregate_metrics(
+    trades: Iterable[Trade],
+    initial_equity: float | None = None,
+) -> AggregateMetrics:
     trade_list = list(trades)
     trade_metrics = [compute_trade_metrics(trade) for trade in trade_list]
 
@@ -158,6 +167,16 @@ def compute_aggregate_metrics(trades: Iterable[Trade]) -> AggregateMetrics:
         below = sum(1 for value in r_values if value < -1.0)
         pct_r_below_minus_one = below / len(r_values)
 
+    roi_pct = None
+    net_return = None
+    if initial_equity is not None:
+        net_return = total_net_pnl
+        if initial_equity:
+            roi_pct = total_net_pnl / initial_equity
+
+    avg_trades_per_day, max_trades_in_day = _trade_counts_by_day(trade_list)
+    avg_pnl_after_loss = _avg_pnl_after_loss(trade_list)
+
     return AggregateMetrics(
         total_trades=total_trades,
         wins=win_count,
@@ -191,6 +210,12 @@ def compute_aggregate_metrics(trades: Iterable[Trade]) -> AggregateMetrics:
         max_r=max_r,
         min_r=min_r,
         pct_r_below_minus_one=pct_r_below_minus_one,
+        roi_pct=roi_pct,
+        initial_equity=initial_equity,
+        net_return=net_return,
+        avg_trades_per_day=avg_trades_per_day,
+        max_trades_in_day=max_trades_in_day,
+        avg_pnl_after_loss=avg_pnl_after_loss,
     )
 
 
@@ -351,7 +376,7 @@ def _bucket_summary(key: int, values: list[float]) -> dict[str, float | int | No
     }
 
 
-def compute_zella_score(trades: Iterable[Trade], metrics: AggregateMetrics) -> dict[str, Any]:
+def compute_performance_score(trades: Iterable[Trade], metrics: AggregateMetrics) -> dict[str, Any]:
     weights = {
         "profit_factor": 0.25,
         "max_drawdown": 0.20,
@@ -451,3 +476,26 @@ def _daily_pnls(trades: Iterable[Trade]) -> list[float]:
         day = trade.exit_time.astimezone().date().isoformat()
         buckets[day] = buckets.get(day, 0.0) + trade.realized_pnl_net
     return list(buckets.values())
+
+
+def _trade_counts_by_day(trades: list[Trade]) -> tuple[float | None, int]:
+    buckets: dict[str, int] = {}
+    for trade in trades:
+        day = trade.exit_time.astimezone().date().isoformat()
+        buckets[day] = buckets.get(day, 0) + 1
+    if not buckets:
+        return None, 0
+    counts = list(buckets.values())
+    return sum(counts) / len(counts), max(counts)
+
+
+def _avg_pnl_after_loss(trades: list[Trade]) -> float | None:
+    ordered = sorted(trades, key=lambda trade: trade.exit_time)
+    values = []
+    for idx in range(1, len(ordered)):
+        prev = ordered[idx - 1]
+        if prev.realized_pnl_net < 0:
+            values.append(ordered[idx].realized_pnl_net)
+    if not values:
+        return None
+    return sum(values) / len(values)

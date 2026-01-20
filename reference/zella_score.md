@@ -1,4 +1,4 @@
-# Tradezella Zella Score Reference 
+# Tradezella Zella Score Reference
 
 The TradeZella Zella Score is a single, comprehensive score (0-100) summarizing a trader's overall performance by combining six key metrics: Profit Factor, Avg Win/Loss, Win %, Max Drawdown, Recovery Factor, and Consistency, each weighted by importance, providing a balanced view of profitability, risk management, and habit stability beyond just P&L. It's calculated by TradeZella's software, which scores each metric (0-100) and combines them with specific weights (e.g., Profit Factor 25%, Max Drawdown 20%) to give traders an overall "report card" for improvement.
 

@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import sys
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -157,6 +158,8 @@ def _run_checks(
     trades = reconstruct_trades(fills)
 
     funding_unmatched: list[dict[str, Any]] = []
+    funding_open_matches: list[dict[str, Any]] = []
+    open_positions = _load_open_positions()
     if funding_path.exists():
         funding_result = load_funding(funding_path)
         attributions = apply_funding_events(trades, funding_result.events)
@@ -165,19 +168,22 @@ def _run_checks(
                 event = item.event
                 if config.funding_since and event.funding_time < config.funding_since:
                     continue
-                context = _funding_context(event, trades)
-                funding_unmatched.append(
-                    {
-                        "funding_id": event.funding_id,
-                        "transaction_id": event.transaction_id,
-                        "symbol": event.symbol,
-                        "side": event.side,
-                        "position_size": event.position_size,
-                        "funding_value": event.funding_value,
-                        "funding_time": event.funding_time.isoformat(),
-                        "context": context,
-                    }
-                )
+                open_match = _match_open_position(event, open_positions)
+                record = {
+                    "funding_id": event.funding_id,
+                    "transaction_id": event.transaction_id,
+                    "symbol": event.symbol,
+                    "side": event.side,
+                    "position_size": event.position_size,
+                    "funding_value": event.funding_value,
+                    "funding_time": event.funding_time.isoformat(),
+                    "context": _funding_context(event, trades),
+                    "open_position": open_match,
+                }
+                if open_match is not None:
+                    funding_open_matches.append(record)
+                else:
+                    funding_unmatched.append(record)
 
     orders = load_orders(orders_path).orders if orders_path.exists() else []
     excursions_map = _load_excursions(excursions_path) if excursions_path.exists() else {}
@@ -219,6 +225,7 @@ def _run_checks(
         "excursions_missing": excursions_missing,
         "tiny_trades": tiny_trades,
         "funding_unmatched": funding_unmatched,
+        "funding_open_matches": funding_open_matches,
     }
 
 
@@ -506,6 +513,7 @@ def _print_summary(report: dict[str, Any]) -> None:
     print(f"excursions_missing {len(report['excursions_missing'])}")
     print(f"tiny_trades {len(report['tiny_trades'])}")
     print(f"funding_unmatched {len(report['funding_unmatched'])}")
+    print(f"funding_open_matches {len(report['funding_open_matches'])}")
 
 
 def _print_funding_table(items: list[dict[str, Any]]) -> None:
@@ -563,6 +571,58 @@ def _parse_datetime_arg(value: str) -> datetime:
     if parsed.tzinfo is None:
         return parsed.astimezone()
     return parsed
+
+
+def _load_open_positions() -> list[dict[str, Any]]:
+    env_path = os.environ.get("TRADE_JOURNAL_ACCOUNT", "").strip()
+    path = Path(env_path) if env_path else Path("data/account.json")
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    positions = []
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, dict):
+            items = data.get("positions")
+            if isinstance(items, list):
+                positions = items
+    output = []
+    for raw in positions:
+        symbol = raw.get("symbol")
+        side = raw.get("side") or raw.get("positionSide")
+        size = raw.get("size") or raw.get("positionSize")
+        if symbol is None or side is None or size is None:
+            continue
+        try:
+            size_value = float(size)
+        except (TypeError, ValueError):
+            continue
+        output.append(
+            {
+                "symbol": str(symbol),
+                "side": str(side).upper(),
+                "size": size_value,
+                "raw": raw,
+            }
+        )
+    return output
+
+
+def _match_open_position(event, positions: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for position in positions:
+        if position["symbol"] != event.symbol:
+            continue
+        if position["side"] != event.side:
+            continue
+        return {
+            "symbol": position["symbol"],
+            "side": position["side"],
+            "size": position["size"],
+        }
+    return None
 
 
 if __name__ == "__main__":

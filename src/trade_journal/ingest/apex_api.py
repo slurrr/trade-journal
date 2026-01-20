@@ -35,14 +35,14 @@ class ApexApiConfig:
     def from_env(cls, env: Mapping[str, str]) -> "ApexApiConfig":
         api_key = env.get("APEX_API_KEY", "").strip()
         api_secret = env.get("APEX_API_SECRET", "").strip()
-        api_passphrase = env.get("APEX_API_PASSPHRASE", "").strip() or env.get("APEX_PASSPHRASE", "").strip()
+        api_passphrase = env.get("APEX_PASSPHRASE", "").strip()
 
         missing = [
             name
             for name, value in (
                 ("APEX_API_KEY", api_key),
                 ("APEX_API_SECRET", api_secret),
-                ("APEX_API_PASSPHRASE", api_passphrase),
+                ("APEX_PASSPHRASE", api_passphrase),
             )
             if not value
         ]
@@ -141,6 +141,9 @@ class ApexApiClient:
         if end_ms is not None:
             params["endTimeExclusive"] = str(end_ms)
         return self._request("GET", "/v3/funding", params=params)
+
+    def fetch_account(self) -> Mapping[str, Any]:
+        return self._request("GET", "/v3/account", params=None)
 
     def _request(self, method: str, path: str, params: Mapping[str, str] | None = None) -> Mapping[str, Any]:
         params = dict(params or {})

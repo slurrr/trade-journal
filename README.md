@@ -57,3 +57,9 @@ If you are contributing:
 - Ground truth first
 - Explainability over optimization
 - Guardrails, not handcuffs
+
+## Environment Notes
+
+- `.env` is for **secrets and machine-specific values** only (API keys, passphrases, base URLs).
+- `.env.example` documents all supported knobs and defaults.
+- Keep `.env` minimal so changes are easy to track and review.

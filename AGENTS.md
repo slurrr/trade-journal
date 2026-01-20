@@ -93,6 +93,9 @@ Ask, or record it anyway (cheap to do).
 - All tooling must run inside the active `.venv`
 - Install the package in editable mode before development:
   - `pip install -e .`
+- Environment variables and defaults are documented in `.env.example`.
+  - Only update `.env.example` in code changes.
+  - The user/developer is responsible for copying needed values into `.env`.
 
 Do not modify `sys.path` or bypass the environment.
 

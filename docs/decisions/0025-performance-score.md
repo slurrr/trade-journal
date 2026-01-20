@@ -1,8 +1,8 @@
-# 0025 – Zella Score Definition
+# 0025 – Performance Score Definition
 
 ## Decision
 
-We compute a composite Zella Score (0–100) as a weighted sum of six normalized sub-scores:
+We compute a composite Performance Score (0–100) as a weighted sum of six normalized sub-scores:
 
 - Profit Factor (25%)
 - Max Drawdown (20%, inverted)

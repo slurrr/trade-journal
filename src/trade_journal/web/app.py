@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +20,7 @@ from trade_journal.metrics.risk import initial_stop_for_trade
 from trade_journal.metrics.summary import (
     compute_aggregate_metrics,
     compute_trade_metrics,
-    compute_zella_score,
+    compute_performance_score,
 )
 from trade_journal.ingest.apex_orders import load_orders
 from trade_journal.reconstruct.funding import apply_funding_events
@@ -187,9 +187,10 @@ def _load_journal_state() -> dict[str, Any]:
             setattr(trade, "r_multiple", risk.r_multiple)
             risk_map[trade.trade_id] = risk
 
-    metrics = compute_aggregate_metrics(trades) if trades else None
+    initial_equity = _initial_equity()
+    metrics = compute_aggregate_metrics(trades, initial_equity=initial_equity) if trades else None
     summary = _summary_payload(metrics) if metrics else _empty_summary()
-    zella_score = compute_zella_score(trades, metrics) if metrics else None
+    performance_score = compute_performance_score(trades, metrics) if metrics else None
 
     trade_items = [
         _trade_payload(
@@ -208,7 +209,8 @@ def _load_journal_state() -> dict[str, Any]:
         "pnl_distribution": _pnl_distribution(trade_items),
         "time_performance": _time_performance(trade_items),
         "symbol_breakdown": _symbol_breakdown(trade_items),
-        "zella_score": zella_score,
+        "performance_score": performance_score,
+        "account": _load_account_snapshot(),
         "recent_trades": trade_items[:6],
         "trades": trade_items,
         "symbols": sorted({item["symbol"] for item in trade_items}),
@@ -491,6 +493,12 @@ def _summary_payload(metrics) -> dict[str, Any]:
         "max_r": metrics.max_r,
         "min_r": metrics.min_r,
         "pct_r_below_minus_one": metrics.pct_r_below_minus_one,
+        "roi_pct": metrics.roi_pct,
+        "initial_equity": metrics.initial_equity,
+        "net_return": metrics.net_return,
+        "avg_trades_per_day": metrics.avg_trades_per_day,
+        "max_trades_in_day": metrics.max_trades_in_day,
+        "avg_pnl_after_loss": metrics.avg_pnl_after_loss,
         "mean_mae": metrics.mean_mae,
         "median_mae": metrics.median_mae,
         "mean_mfe": metrics.mean_mfe,
@@ -527,6 +535,12 @@ def _empty_summary() -> dict[str, Any]:
         "max_r": None,
         "min_r": None,
         "pct_r_below_minus_one": None,
+        "roi_pct": None,
+        "initial_equity": None,
+        "net_return": None,
+        "avg_trades_per_day": None,
+        "max_trades_in_day": 0,
+        "avg_pnl_after_loss": None,
         "mean_mae": None,
         "median_mae": None,
         "mean_mfe": None,
@@ -534,6 +548,72 @@ def _empty_summary() -> dict[str, Any]:
         "mean_etd": None,
         "median_etd": None,
     }
+
+
+def _initial_equity() -> float | None:
+    text = os.environ.get("TRADE_JOURNAL_INITIAL_EQUITY", "").strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _load_account_snapshot() -> dict[str, Any] | None:
+    env_path = os.environ.get("TRADE_JOURNAL_ACCOUNT", "").strip()
+    path = Path(env_path) if env_path else Path("data/account.json")
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return None
+    snapshot = {
+        "total_equity": _first_float(data, "totalEquity", "totalAccountValue", "equity"),
+        "available_balance": _first_float(data, "availableBalance", "availableBalanceValue", "available"),
+        "margin_balance": _first_float(data, "marginBalance", "marginBalanceValue", "balance"),
+        "timestamp": _first_timestamp(data, "updatedTime", "updateTime", "timestamp"),
+        "raw": data,
+    }
+    if snapshot["total_equity"] is None and snapshot["available_balance"] is None:
+        return None
+    return snapshot
+
+
+def _first_float(data: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        if key in data and data[key] not in (None, ""):
+            try:
+                return float(data[key])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _first_timestamp(data: dict[str, Any], *keys: str) -> str | None:
+    for key in keys:
+        if key in data and data[key] not in (None, ""):
+            value = data[key]
+            try:
+                num = float(value)
+                if num > 1e12:
+                    num = num / 1000.0
+                return datetime.fromtimestamp(num, tz=timezone.utc).isoformat()
+            except (TypeError, ValueError):
+                try:
+                    parsed = datetime.fromisoformat(str(value))
+                except ValueError:
+                    return None
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.isoformat()
+    return None
 
 
 def _equity_curve(trades: list[dict[str, Any]]) -> dict[str, Any]:
