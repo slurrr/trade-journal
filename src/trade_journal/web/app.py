@@ -20,7 +20,10 @@ from trade_journal.metrics.risk import initial_stop_for_trade
 from trade_journal.metrics.summary import (
     compute_aggregate_metrics,
     compute_trade_metrics,
+    compute_pnl_distribution,
     compute_performance_score,
+    compute_symbol_breakdown,
+    compute_time_performance,
 )
 from trade_journal.ingest.apex_orders import load_orders
 from trade_journal.reconstruct.funding import apply_funding_events
@@ -84,6 +87,50 @@ def calendar_page(request: Request) -> HTMLResponse:
         "data_note_class": "",
     }
     return TEMPLATES.TemplateResponse("calendar.html", context)
+
+
+@app.get("/analytics", response_class=HTMLResponse)
+def analytics_page(request: Request) -> HTMLResponse:
+    payload = _load_journal_state()
+    trade_items = payload["trades"]
+    trade_objects = payload.get("trade_objects", [])
+
+    filters = _parse_analytics_filters(request, payload["symbols"])
+    filtered_items = _filter_trade_items(trade_items, filters)
+    filtered_ids = {item["trade_id"] for item in filtered_items}
+    filtered_trades = [trade for trade in trade_objects if trade.trade_id in filtered_ids]
+
+    initial_equity = _initial_equity()
+    metrics = compute_aggregate_metrics(filtered_trades, initial_equity=initial_equity) if filtered_trades else None
+    summary = _summary_payload(metrics) if metrics else _empty_summary()
+    performance_score = compute_performance_score(filtered_trades, metrics) if metrics else None
+    time_perf = compute_time_performance(filtered_trades) if filtered_trades else {"hourly": [], "weekday": []}
+    symbol_breakdown = compute_symbol_breakdown(filtered_trades) if filtered_trades else []
+    pnl_distribution = compute_pnl_distribution(filtered_trades) if filtered_trades else {"bins": []}
+    daily_pnl = _daily_pnl(filtered_items)
+    equity_curve = _equity_curve(filtered_items)
+    diagnostics = _diagnostics_payload(filtered_items)
+
+    context = {
+        "request": request,
+        "page": "analytics",
+        "filters": filters,
+        "tab": filters["tab"],
+        "summary": summary,
+        "performance_score": performance_score,
+        "equity_curve": equity_curve,
+        "daily_pnl": daily_pnl,
+        "pnl_distribution": pnl_distribution,
+        "time_performance": time_perf,
+        "symbol_breakdown": symbol_breakdown,
+        "diagnostics": diagnostics,
+        "trades": filtered_items,
+        "symbols": payload["symbols"],
+        "query_base": filters["query_base"],
+        "data_note": payload.get("data_note"),
+        "data_note_class": _note_class(payload.get("data_note")),
+    }
+    return TEMPLATES.TemplateResponse("analytics.html", context)
 
 
 @app.get("/trades/{trade_id}", response_class=HTMLResponse)
@@ -213,6 +260,7 @@ def _load_journal_state() -> dict[str, Any]:
         "account": _load_account_snapshot(),
         "recent_trades": trade_items[:6],
         "trades": trade_items,
+        "trade_objects": trades,
         "symbols": sorted({item["symbol"] for item in trade_items}),
         "liquidations": liquidation_events,
         "data_note": data_note,
@@ -594,6 +642,121 @@ def _first_float(data: dict[str, Any], *keys: str) -> float | None:
             except (TypeError, ValueError):
                 return None
     return None
+
+
+def _parse_analytics_filters(request: Request, symbols: list[str]) -> dict[str, Any]:
+    params = request.query_params
+    tab = params.get("tab", "overview").strip().lower()
+    if tab not in {"overview", "diagnostics", "edge", "time", "trades"}:
+        tab = "overview"
+
+    from_date = _parse_date(params.get("from"))
+    to_date = _parse_date(params.get("to"))
+
+    selected_symbols: list[str] = []
+    if hasattr(params, "getlist"):
+        selected_symbols.extend([sym for sym in params.getlist("symbol") if sym])
+    symbol_param = params.get("symbol", "").strip()
+    selected_symbols.extend([sym for sym in symbol_param.split(",") if sym])
+    available_symbols = symbols
+    valid_symbols = [sym for sym in selected_symbols if sym in available_symbols]
+    if valid_symbols:
+        valid_symbols = list(dict.fromkeys(valid_symbols))
+
+    side = params.get("side", "all").strip().lower()
+    if side not in {"all", "long", "short"}:
+        side = "all"
+
+    outcome = params.get("outcome", "all").strip().lower()
+    if outcome not in {"all", "win", "loss", "breakeven"}:
+        outcome = "all"
+
+    query_parts = []
+    if from_date:
+        query_parts.append(f"from={from_date.isoformat()}")
+    if to_date:
+        query_parts.append(f"to={to_date.isoformat()}")
+    if valid_symbols:
+        query_parts.append(f"symbol={','.join(valid_symbols)}")
+    if side != "all":
+        query_parts.append(f"side={side}")
+    if outcome != "all":
+        query_parts.append(f"outcome={outcome}")
+    query_base = "&".join(query_parts)
+
+    return {
+        "tab": tab,
+        "from": from_date,
+        "to": to_date,
+        "symbols": valid_symbols,
+        "side": side,
+        "outcome": outcome,
+        "query_base": query_base,
+    }
+
+
+def _parse_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value).date()
+    except ValueError:
+        return None
+
+
+def _filter_trade_items(items: list[dict[str, Any]], filters: dict[str, Any]) -> list[dict[str, Any]]:
+    filtered: list[dict[str, Any]] = []
+    for item in items:
+        exit_day = item["exit_time"].date()
+        if filters["from"] and exit_day < filters["from"]:
+            continue
+        if filters["to"] and exit_day > filters["to"]:
+            continue
+        if filters["symbols"] and item["symbol"] not in filters["symbols"]:
+            continue
+        if filters["side"] != "all" and item["side"].lower() != filters["side"]:
+            continue
+        if filters["outcome"] != "all" and item["outcome"] != filters["outcome"]:
+            continue
+        filtered.append(item)
+    filtered.sort(key=lambda item: item["exit_time"], reverse=True)
+    return filtered
+
+
+def _diagnostics_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
+    mae_mfe = [
+        {
+            "x": item["mae"],
+            "y": item["mfe"],
+            "symbol": item["symbol"],
+        }
+        for item in items
+        if item["mae"] is not None and item["mfe"] is not None
+    ]
+    mfe_pnl = [
+        {
+            "x": item["mfe"],
+            "y": item["realized_pnl_net"],
+            "symbol": item["symbol"],
+        }
+        for item in items
+        if item["mfe"] is not None
+    ]
+    table = [
+        {
+            "symbol": item["symbol"],
+            "pnl": item["realized_pnl_net"],
+            "mae": item["mae"],
+            "mfe": item["mfe"],
+            "etd": item["etd"],
+        }
+        for item in items
+    ]
+    return {
+        "mae_mfe": mae_mfe,
+        "mfe_pnl": mfe_pnl,
+        "table": table,
+    }
 
 
 def _first_timestamp(data: dict[str, Any], *keys: str) -> str | None:
