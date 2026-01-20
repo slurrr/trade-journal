@@ -359,11 +359,11 @@
 {% endif %}
 
 <script>
-  const performanceScore = {{ performance_score | json | safe if performance_score else 'null' }};
-  const dailySeries = {{ daily_pnl | json | safe }};
-  const distData = {{ pnl_distribution | json | safe }};
-  const diagnostics = {{ diagnostics | json | safe }};
-  const timePerf = {{ time_performance | json | safe }};
+  const performanceScore = {{ performance_score | default(None, true) | json | safe }};
+  const dailySeries = {{ daily_pnl | default({}, true) | json | safe }};
+  const distData = {{ pnl_distribution | default({}, true) | json | safe }};
+  const diagnostics = {{ diagnostics | default({}, true) | json | safe }};
+  const timePerf = {{ time_performance | default({}, true) | json | safe }};
 
   const palette = {
     pos: '#2fbf71',
