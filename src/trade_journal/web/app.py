@@ -7,6 +7,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
@@ -18,6 +19,7 @@ from trade_journal.ingest.apex_liquidations import load_liquidations
 from trade_journal.ingest.apex_omni import load_fills
 from trade_journal.metrics.risk import initial_stop_for_trade
 from trade_journal.metrics.summary import (
+    classify_outcome,
     compute_aggregate_metrics,
     compute_trade_metrics,
     compute_performance_score,
@@ -84,6 +86,87 @@ def calendar_page(request: Request) -> HTMLResponse:
         "data_note_class": "",
     }
     return TEMPLATES.TemplateResponse("calendar.html", context)
+
+
+@app.get("/analytics", response_class=HTMLResponse)
+def analytics_page(request: Request) -> HTMLResponse:
+    payload = _load_journal_state()
+    filters = _parse_analytics_filters(request.query_params)
+    tab = _normalize_tab(request.query_params.get("tab"))
+
+    trades = payload.get("raw_trades", [])
+    filtered_trades = _filter_trades(trades, filters)
+    win_total = sum(trade.realized_pnl_net for trade in filtered_trades if trade.realized_pnl_net > 0)
+    loss_total = sum(-trade.realized_pnl_net for trade in filtered_trades if trade.realized_pnl_net < 0)
+    win_count = sum(1 for trade in filtered_trades if trade.realized_pnl_net > 0)
+    loss_count = sum(1 for trade in filtered_trades if trade.realized_pnl_net < 0)
+    breakeven_count = sum(1 for trade in filtered_trades if trade.realized_pnl_net == 0)
+    initial_equity = _initial_equity()
+    metrics = compute_aggregate_metrics(filtered_trades, initial_equity=initial_equity) if filtered_trades else None
+    summary = _summary_payload(metrics) if metrics else _empty_summary()
+    performance_score = compute_performance_score(filtered_trades, metrics) if metrics else None
+
+    risk_map = payload.get("risk_map", {})
+    liquidation_matches = payload.get("liquidation_matches", {})
+    trade_items = [
+        _trade_payload(
+            trade,
+            liquidation_matches.get(trade.trade_id),
+            risk_map.get(trade.trade_id),
+        )
+        for trade in filtered_trades
+    ]
+    trade_items.sort(key=lambda item: item["exit_time"], reverse=True)
+
+    equity_curve = _equity_curve(trade_items)
+    pnl_distribution = _pnl_distribution(trade_items)
+    daily_pnl = _daily_pnl(trade_items)
+    time_performance = _time_performance(trade_items)
+    calendar_data = _calendar_data(trade_items)
+    diagnostics_table = _diagnostics_by_symbol(trade_items)
+    symbol_breakdown = _symbol_breakdown(trade_items)
+    direction_stats = _direction_analysis(filtered_trades)
+    scatter = _diagnostic_scatter(trade_items)
+
+    query_params = _analytics_query_params(filters)
+    tabs = {
+        "overview": f"/analytics?{_analytics_query_string(query_params, tab='overview')}",
+        "diagnostics": f"/analytics?{_analytics_query_string(query_params, tab='diagnostics')}",
+        "edge": f"/analytics?{_analytics_query_string(query_params, tab='edge')}",
+        "time": f"/analytics?{_analytics_query_string(query_params, tab='time')}",
+        "trades": f"/analytics?{_analytics_query_string(query_params, tab='trades')}",
+    }
+
+    context = {
+        "request": request,
+        "page": "analytics",
+        "tab": tab,
+        "tabs": tabs,
+        "filters": filters,
+        "symbols": payload.get("symbols", []),
+        "summary": summary,
+        "win_loss": {
+            "win_total": win_total,
+            "loss_total": loss_total,
+            "win_count": win_count,
+            "loss_count": loss_count,
+            "breakeven_count": breakeven_count,
+        },
+        "performance_score": performance_score,
+        "equity_curve": equity_curve,
+        "pnl_distribution": pnl_distribution,
+        "daily_pnl": daily_pnl,
+        "time_performance": time_performance,
+        "calendar": calendar_data,
+        "diagnostics_table": diagnostics_table,
+        "symbol_breakdown": symbol_breakdown,
+        "direction_stats": direction_stats,
+        "scatter": scatter,
+        "trades": trade_items,
+        "data_note": payload.get("data_note"),
+        "data_note_class": _note_class(payload.get("data_note")),
+    }
+    return TEMPLATES.TemplateResponse("analytics.html", context)
 
 
 @app.get("/trades/{trade_id}", response_class=HTMLResponse)
@@ -213,6 +296,9 @@ def _load_journal_state() -> dict[str, Any]:
         "account": _load_account_snapshot(),
         "recent_trades": trade_items[:6],
         "trades": trade_items,
+        "raw_trades": trades,
+        "risk_map": risk_map,
+        "liquidation_matches": liquidation_matches,
         "symbols": sorted({item["symbol"] for item in trade_items}),
         "liquidations": liquidation_events,
         "data_note": data_note,
@@ -313,6 +399,11 @@ def _trade_payload(
 ) -> dict[str, Any]:
     metrics = compute_trade_metrics(trade)
     ui_id = _trade_ui_id(trade)
+    r_multiple = None
+    if risk_summary is not None:
+        r_multiple = risk_summary.r_multiple
+    else:
+        r_multiple = getattr(trade, "r_multiple", None)
     return {
         "ui_id": ui_id,
         "trade_id": trade.trade_id,
@@ -340,7 +431,7 @@ def _trade_payload(
         "liquidation": liquidation,
         "initial_stop": risk_summary.stop_price if risk_summary else None,
         "initial_risk": risk_summary.risk_amount if risk_summary else None,
-        "r_multiple": risk_summary.r_multiple if risk_summary else None,
+        "r_multiple": r_multiple,
         "stop_source": risk_summary.source if risk_summary else None,
     }
 
@@ -810,6 +901,7 @@ def _pnl_distribution(trades: list[dict[str, Any]]) -> dict[str, Any]:
                 {
                     "label": _format_money(low),
                     "count": len(values),
+                    "total_pnl": sum(values),
                     "start": low,
                     "end": high,
                     "side": "zero" if low == 0 else ("pos" if low > 0 else "neg"),
@@ -826,12 +918,14 @@ def _pnl_distribution(trades: list[dict[str, Any]]) -> dict[str, Any]:
         neg_span = abs(low) / buckets_per_side
         neg_edges = [low + neg_span * idx for idx in range(buckets_per_side + 1)]
         neg_counts = [0 for _ in range(buckets_per_side)]
+        neg_totals = [0.0 for _ in range(buckets_per_side)]
         for value in values:
             if value >= 0:
                 continue
             idx = buckets_per_side - 1 if value == 0 else int((value - low) / neg_span)
             idx = max(0, min(buckets_per_side - 1, idx))
             neg_counts[idx] += 1
+            neg_totals[idx] += value
         for idx, count in enumerate(neg_counts):
             start = neg_edges[idx]
             end = neg_edges[idx + 1]
@@ -839,6 +933,7 @@ def _pnl_distribution(trades: list[dict[str, Any]]) -> dict[str, Any]:
                 {
                     "label": f"{_format_money(start)} to {_format_money(end)}",
                     "count": count,
+                    "total_pnl": neg_totals[idx],
                     "start": start,
                     "end": end,
                     "side": "neg",
@@ -849,12 +944,14 @@ def _pnl_distribution(trades: list[dict[str, Any]]) -> dict[str, Any]:
         pos_span = high / buckets_per_side
         pos_edges = [0.0 + pos_span * idx for idx in range(buckets_per_side + 1)]
         pos_counts = [0 for _ in range(buckets_per_side)]
+        pos_totals = [0.0 for _ in range(buckets_per_side)]
         for value in values:
             if value < 0:
                 continue
             idx = buckets_per_side - 1 if value == high else int(value / pos_span)
             idx = max(0, min(buckets_per_side - 1, idx))
             pos_counts[idx] += 1
+            pos_totals[idx] += value
         for idx, count in enumerate(pos_counts):
             start = pos_edges[idx]
             end = pos_edges[idx + 1]
@@ -862,6 +959,7 @@ def _pnl_distribution(trades: list[dict[str, Any]]) -> dict[str, Any]:
                 {
                     "label": f"{_format_money(start)} to {_format_money(end)}",
                     "count": count,
+                    "total_pnl": pos_totals[idx],
                     "start": start,
                     "end": end,
                     "side": "pos",
@@ -869,6 +967,159 @@ def _pnl_distribution(trades: list[dict[str, Any]]) -> dict[str, Any]:
             )
 
     return {"bins": bins, "low": low, "high": high}
+
+
+def _normalize_tab(value: str | None) -> str:
+    valid = {"overview", "diagnostics", "edge", "time", "trades"}
+    if value in valid:
+        return value
+    return "overview"
+
+
+def _parse_iso_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _parse_symbol_param(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _parse_analytics_filters(params) -> dict[str, Any]:
+    from_value = _parse_iso_date(params.get("from"))
+    to_value = _parse_iso_date(params.get("to"))
+    symbols = _parse_symbol_param(params.get("symbol"))
+    side = (params.get("side") or "all").lower()
+    outcome = (params.get("outcome") or "all").lower()
+    return {
+        "from": from_value,
+        "to": to_value,
+        "from_str": from_value.isoformat() if from_value else "",
+        "to_str": to_value.isoformat() if to_value else "",
+        "symbols": symbols,
+        "symbols_value": ",".join(symbols),
+        "side": side,
+        "outcome": outcome,
+    }
+
+
+def _filter_trades(trades: list, filters: dict[str, Any]) -> list:
+    from_date = filters.get("from")
+    to_date = filters.get("to")
+    symbols = set(filters.get("symbols") or [])
+    side = filters.get("side")
+    outcome = filters.get("outcome")
+    output = []
+
+    for trade in trades:
+        exit_date = trade.exit_time.astimezone().date()
+        if from_date and exit_date < from_date:
+            continue
+        if to_date and exit_date > to_date:
+            continue
+        if symbols and trade.symbol not in symbols:
+            continue
+        if side and side != "all" and trade.side.lower() != side:
+            continue
+        if outcome and outcome != "all":
+            entry_notional = trade.entry_price * trade.entry_size
+            trade_outcome = classify_outcome(trade.realized_pnl_net, entry_notional)
+            if trade_outcome != outcome:
+                continue
+        output.append(trade)
+
+    return output
+
+
+def _analytics_query_params(filters: dict[str, Any]) -> dict[str, str]:
+    params: dict[str, str] = {}
+    if filters.get("from"):
+        params["from"] = filters["from"].isoformat()
+    if filters.get("to"):
+        params["to"] = filters["to"].isoformat()
+    if filters.get("symbols_value"):
+        params["symbol"] = filters["symbols_value"]
+    if filters.get("side"):
+        params["side"] = filters["side"]
+    if filters.get("outcome"):
+        params["outcome"] = filters["outcome"]
+    return params
+
+
+def _analytics_query_string(params: dict[str, str], tab: str | None = None) -> str:
+    payload = dict(params)
+    if tab:
+        payload["tab"] = tab
+    return urlencode(payload)
+
+
+def _diagnostic_scatter(trades: list[dict[str, Any]]) -> dict[str, list[dict[str, float]]]:
+    mae_mfe = []
+    mfe_pnl = []
+    for item in trades:
+        mae = item.get("mae")
+        mfe = item.get("mfe")
+        net = item.get("realized_pnl_net")
+        if mae is not None and mfe is not None:
+            mae_mfe.append({"x": mae, "y": mfe})
+        if mfe is not None and net is not None:
+            mfe_pnl.append({"x": mfe, "y": net})
+    return {"mae_mfe": mae_mfe, "mfe_pnl": mfe_pnl}
+
+
+def _diagnostics_by_symbol(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    buckets: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    totals: dict[str, float] = defaultdict(float)
+    for item in trades:
+        symbol = item["symbol"]
+        totals[symbol] += item["realized_pnl_net"]
+        for key in ("mae", "mfe", "etd"):
+            value = item.get(key)
+            if value is not None:
+                buckets[symbol][key].append(value)
+
+    rows = []
+    for symbol in sorted(totals.keys()):
+        mae_vals = buckets[symbol].get("mae", [])
+        mfe_vals = buckets[symbol].get("mfe", [])
+        etd_vals = buckets[symbol].get("etd", [])
+        rows.append(
+            {
+                "symbol": symbol,
+                "net_pnl": totals[symbol],
+                "mae": _average(mae_vals),
+                "mfe": _average(mfe_vals),
+                "etd": _average(etd_vals),
+            }
+        )
+    return rows
+
+
+def _average(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def _direction_analysis(trades: list) -> dict[str, dict[str, Any]]:
+    output: dict[str, dict[str, Any]] = {}
+    for side in ("long", "short"):
+        side_trades = [trade for trade in trades if trade.side.lower() == side]
+        metrics = compute_aggregate_metrics(side_trades) if side_trades else None
+        output[side] = {
+            "trades": len(side_trades),
+            "win_rate": metrics.win_rate if metrics else None,
+            "profit_factor": metrics.profit_factor if metrics else None,
+            "expectancy": metrics.expectancy if metrics else None,
+            "net_pnl": metrics.total_net_pnl if metrics else 0.0,
+        }
+    return output
 
 
 def _format_money(value: float) -> str:
