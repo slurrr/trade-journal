@@ -37,8 +37,6 @@ def main(argv: list[str] | None = None) -> int:
             client,
             limit=args.limit,
             max_pages=args.max_pages,
-            source=context.source,
-            account_id=context.account_id,
         )
     else:
         payload = client.fetch_historical_pnl(limit=args.limit, page=args.page)
@@ -78,8 +76,6 @@ def _fetch_all_pages(
     client: ApexApiClient,
     limit: int | None,
     max_pages: int,
-    source: str | None,
-    account_id: str | None,
 ) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     page = 0
@@ -88,14 +84,31 @@ def _fetch_all_pages(
         error = _payload_error(payload)
         if error:
             raise RuntimeError(f"ApeX error while paging: {error}")
-        page_records = extract_liquidations(payload, source=source, account_id=account_id).events
+        page_records = list(_extract_records(payload))
         if not page_records:
             break
-        records.extend([event.raw for event in page_records])
+        records.extend(page_records)
         if limit is not None and len(page_records) < limit:
             break
         page += 1
     return {"data": {"historicalPnl": records}}
+
+
+def _extract_records(payload: Any) -> Iterable[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [record for record in payload if isinstance(record, dict)]
+    if isinstance(payload, dict):
+        for key in ("data", "result"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [record for record in value if isinstance(record, dict)]
+        data = payload.get("data")
+        if isinstance(data, dict):
+            for key in ("list", "records", "pnl", "history", "historicalPnl"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    return [record for record in value if isinstance(record, dict)]
+    return []
 
 
 def _payload_error(payload: Any) -> str | None:

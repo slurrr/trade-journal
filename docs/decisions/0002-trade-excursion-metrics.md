@@ -9,17 +9,22 @@ position lifecycle from first fill to fully flat.
 
 ### Maximum Adverse Excursion (MAE)
 
-The maximum unrealized loss experienced at any point during the trade,
-measured from the trade’s weighted average entry price to the worst
-intratrade price, adjusted for position size.
+The maximum **price-based total PnL drawdown** experienced at any point during
+the trade. This is computed as:
+
+`realized_price_pnl_so_far + unrealized_price_pnl`
+
+Price-only means **fees and funding are excluded**.
 
 MAE represents the worst pain endured during the trade.
 
 ### Maximum Favorable Excursion (MFE)
 
-The maximum unrealized profit experienced at any point during the trade,
-measured from the trade’s weighted average entry price to the best
-intratrade price, adjusted for position size.
+The maximum **price-based total PnL** experienced at any point during the trade.
+This includes realized price PnL from scale-outs plus the unrealized price PnL
+on the remaining open size.
+
+Price-only means **fees and funding are excluded**.
 
 MFE represents the maximum opportunity available during the trade.
 
@@ -27,7 +32,7 @@ MFE represents the maximum opportunity available during the trade.
 
 The difference between MFE and the realized PnL at trade exit.
 
-ETD = MFE − Realized PnL
+ETD = MFE − Realized Price PnL
 
 ETD represents how much unrealized profit was given back before exit.
 

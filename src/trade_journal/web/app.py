@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -119,6 +119,7 @@ def analytics_page(request: Request) -> HTMLResponse:
             "mae": row["mae"],
             "mfe": row["mfe"],
             "etd": row["etd"],
+            "ui_id": row.get("ui_id"),
             "capture_pct": row.get("capture_pct"),
             "heat_pct": row.get("heat_pct"),
         }
@@ -181,6 +182,35 @@ def summary_api() -> dict[str, Any]:
 def trades_api() -> list[dict[str, Any]]:
     payload = _load_journal_state()
     return payload["trades"]
+
+
+@app.get("/api/trades/{trade_id}/series")
+def trade_series_api(trade_id: str) -> dict[str, Any]:
+    context = resolve_account_context(env=os.environ)
+    series_path = _resolve_trade_series_path(context)
+    if series_path is None:
+        raise HTTPException(status_code=404, detail="Trade series cache not found.")
+
+    payload = _load_journal_state()
+    trade = next((item for item in payload["trade_objects"] if _trade_ui_id(item) == trade_id), None)
+    if trade is None:
+        raise HTTPException(status_code=404, detail="Trade not found.")
+
+    series_map = _load_trade_series(series_path)
+    key = _excursions_key(trade)
+    series = series_map.get(key)
+    if series is None:
+        series = series_map.get(_excursions_key(trade, use_local=True))
+    if series is None:
+        series = series_map.get(_excursions_key_legacy(trade))
+    if series is None:
+        series = series_map.get(_excursions_key_legacy(trade, use_local=True))
+    return {
+        "trade_id": trade_id,
+        "symbol": trade.symbol,
+        "interval": _price_interval(),
+        "series": series or [],
+    }
 
 
 def _load_journal_state() -> dict[str, Any]:
@@ -472,7 +502,7 @@ def _capture_heat_pct(trade) -> tuple[float | None, float | None]:
     if mfe is None or mfe <= 0:
         return None, None
     capture_pct = (trade.realized_pnl_net / mfe) * 100.0
-    heat_pct = (trade.mae / mfe) * 100.0 if trade.mae is not None else None
+    heat_pct = abs((trade.mae / mfe) * 100.0) if trade.mae is not None else None
     return capture_pct, heat_pct
 
 
@@ -705,6 +735,29 @@ def _load_account_snapshot(context) -> dict[str, Any] | None:
     return snapshot
 
 
+def _resolve_trade_series_path(context) -> Path | None:
+    env_path = os.environ.get("TRADE_JOURNAL_TRADE_SERIES")
+    if env_path:
+        candidate = Path(env_path)
+        return candidate if candidate.exists() else None
+    candidate = resolve_data_path(None, context, "trade_series.json")
+    return candidate if candidate.exists() else None
+
+
+def _load_trade_series(path: Path) -> dict[str, list[dict[str, float | None]]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return payload
+
+
+def _price_interval() -> str:
+    return os.environ.get("APEX_PRICE_INTERVAL", "1m")
+
+
 def _first_float(data: dict[str, Any], *keys: str) -> float | None:
     for key in keys:
         if key in data and data[key] not in (None, ""):
@@ -800,6 +853,12 @@ def _diagnostics_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
             "x": item["mae"],
             "y": item["mfe"],
             "symbol": item["symbol"],
+            "trade_id": item["ui_id"],
+            "pnl": item["realized_pnl_net"],
+            "mae": item["mae"],
+            "mfe": item["mfe"],
+            "capture_pct": item.get("capture_pct"),
+            "heat_pct": item.get("heat_pct"),
         }
         for item in items
         if item["mae"] is not None and item["mfe"] is not None
@@ -809,6 +868,12 @@ def _diagnostics_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
             "x": item["mfe"],
             "y": item["realized_pnl_net"],
             "symbol": item["symbol"],
+            "trade_id": item["ui_id"],
+            "pnl": item["realized_pnl_net"],
+            "mae": item["mae"],
+            "mfe": item["mfe"],
+            "capture_pct": item.get("capture_pct"),
+            "heat_pct": item.get("heat_pct"),
         }
         for item in items
         if item["mfe"] is not None
@@ -820,6 +885,7 @@ def _diagnostics_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
             "mae": item["mae"],
             "mfe": item["mfe"],
             "etd": item["etd"],
+            "ui_id": item["ui_id"],
             "capture_pct": item.get("capture_pct"),
             "heat_pct": item.get("heat_pct"),
         }

@@ -178,6 +178,14 @@
     pickerList.scrollTop = Math.max(0, offset);
   };
 
+  const syncPickerPosition = () => {
+    const wrapRect = pickerWrap.getBoundingClientRect();
+    const labelRect = pickerLabel.getBoundingClientRect();
+    const left = labelRect.left - wrapRect.left;
+    pickerList.style.left = `${left}px`;
+    pickerList.style.width = `${labelRect.width}px`;
+  };
+
   const updateActiveFromScroll = () => {
     const mid = pickerList.scrollTop + pickerList.clientHeight / 2;
     let closest = pickerItems[0];
@@ -195,9 +203,20 @@
     }
   };
 
+  const wrapPickerScroll = () => {
+    const max = pickerList.scrollHeight - pickerList.clientHeight;
+    if (max <= 0) return;
+    if (pickerList.scrollTop <= 0) {
+      pickerList.scrollTop = max - 1;
+    } else if (pickerList.scrollTop >= max) {
+      pickerList.scrollTop = 1;
+    }
+  };
+
   const openPicker = () => {
     pickerWrap.classList.add('open');
     pickerList.setAttribute('aria-hidden', 'false');
+    syncPickerPosition();
     scrollToMonth(currentMonth);
     updateActiveFromScroll();
   };
@@ -221,10 +240,12 @@
       openPicker();
     }
     pickerList.scrollTop += event.deltaY;
+    wrapPickerScroll();
     updateActiveFromScroll();
   });
 
   pickerList.addEventListener('scroll', () => {
+    wrapPickerScroll();
     updateActiveFromScroll();
   });
 
@@ -251,6 +272,12 @@
     if (!pickerWrap.classList.contains('open')) return;
     if (pickerWrap.contains(event.target)) return;
     closePicker();
+  });
+
+  window.addEventListener('resize', () => {
+    if (pickerWrap.classList.contains('open')) {
+      syncPickerPosition();
+    }
   });
 </script>
 {% endblock %}

@@ -180,13 +180,16 @@ def _run_checks(
     funding_unmatched: list[dict[str, Any]] = []
     funding_open_matches: list[dict[str, Any]] = []
     open_positions = _load_open_positions(context)
+    funding_since = config.funding_since
+    if funding_since is None and getattr(context, "funding_baseline", None):
+        funding_since = _parse_datetime_arg(context.funding_baseline)
     if funding_path.exists():
         funding_result = load_funding(funding_path, source=source, account_id=account_id)
         attributions = apply_funding_events(trades, funding_result.events)
         for item in attributions:
             if item.matched_trade_id is None:
                 event = item.event
-                if config.funding_since and event.funding_time < config.funding_since:
+                if funding_since and event.funding_time < funding_since:
                     continue
                 open_match = _match_open_position(event, open_positions)
                 record = {
@@ -242,6 +245,7 @@ def _run_checks(
             "trades": len(trades),
             "critical": critical,
             "warning": warning,
+            "funding_since": funding_since.isoformat() if funding_since else None,
         },
         "fills": fill_issues,
         "trades": trade_issues,
@@ -529,6 +533,8 @@ def _print_summary(report: dict[str, Any]) -> None:
     print(f"trades {summary['trades']}")
     print(f"critical {summary['critical']}")
     print(f"warning {summary['warning']}")
+    if summary.get("funding_since"):
+        print(f"funding_since {summary['funding_since']}")
     print(f"fill_critical {len(report['fills']['critical'])}")
     print(f"fill_warning {len(report['fills']['warning'])}")
     print(f"trade_critical {len(report['trades']['critical'])}")

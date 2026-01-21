@@ -19,6 +19,7 @@
 
 <form class="filter-bar" method="get" action="/analytics">
   <input type="hidden" name="tab" value="{{ tab }}" />
+  <input type="hidden" name="symbol" id="symbolValue" value="{{ filters.symbols | join(',') }}" />
   <label>
     <span>From</span>
     <input type="date" name="from" value="{{ filters['from'] or '' }}" />
@@ -27,14 +28,19 @@
     <span>To</span>
     <input type="date" name="to" value="{{ filters['to'] or '' }}" />
   </label>
-  <label>
+  <div class="symbol-picker">
     <span>Symbols</span>
-    <select name="symbol" multiple>
-      {% for symbol in symbols %}
-      <option value="{{ symbol }}" {% if symbol in filters.symbols %}selected{% endif %}>{{ symbol }}</option>
-      {% endfor %}
-    </select>
-  </label>
+    <div class="symbol-wheel" id="symbolWheel">
+      <div class="symbol-wheel-current month-wheel-current" id="symbolWheelCurrent">Symbols</div>
+      <div class="symbol-wheel-list month-wheel-list" id="symbolWheelList" aria-hidden="true">
+        {% for symbol in symbols %}
+        <div class="symbol-wheel-item month-wheel-item {% if symbol in filters.symbols %}active{% endif %}" data-symbol="{{ symbol }}">
+          {{ symbol | replace('-USDT', '') }}
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
   <label>
     <span>Side</span>
     <select name="side">
@@ -52,7 +58,10 @@
       <option value="breakeven" {% if filters.outcome == 'breakeven' %}selected{% endif %}>Breakeven</option>
     </select>
   </label>
-  <button class="filter-apply" type="submit">Apply</button>
+  <div class="filter-actions">
+    <button class="filter-apply" type="submit">Apply</button>
+    <button class="filter-clear" type="button" id="filterClear">Clear</button>
+  </div>
 </form>
 
 <nav class="analytics-tabs">
@@ -144,24 +153,26 @@
 </section>
 
 {% elif tab == 'diagnostics' %}
-<section class="chart-grid analytics-charts">
+<section class="chart-grid analytics-charts diagnostics-scatter">
   <div class="panel">
     <div class="panel-header">
       <div>
         <h2>Heat</h2>
-        <p>MAE vs MFE</p>
       </div>
     </div>
-    <canvas id="maeMfeChart" height="180"></canvas>
+    <div class="scatter-body">
+      <canvas id="maeMfeChart" height="200"></canvas>
+    </div>
   </div>
   <div class="panel">
     <div class="panel-header">
       <div>
         <h2>Capture</h2>
-        <p>MFE vs Realized P&amp;L</p>
       </div>
     </div>
-    <canvas id="mfePnlChart" height="180"></canvas>
+    <div class="scatter-body">
+      <canvas id="mfePnlChart" height="200"></canvas>
+    </div>
   </div>
 </section>
 
@@ -169,24 +180,23 @@
   <div class="panel-header">
     <div>
       <h2>Efficiency Metrics</h2>
-      <p>Mean and median excursion stats.</p>
     </div>
   </div>
   <div class="stat-grid">
-    <div class="stat-card">
-      <div class="stat-label">Mean MAE</div>
-      <div class="stat-value">{{ summary.mean_mae | money }}</div>
-      <div class="stat-sub">Median {{ summary.median_mae | money }}</div>
+    <div class="stat-card positive">
+      <div class="stat-label">MFE</div>
+      <div class="stat-value">{{ summary.median_mfe | money }}</div>
+      <div class="stat-sub">Average {{ summary.mean_mfe | money }}</div>
     </div>
-    <div class="stat-card">
-      <div class="stat-label">Mean MFE</div>
-      <div class="stat-value">{{ summary.mean_mfe | money }}</div>
-      <div class="stat-sub">Median {{ summary.median_mfe | money }}</div>
+    <div class="stat-card negative">
+      <div class="stat-label">MAE</div>
+      <div class="stat-value">{{ summary.median_mae | money }}</div>
+      <div class="stat-sub">Average {{ summary.mean_mae | money }}</div>
     </div>
-    <div class="stat-card">
-      <div class="stat-label">Mean ETD</div>
-      <div class="stat-value">{{ summary.mean_etd | money }}</div>
-      <div class="stat-sub">Median {{ summary.median_etd | money }}</div>
+    <div class="stat-card neutral">
+      <div class="stat-label">ETD</div>
+      <div class="stat-value">{{ summary.median_etd | money }}</div>
+      <div class="stat-sub">Average {{ summary.mean_etd | money }}</div>
     </div>
   </div>
 </section>
@@ -195,8 +205,8 @@
   <div class="panel-header">
     <div>
       <h2>Diagnostics Table</h2>
-      <p>Excursions by symbol.</p>
     </div>
+    <div class="panel-count">{{ diagnostics_table | length }} trades</div>
   </div>
   <div class="table-wrap">
     <table class="table" id="diagnosticsTable">
@@ -215,6 +225,8 @@
         {% if diagnostics_table %}
           {% for row in diagnostics_table %}
           <tr
+            id="diag-{{ row.ui_id }}"
+            data-trade-id="{{ row.ui_id }}"
             data-symbol="{{ row.symbol }}"
             data-pnl="{{ row.pnl or 0 }}"
             data-mfe="{{ row.mfe or 0 }}"
@@ -486,6 +498,7 @@
 
 <script>
   const performanceScore = {{ performance_score | default(None, true) | json | safe }};
+  const summaryData = {{ summary | default({}, true) | json | safe }};
   const dailySeries = {{ daily_pnl | default({}, true) | json | safe }};
   const distData = {{ pnl_distribution | default({}, true) | json | safe }};
   const diagnostics = {{ diagnostics | default({}, true) | json | safe }};
@@ -493,12 +506,332 @@
   const timePerf = {{ time_performance | default({}, true) | json | safe }};
   const calendarData = {{ calendar | default({}, true) | json | safe }};
 
+  const symbolValue = document.getElementById('symbolValue');
+  const symbolWheel = document.getElementById('symbolWheel');
+  const symbolWheelCurrent = document.getElementById('symbolWheelCurrent');
+  const symbolWheelList = document.getElementById('symbolWheelList');
+  const symbolItems = Array.from(document.querySelectorAll('.symbol-wheel-item'));
+
+  const syncSymbolWheelPosition = () => {
+    if (!symbolWheel || !symbolWheelCurrent || !symbolWheelList) return;
+    const wheelRect = symbolWheel.getBoundingClientRect();
+    const currentRect = symbolWheelCurrent.getBoundingClientRect();
+    const left = currentRect.left - wheelRect.left;
+    symbolWheelList.style.left = `${left}px`;
+    symbolWheelList.style.width = `${currentRect.width}px`;
+  };
+
+  const updateSymbolValue = () => {
+    if (!symbolValue) return;
+    const selected = symbolItems.filter(item => item.classList.contains('active')).map(item => item.dataset.symbol);
+    symbolValue.value = selected.join(',');
+    if (symbolWheelCurrent) {
+      symbolWheelCurrent.textContent = selected.length ? `Symbols (${selected.length})` : 'Symbols (All)';
+    }
+  };
+
+  const updateSymbolFocus = () => {
+    if (!symbolWheelList) return;
+    const mid = symbolWheelList.scrollTop + symbolWheelList.clientHeight / 2;
+    let closest = symbolItems[0];
+    let closestDist = Infinity;
+    symbolItems.forEach(item => {
+      const itemMid = item.offsetTop + item.clientHeight / 2;
+      const dist = Math.abs(itemMid - mid);
+      if (dist < closestDist) {
+        closest = item;
+        closestDist = dist;
+      }
+    });
+    symbolItems.forEach(item => {
+      item.classList.remove('focus', 'near', 'far');
+    });
+    if (closest) {
+      closest.classList.add('focus');
+      const idx = symbolItems.indexOf(closest);
+      symbolItems.forEach((item, index) => {
+        if (item === closest) return;
+        const distance = Math.abs(index - idx);
+        if (distance === 1) item.classList.add('near');
+        if (distance >= 2) item.classList.add('far');
+      });
+    }
+  };
+
+  const wrapWheelScroll = (list) => {
+    const max = list.scrollHeight - list.clientHeight;
+    if (max <= 0) return;
+    if (list.scrollTop <= 0) {
+      list.scrollTop = max - 1;
+    } else if (list.scrollTop >= max) {
+      list.scrollTop = 1;
+    }
+  };
+
+  const openSymbolWheel = () => {
+    if (!symbolWheel || !symbolWheelList) return;
+    syncSymbolWheelPosition();
+    symbolWheel.classList.add('open');
+    symbolWheelList.setAttribute('aria-hidden', 'false');
+    updateSymbolFocus();
+  };
+
+  const closeSymbolWheel = () => {
+    if (!symbolWheel || !symbolWheelList) return;
+    symbolWheel.classList.remove('open');
+    symbolWheelList.setAttribute('aria-hidden', 'true');
+  };
+
+  if (symbolWheelCurrent && symbolWheelList && symbolItems.length) {
+    symbolWheelCurrent.addEventListener('click', () => {
+      if (symbolWheel.classList.contains('open')) {
+        closeSymbolWheel();
+      } else {
+        openSymbolWheel();
+      }
+    });
+
+    symbolWheelCurrent.addEventListener('wheel', event => {
+      event.preventDefault();
+      if (!symbolWheel.classList.contains('open')) {
+        openSymbolWheel();
+      }
+      symbolWheelList.scrollTop += event.deltaY;
+      wrapWheelScroll(symbolWheelList);
+      updateSymbolFocus();
+    });
+
+    symbolWheelList.addEventListener('scroll', () => {
+      wrapWheelScroll(symbolWheelList);
+      updateSymbolFocus();
+    });
+
+    symbolItems.forEach(item => {
+      item.addEventListener('click', event => {
+        event.stopPropagation();
+        item.classList.toggle('active');
+        updateSymbolValue();
+      });
+    });
+
+    document.addEventListener('click', event => {
+      if (!symbolWheel.classList.contains('open')) return;
+      if (symbolWheel.contains(event.target)) return;
+      closeSymbolWheel();
+    });
+
+    window.addEventListener('resize', () => {
+      if (symbolWheel.classList.contains('open')) {
+        syncSymbolWheelPosition();
+      }
+    });
+
+    updateSymbolValue();
+  }
+
+  const clearButton = document.getElementById('filterClear');
+  if (clearButton) {
+    clearButton.addEventListener('click', () => {
+      const tab = '{{ tab }}';
+      window.location.href = `/analytics?tab=${tab}`;
+    });
+  }
+
   const palette = {
     pos: '#2fbf71',
     neg: '#e25c4b',
     accent: '#9a6bff',
     ink: '#c9c0b6',
   };
+
+  const formatMoney = (value) => {
+    if (value === null || value === undefined || Number.isNaN(value)) return 'n/a';
+    const numeric = Number(value);
+    const sign = numeric < 0 ? '-' : '';
+    const absValue = Math.abs(numeric);
+    return `${sign}$${absValue.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+  };
+
+  const formatPercent = (value) => {
+    if (value === null || value === undefined || Number.isNaN(value)) return 'n/a';
+    const numeric = Number(value);
+    return `${numeric.toFixed(1)}%`;
+  };
+
+  const formatMae = (value) => {
+    if (value === null || value === undefined || Number.isNaN(value)) return 'n/a';
+    const absValue = Math.abs(Number(value));
+    return `-$${absValue.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+  };
+
+  const getOrCreateScatterTooltip = (chart) => {
+    const parent = chart.canvas.parentNode;
+    let tooltipEl = parent.querySelector('.chart-tooltip');
+    if (!tooltipEl) {
+      tooltipEl = document.createElement('div');
+      tooltipEl.className = 'chart-tooltip';
+      tooltipEl.dataset.locked = 'false';
+      tooltipEl.dataset.hideTimeout = '';
+      tooltipEl.style.pointerEvents = 'none';
+      tooltipEl.addEventListener('mouseenter', () => {
+        tooltipEl.dataset.locked = 'true';
+        if (tooltipEl.dataset.hideTimeout) {
+          clearTimeout(Number(tooltipEl.dataset.hideTimeout));
+          tooltipEl.dataset.hideTimeout = '';
+        }
+      });
+      tooltipEl.addEventListener('mouseleave', () => {
+        tooltipEl.dataset.locked = 'false';
+        tooltipEl.style.opacity = '0';
+        tooltipEl.style.pointerEvents = 'none';
+      });
+      parent.appendChild(tooltipEl);
+    }
+    return tooltipEl;
+  };
+
+  const scatterTooltipHandler = (context) => {
+    const { chart, tooltip } = context;
+    const tooltipEl = getOrCreateScatterTooltip(chart);
+    if (tooltip.opacity === 0) {
+      if (tooltipEl.dataset.locked === 'true' || tooltipEl.matches(':hover')) return;
+      if (!tooltipEl.dataset.hideTimeout) {
+        const timeout = window.setTimeout(() => {
+          if (tooltipEl.dataset.locked === 'true' || tooltipEl.matches(':hover')) return;
+          tooltipEl.style.opacity = '0';
+          tooltipEl.style.pointerEvents = 'none';
+          tooltipEl.dataset.hideTimeout = '';
+        }, 120);
+        tooltipEl.dataset.hideTimeout = String(timeout);
+      }
+      return;
+    }
+    const raw = tooltip.dataPoints?.[0]?.raw || {};
+    if (tooltipEl.dataset.hideTimeout) {
+      clearTimeout(Number(tooltipEl.dataset.hideTimeout));
+      tooltipEl.dataset.hideTimeout = '';
+    }
+    const lines = [
+      `PnL: ${formatMoney(raw.pnl)}`,
+      `MFE: ${formatMoney(raw.mfe)}`,
+      `MAE: ${formatMae(raw.mae)}`,
+      `Capture: ${formatPercent(raw.capture_pct)}`,
+      `Heat: ${formatPercent(raw.heat_pct)}`,
+    ];
+    const link = raw.trade_id ? `<a href="#diag-${raw.trade_id}" data-diag-link="true">View in table</a>` : '';
+    tooltipEl.innerHTML = `
+      ${lines.map(line => `<div>${line}</div>`).join('')}
+      ${link ? `<div class="tooltip-link">${link}</div>` : ''}
+    `;
+    tooltipEl.style.opacity = '1';
+    tooltipEl.style.pointerEvents = 'auto';
+    tooltipEl.style.left = `${tooltip.caretX}px`;
+    tooltipEl.style.top = `${tooltip.caretY}px`;
+  };
+
+  const guideColor = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim() || '#d97a3a';
+
+  const buildScatterGuides = (config) => ({
+    id: 'scatterGuides',
+    afterDraw: (chart) => {
+      const xScale = chart.scales.x;
+      const yScale = chart.scales.y;
+      if (!xScale || !yScale) return;
+      const drawLine = (x1, y1, x2, y2) => {
+        const ctx = chart.ctx;
+        ctx.save();
+        ctx.strokeStyle = guideColor;
+        ctx.globalAlpha = 0.35;
+        ctx.lineWidth = 1;
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.stroke();
+        ctx.restore();
+      };
+
+      if (config.diagonal) {
+        const start = Math.max(xScale.min ?? 0, yScale.min ?? 0);
+        const end = Math.min(xScale.max ?? 0, yScale.max ?? 0);
+        if (start < end) {
+          drawLine(
+            xScale.getPixelForValue(start),
+            yScale.getPixelForValue(start),
+            xScale.getPixelForValue(end),
+            yScale.getPixelForValue(end)
+          );
+        }
+      }
+
+      if (config.diagonalNegative) {
+        const xMin = Number.isFinite(xScale.min) ? xScale.min : 0;
+        const xMax = Number.isFinite(xScale.max) ? xScale.max : 0;
+        const yMin = Number.isFinite(yScale.min) ? yScale.min : 0;
+        const yMax = Number.isFinite(yScale.max) ? yScale.max : 0;
+        const rawPoints = [
+          { x: xMin, y: -xMin },
+          { x: xMax, y: -xMax },
+          { x: -yMin, y: yMin },
+          { x: -yMax, y: yMax },
+        ].filter(point => point.x >= xMin && point.x <= xMax && point.y >= yMin && point.y <= yMax);
+        const points = [];
+        rawPoints.forEach(point => {
+          const key = `${point.x.toFixed(6)}:${point.y.toFixed(6)}`;
+          if (!points.some(existing => `${existing.x.toFixed(6)}:${existing.y.toFixed(6)}` === key)) {
+            points.push(point);
+          }
+        });
+        if (points.length >= 2) {
+          let start = points[0];
+          let end = points[1];
+          let maxDist = -Infinity;
+          for (let i = 0; i < points.length; i++) {
+            for (let j = i + 1; j < points.length; j++) {
+              const dx = points[i].x - points[j].x;
+              const dy = points[i].y - points[j].y;
+              const dist = dx * dx + dy * dy;
+              if (dist > maxDist) {
+                maxDist = dist;
+                start = points[i];
+                end = points[j];
+              }
+            }
+          }
+          drawLine(
+            xScale.getPixelForValue(start.x),
+            yScale.getPixelForValue(start.y),
+            xScale.getPixelForValue(end.x),
+            yScale.getPixelForValue(end.y)
+          );
+        }
+      }
+
+      if (config.vertical !== null && config.vertical !== undefined) {
+        const value = Number(config.vertical);
+        if (!Number.isNaN(value) && value >= (xScale.min ?? value) && value <= (xScale.max ?? value)) {
+          drawLine(
+            xScale.getPixelForValue(value),
+            yScale.getPixelForValue(yScale.min),
+            xScale.getPixelForValue(value),
+            yScale.getPixelForValue(yScale.max)
+          );
+        }
+      }
+
+      if (config.horizontal !== null && config.horizontal !== undefined) {
+        const value = Number(config.horizontal);
+        if (!Number.isNaN(value) && value >= (yScale.min ?? value) && value <= (yScale.max ?? value)) {
+          drawLine(
+            xScale.getPixelForValue(xScale.min),
+            yScale.getPixelForValue(value),
+            xScale.getPixelForValue(xScale.max),
+            yScale.getPixelForValue(value)
+          );
+        }
+      }
+    }
+  });
 
   const radarCanvas = document.getElementById('performanceRadar');
   if (radarCanvas && performanceScore) {
@@ -629,17 +962,31 @@
       type: 'scatter',
       data: {
         datasets: [{
-          label: 'MAE vs MFE',
           data: scatterData.mae_mfe,
           backgroundColor: palette.pos,
         }],
       },
+      plugins: [buildScatterGuides({ diagonalNegative: true, vertical: summaryData.median_mae })],
       options: {
         responsive: true,
-        plugins: { legend: { display: false } },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            enabled: false,
+            external: scatterTooltipHandler,
+          }
+        },
         scales: {
-          x: { title: { display: true, text: 'MAE' }, grid: { color: 'rgba(0,0,0,0.06)' } },
-          y: { title: { display: true, text: 'MFE' }, grid: { color: 'rgba(0,0,0,0.06)' } },
+          x: {
+            title: { display: true, text: 'MAE' },
+            ticks: { display: true, maxTicksLimit: 5, autoSkip: true, font: { size: 9 }, padding: 2 },
+            grid: { color: 'rgba(0,0,0,0.06)' }
+          },
+          y: {
+            title: { display: true, text: 'MFE' },
+            ticks: { display: true, maxTicksLimit: 5, autoSkip: true, font: { size: 9 }, padding: 2 },
+            grid: { color: 'rgba(0,0,0,0.06)' }
+          },
         }
       }
     });
@@ -651,17 +998,31 @@
       type: 'scatter',
       data: {
         datasets: [{
-          label: 'MFE vs Realized',
           data: scatterData.mfe_pnl,
           backgroundColor: palette.neg,
         }],
       },
+      plugins: [buildScatterGuides({ diagonal: true, horizontal: 0 })],
       options: {
         responsive: true,
-        plugins: { legend: { display: false } },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            enabled: false,
+            external: scatterTooltipHandler,
+          }
+        },
         scales: {
-          x: { title: { display: true, text: 'MFE' }, grid: { color: 'rgba(0,0,0,0.06)' } },
-          y: { title: { display: true, text: 'Realized Net P&L' }, grid: { color: 'rgba(0,0,0,0.06)' } },
+          x: {
+            title: { display: true, text: 'MFE' },
+            ticks: { display: true, maxTicksLimit: 5, autoSkip: true, font: { size: 9 }, padding: 2 },
+            grid: { color: 'rgba(0,0,0,0.06)' }
+          },
+          y: {
+            title: { display: true, text: 'Realized Net P&L' },
+            ticks: { display: true, maxTicksLimit: 5, autoSkip: true, font: { size: 9 }, padding: 2 },
+            grid: { color: 'rgba(0,0,0,0.06)' }
+          },
         }
       }
     });
@@ -837,6 +1198,37 @@
       });
     });
   }
+
+  const focusDiagnosticsRow = tradeId => {
+    if (!tradeId) return;
+    const row = document.getElementById(`diag-${tradeId}`);
+    if (!row) return;
+    row.classList.remove('row-highlight');
+    void row.offsetWidth;
+    row.classList.add('row-highlight');
+    row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  };
+
+  const handleDiagnosticsHash = () => {
+    const hash = window.location.hash || '';
+    if (!hash.startsWith('#diag-')) return;
+    const tradeId = hash.slice(6);
+    focusDiagnosticsRow(tradeId);
+  };
+
+  document.addEventListener('click', event => {
+    const link = event.target.closest('a[data-diag-link]');
+    if (!link) return;
+    event.preventDefault();
+    const href = link.getAttribute('href') || '';
+    if (href.startsWith('#diag-')) {
+      history.replaceState(null, '', href);
+      handleDiagnosticsHash();
+    }
+  });
+
+  window.addEventListener('hashchange', handleDiagnosticsHash);
+  handleDiagnosticsHash();
 
   const analyticsTable = document.getElementById('analyticsTradesTable');
   if (analyticsTable) {

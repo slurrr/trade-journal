@@ -11,6 +11,7 @@ from trade_journal.ingest.apex_api import load_dotenv
 from trade_journal.ingest.apex_funding import load_funding
 from trade_journal.ingest.apex_omni import load_fills
 from trade_journal.metrics.excursions import apply_trade_excursions
+from trade_journal.metrics.series import compute_trade_series, downsample_series
 from trade_journal.pricing.apex_prices import ApexPriceClient, PriceSeriesConfig
 from trade_journal.reconstruct.funding import apply_funding_events
 from trade_journal.reconstruct.trades import reconstruct_trades
@@ -34,6 +35,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--env", type=Path, default=Path(".env"), help="Path to .env file.")
     parser.add_argument("--out", type=Path, default=None, help="Output file.")
+    parser.add_argument("--series-out", type=Path, default=None, help="Optional trade series cache output.")
+    parser.add_argument(
+        "--series-max-points",
+        type=int,
+        default=None,
+        help="Max points per trade series (downsample if needed).",
+    )
     parser.add_argument("--local", action="store_true", help="Use local timestamps for keys (default uses UTC).")
     args = parser.parse_args(argv)
 
@@ -71,6 +79,7 @@ def main(argv: list[str] | None = None) -> int:
     price_client = ApexPriceClient(PriceSeriesConfig.from_env(env))
 
     payload: dict[str, dict[str, float | None]] = {}
+    series_payload: dict[str, list[dict[str, float | None]]] = {}
     for trade in trades:
         key = _trade_key(trade, local=args.local)
         try:
@@ -81,6 +90,20 @@ def main(argv: list[str] | None = None) -> int:
                 "mfe": trade.mfe,
                 "etd": trade.etd,
             }
+            series = compute_trade_series(trade, bars)
+            series = downsample_series(series, args.series_max_points)
+            series_payload[key] = [
+                {
+                    "t": int(point.timestamp.timestamp() * 1000),
+                    "open": point.open,
+                    "high": point.high,
+                    "low": point.low,
+                    "close": point.close,
+                    "entry_return": point.entry_return,
+                    "per_unit_unrealized": point.per_unit_unrealized,
+                }
+                for point in series
+            ]
         except RuntimeError as exc:
             print(
                 f"Price series missing for {trade.symbol} "
@@ -92,10 +115,14 @@ def main(argv: list[str] | None = None) -> int:
                 "mfe": None,
                 "etd": None,
             }
+            series_payload[key] = []
 
     out_path = args.out or resolve_data_path(None, context, "excursions.json")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    series_out = args.series_out or resolve_data_path(None, context, "trade_series.json")
+    series_out.parent.mkdir(parents=True, exist_ok=True)
+    series_out.write_text(json.dumps(series_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return 0
 
 

@@ -17,6 +17,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--raw", action="store_true", help="Print raw JSON instead of summary.")
     parser.add_argument("--env", type=Path, default=Path(".env"), help="Path to .env file.")
     parser.add_argument("--base-url", type=str, default=None, help="Override APEX_BASE_URL.")
+    parser.add_argument("--account", type=str, default=None, help="Account name from accounts config.")
     parser.add_argument("--begin", type=str, default=None, help="Begin datetime (local) or epoch ms.")
     parser.add_argument("--end", type=str, default=None, help="End datetime (local) or epoch ms.")
     parser.add_argument("--all", action="store_true", help="Fetch all pages until empty.")

@@ -17,6 +17,7 @@ class AccountConfig:
     source: str
     account_id: str | None
     data_dir: Path
+    funding_baseline: str | None
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,7 @@ class AccountContext:
     source: str
     account_id: str | None
     data_dir: Path
+    funding_baseline: str | None
 
 
 def load_accounts_config(path: Path) -> AccountsConfig:
@@ -46,11 +48,13 @@ def load_accounts_config(path: Path) -> AccountsConfig:
         source = str(cfg.get("source") or "apex").strip().lower()
         account_id = cfg.get("account_id") or cfg.get("accountId")
         data_dir = cfg.get("data_dir") or cfg.get("dataDir") or f"data/{name}"
+        funding_baseline = cfg.get("funding_baseline") or cfg.get("fundingBaseline")
         accounts[name] = AccountConfig(
             name=name,
             source=source,
             account_id=str(account_id) if account_id else None,
             data_dir=Path(data_dir),
+            funding_baseline=str(funding_baseline) if funding_baseline else None,
         )
     if default_account and default_account not in accounts:
         raise ValueError(f"Default account '{default_account}' not found in accounts config.")
@@ -83,6 +87,7 @@ def resolve_account_context(
             source=account.source,
             account_id=account.account_id or account.name,
             data_dir=account.data_dir,
+            funding_baseline=account.funding_baseline,
         )
     data_dir = Path(env.get("TRADE_JOURNAL_DATA_DIR", "data"))
     source = env.get("TRADE_JOURNAL_SOURCE", "apex")
@@ -92,6 +97,7 @@ def resolve_account_context(
         source=source,
         account_id=account_id if account_id else resolved_name,
         data_dir=data_dir,
+        funding_baseline=None,
     )
 
 
