@@ -55,6 +55,14 @@ def load_orders(
     raise ValueError(f"Unsupported file type: {source_path.suffix}")
 
 
+def load_orders_payload(
+    payload: Any, *, source: str | None = None, account_id: str | None = None
+) -> OrdersIngestResult:
+    records = _extract_records(payload)
+    orders, skipped = _normalize_records(records, source_name=source, account_id=account_id)
+    return OrdersIngestResult(orders=orders, skipped=skipped)
+
+
 def _load_orders_json(
     path: Path, *, source_name: str | None, account_id: str | None
 ) -> OrdersIngestResult:
@@ -131,6 +139,8 @@ def _normalize_order(
     status = _pick(raw, "status")
     created_at = _parse_timestamp(_pick(raw, "createdAt", "created_at", "timestamp", "time"))
 
+    if size is None:
+        raise ValueError("Missing order size")
     if not symbol or not side:
         raise ValueError("Missing required order fields")
 

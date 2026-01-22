@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from collections import defaultdict
+import asyncio
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -15,10 +16,12 @@ from fastapi.templating import Jinja2Templates
 from jinja2 import Undefined
 
 from trade_journal.config.accounts import resolve_account_context, resolve_data_path
+from trade_journal.config.app_config import load_app_config
 from trade_journal.ingest.apex_funding import load_funding
 from trade_journal.ingest.apex_equity import load_equity_history
 from trade_journal.ingest.apex_liquidations import load_liquidations
 from trade_journal.ingest.apex_omni import load_fills
+from trade_journal.storage import sqlite_reader
 from trade_journal.metrics.equity import apply_equity_at_entry
 from trade_journal.metrics.risk import initial_stop_for_trade
 from trade_journal.metrics.summary import (
@@ -40,6 +43,15 @@ TEMPLATES = Jinja2Templates(directory=str(APP_ROOT / "templates"))
 
 app = FastAPI(title="Trade Journal")
 app.mount("/static", StaticFiles(directory=str(APP_ROOT / "static")), name="static")
+
+_SYNC_LOCK = asyncio.Lock()
+
+
+@app.on_event("startup")
+async def _start_auto_sync() -> None:
+    if not _auto_sync_enabled():
+        return
+    asyncio.create_task(_auto_sync_loop())
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -217,6 +229,9 @@ def trade_series_api(trade_id: str) -> dict[str, Any]:
 
 def _load_journal_state() -> dict[str, Any]:
     context = resolve_account_context(env=os.environ)
+    db_path = _resolve_db_path()
+    if db_path is not None and db_path.exists():
+        return _load_journal_state_db(context, db_path)
     (
         fills_path,
         funding_path,
@@ -299,10 +314,7 @@ def _load_journal_state() -> dict[str, Any]:
         except (ValueError, OSError, json.JSONDecodeError):
             data_note = _append_note(data_note, "Failed to parse equity history.")
         else:
-            fallback_equity = _initial_equity()
-            if fallback_equity is None:
-                fallback_equity = context.starting_equity
-            apply_equity_at_entry(trades, equity_result.snapshots, fallback_equity=fallback_equity)
+            _apply_equity(trades, equity_result.snapshots, context)
 
     risk_map: dict[str, Any] = {}
     if orders:
@@ -350,80 +362,262 @@ def _load_journal_state() -> dict[str, Any]:
     }
 
 
+def _load_journal_state_db(context, db_path: Path) -> dict[str, Any]:
+    conn = sqlite_reader.connect(db_path)
+    from trade_journal.storage.sqlite_store import init_db
+
+    init_db(conn)
+    try:
+        fills = sqlite_reader.load_fills(conn, source=context.source, account_id=context.account_id)
+        trades = reconstruct_trades(fills)
+        funding_events = sqlite_reader.load_funding(conn, source=context.source, account_id=context.account_id)
+        attributions = apply_funding_events(trades, funding_events)
+        unmatched = sum(1 for item in attributions if item.matched_trade_id is None)
+        orders = sqlite_reader.load_orders(conn, source=context.source, account_id=context.account_id)
+        liquidation_events_raw = sqlite_reader.load_liquidations(
+            conn, source=context.source, account_id=context.account_id
+        )
+        equity_snapshots = sqlite_reader.load_equity_history(
+            conn, source=context.source, account_id=context.account_id
+        )
+    finally:
+        conn.close()
+
+    data_note = None
+    if not fills:
+        data_note = "No fills found in database."
+    if unmatched:
+        data_note = _append_note(data_note, f"Unmatched funding events: {unmatched}.")
+
+    app_config = load_app_config()
+    excursions_map: dict[str, dict[str, Any]] = {}
+    excursions_path = None
+    candidate = app_config.paths.excursions
+    if candidate and candidate.exists():
+        excursions_path = candidate
+    else:
+        candidate = resolve_data_path(None, context, "excursions.json")
+        if candidate.exists():
+            excursions_path = candidate
+    if excursions_path is not None:
+        try:
+            excursions_map = json.loads(excursions_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            data_note = _append_note(data_note, "Failed to parse excursions cache.")
+    elif trades:
+        data_note = _append_note(data_note, "Excursions cache missing: MAE/MFE/ETD shown as n/a.")
+
+    if excursions_map:
+        _apply_excursions_cache(trades, excursions_map)
+
+    if equity_snapshots:
+        _apply_equity(trades, equity_snapshots, context)
+
+    liquidation_matches = _match_liquidations(trades, liquidation_events_raw)
+    liquidation_events = _build_liquidation_events(trades, liquidation_events_raw, liquidation_matches)
+
+    risk_map: dict[str, Any] = {}
+    if orders:
+        for trade in trades:
+            risk = initial_stop_for_trade(trade, orders)
+            setattr(trade, "r_multiple", risk.r_multiple)
+            risk_map[trade.trade_id] = risk
+
+    initial_equity = _initial_equity()
+    metrics = compute_aggregate_metrics(trades, initial_equity=initial_equity) if trades else None
+    summary = _summary_payload(metrics) if metrics else _empty_summary()
+    performance_score = compute_performance_score(trades, metrics) if metrics else None
+
+    trade_items = [
+        _trade_payload(
+            trade,
+            liquidation_matches.get(trade.trade_id),
+            risk_map.get(trade.trade_id),
+        )
+        for trade in trades
+    ]
+    trade_items.sort(key=lambda item: item["exit_time"], reverse=True)
+
+    return {
+        "summary": summary,
+        "equity_curve": _equity_curve(trade_items),
+        "daily_pnl": _daily_pnl(trade_items),
+        "pnl_distribution": _pnl_distribution(trade_items),
+        "time_performance": _time_performance(trade_items),
+        "symbol_breakdown": _symbol_breakdown(trade_items),
+        "performance_score": performance_score,
+        "account": _load_account_snapshot(context),
+        "account_context": {
+            "name": context.name,
+            "source": context.source,
+            "account_id": context.account_id,
+            "data_dir": str(context.data_dir),
+            "db_path": str(db_path),
+        },
+        "recent_trades": trade_items[:6],
+        "trades": trade_items,
+        "trade_objects": trades,
+        "symbols": sorted({item["symbol"] for item in trade_items}),
+        "liquidations": liquidation_events,
+        "data_note": data_note,
+    }
+
+
 def _resolve_paths(
     context,
 ) -> tuple[Path | None, Path | None, Path | None, Path | None, Path | None, Path | None]:
-    fills_env = os.environ.get("TRADE_JOURNAL_FILLS")
-    funding_env = os.environ.get("TRADE_JOURNAL_FUNDING")
-    liquidations_env = os.environ.get("TRADE_JOURNAL_LIQUIDATIONS")
-    excursions_env = os.environ.get("TRADE_JOURNAL_EXCURSIONS")
-    orders_env = os.environ.get("TRADE_JOURNAL_ORDERS")
-    equity_env = os.environ.get("TRADE_JOURNAL_EQUITY_HISTORY")
-
-    fills_path = Path(fills_env) if fills_env else resolve_data_path(None, context, "fills.json")
+    app_config = load_app_config()
+    fills_path = resolve_data_path(None, context, "fills.json")
     if not fills_path.exists():
         fills_path = resolve_data_path(None, context, "fills.csv")
     if not fills_path.exists():
         fills_path = None
 
     funding_path = None
-    if funding_env:
-        candidate = Path(funding_env)
-        if candidate.exists():
-            funding_path = candidate
-    else:
-        candidate = resolve_data_path(None, context, "funding.json")
-        if candidate.exists():
-            funding_path = candidate
+    candidate = resolve_data_path(None, context, "funding.json")
+    if candidate.exists():
+        funding_path = candidate
     liquidations_path = None
-    if liquidations_env:
-        candidate = Path(liquidations_env)
-        if candidate.exists():
-            liquidations_path = candidate
+    candidate = resolve_data_path(None, context, "liquidations.json")
+    if candidate.exists():
+        liquidations_path = candidate
     else:
-        candidate = resolve_data_path(None, context, "liquidations.json")
+        candidate = resolve_data_path(None, context, "historical_pnl.json")
         if candidate.exists():
             liquidations_path = candidate
-        else:
-            candidate = resolve_data_path(None, context, "historical_pnl.json")
-            if candidate.exists():
-                liquidations_path = candidate
 
     excursions_path = None
-    if excursions_env:
-        candidate = Path(excursions_env)
-        if candidate.exists():
-            excursions_path = candidate
+    candidate = app_config.paths.excursions
+    if candidate and candidate.exists():
+        excursions_path = candidate
     else:
         candidate = resolve_data_path(None, context, "excursions.json")
         if candidate.exists():
             excursions_path = candidate
 
     orders_path = None
-    if orders_env:
-        candidate = Path(orders_env)
-        if candidate.exists():
-            orders_path = candidate
+    candidate = resolve_data_path(None, context, "history_orders.json")
+    if candidate.exists():
+        orders_path = candidate
     else:
-        candidate = resolve_data_path(None, context, "history_orders.json")
+        candidate = resolve_data_path(None, context, "open_orders.json")
         if candidate.exists():
             orders_path = candidate
-        else:
-            candidate = resolve_data_path(None, context, "open_orders.json")
-            if candidate.exists():
-                orders_path = candidate
 
     equity_path = None
-    if equity_env:
-        candidate = Path(equity_env)
-        if candidate.exists():
-            equity_path = candidate
+    candidate = app_config.paths.equity_history
+    if candidate and candidate.exists():
+        equity_path = candidate
     else:
         candidate = resolve_data_path(None, context, "equity_history.json")
         if candidate.exists():
             equity_path = candidate
 
     return fills_path, funding_path, liquidations_path, excursions_path, orders_path, equity_path
+
+
+def _resolve_db_path() -> Path | None:
+    app_config = load_app_config()
+    return app_config.app.db_path
+
+
+def _apply_equity(trades: list, snapshots, context) -> None:
+    fallback_equity = _initial_equity()
+    if fallback_equity is None:
+        fallback_equity = context.starting_equity
+    apply_equity_at_entry(trades, snapshots, fallback_equity=fallback_equity)
+
+
+def _auto_sync_enabled() -> bool:
+    app_config = load_app_config()
+    return bool(app_config.sync.auto_sync)
+
+
+async def _auto_sync_loop() -> None:
+    interval = _sync_interval_seconds()
+    while True:
+        await _run_auto_sync_once()
+        await asyncio.sleep(interval)
+
+
+async def _run_auto_sync_once() -> None:
+    db_path = _resolve_db_path()
+    if db_path is None:
+        return
+    try:
+        if _SYNC_LOCK.locked():
+            return
+        async with _SYNC_LOCK:
+            await asyncio.to_thread(_sync_once)
+            if _sync_runs_excursions():
+                await asyncio.to_thread(_run_excursions, db_path)
+    except Exception as exc:
+        print(f"Auto-sync failed: {exc}")
+
+
+def _sync_once() -> None:
+    from trade_journal import sync_api
+
+    app_config = load_app_config()
+    env_path = app_config.app.env_path
+    sync_api.sync_once(
+        db_path=_resolve_db_path() or Path("data/trade_journal.sqlite"),
+        account=os.environ.get("TRADE_JOURNAL_ACCOUNT_NAME"),
+        env_path=env_path,
+        base_url=app_config.api.base_url,
+        limit=_sync_limit(),
+        max_pages=_sync_max_pages(),
+        overlap_hours=_sync_overlap_hours(),
+        end_ms=_sync_end_ms(),
+    )
+
+
+def _run_excursions(db_path: Path) -> None:
+    from trade_journal import compute_excursions
+
+    args = ["--db", str(db_path)]
+    account = os.environ.get("TRADE_JOURNAL_ACCOUNT_NAME")
+    if account:
+        args += ["--account", account]
+    max_points = _series_max_points()
+    if max_points is not None:
+        args += ["--series-max-points", str(max_points)]
+    compute_excursions.main(args)
+
+
+def _sync_interval_seconds() -> int:
+    app_config = load_app_config()
+    return max(60, int(app_config.sync.interval_seconds))
+
+
+def _sync_overlap_hours() -> float:
+    app_config = load_app_config()
+    return float(app_config.sync.overlap_hours)
+
+
+def _sync_limit() -> int | None:
+    app_config = load_app_config()
+    return app_config.sync.limit
+
+
+def _sync_max_pages() -> int:
+    app_config = load_app_config()
+    return int(app_config.sync.max_pages)
+
+
+def _sync_end_ms() -> int | None:
+    app_config = load_app_config()
+    return app_config.sync.end_ms
+
+
+def _sync_runs_excursions() -> bool:
+    app_config = load_app_config()
+    return bool(app_config.sync.run_excursions)
+
+
+def _series_max_points() -> int | None:
+    app_config = load_app_config()
+    return app_config.sync.series_max_points
 
 
 def _append_note(existing: str | None, extra: str) -> str:
@@ -733,16 +927,21 @@ def _empty_summary() -> dict[str, Any]:
 
 
 def _initial_equity() -> float | None:
-    text = os.environ.get("TRADE_JOURNAL_INITIAL_EQUITY", "").strip()
-    if not text:
-        return None
-    try:
-        return float(text)
-    except ValueError:
-        return None
+    app_config = load_app_config()
+    return app_config.app.initial_equity
 
 
 def _load_account_snapshot(context) -> dict[str, Any] | None:
+    db_path = _resolve_db_path()
+    if db_path is not None:
+        conn = sqlite_reader.connect(db_path)
+        try:
+            return sqlite_reader.load_account_snapshot(
+                conn, source=context.source, account_id=context.account_id
+            )
+        finally:
+            conn.close()
+
     env_path = os.environ.get("TRADE_JOURNAL_ACCOUNT", "").strip()
     path = Path(env_path) if env_path else resolve_data_path(None, context, "account.json")
     if not path.exists():
@@ -769,10 +968,10 @@ def _load_account_snapshot(context) -> dict[str, Any] | None:
 
 
 def _resolve_trade_series_path(context) -> Path | None:
-    env_path = os.environ.get("TRADE_JOURNAL_TRADE_SERIES")
-    if env_path:
-        candidate = Path(env_path)
-        return candidate if candidate.exists() else None
+    app_config = load_app_config()
+    candidate = app_config.paths.trade_series
+    if candidate and candidate.exists():
+        return candidate
     candidate = resolve_data_path(None, context, "trade_series.json")
     return candidate if candidate.exists() else None
 
@@ -788,7 +987,8 @@ def _load_trade_series(path: Path) -> dict[str, list[dict[str, float | None]]]:
 
 
 def _price_interval() -> str:
-    return os.environ.get("APEX_PRICE_INTERVAL", "1m")
+    app_config = load_app_config()
+    return str(app_config.pricing.interval)
 
 
 def _first_float(data: dict[str, Any], *keys: str) -> float | None:
@@ -1303,14 +1503,13 @@ TEMPLATES.env.filters.update(
 def main() -> None:
     import uvicorn
 
-    host = os.environ.get("TRADE_JOURNAL_HOST", "127.0.0.1")
-    port_text = os.environ.get("TRADE_JOURNAL_PORT", "8000")
-    try:
-        port = int(port_text)
-    except ValueError:
-        port = 8000
-    reload_flag = os.environ.get("TRADE_JOURNAL_RELOAD", "true").lower() in {"1", "true", "yes"}
-    uvicorn.run("trade_journal.web.app:app", host=host, port=port, reload=reload_flag)
+    app_config = load_app_config()
+    uvicorn.run(
+        "trade_journal.web.app:app",
+        host=app_config.app.host,
+        port=app_config.app.port,
+        reload=app_config.app.reload,
+    )
 
 
 if __name__ == "__main__":

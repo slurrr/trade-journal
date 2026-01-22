@@ -1,5 +1,5 @@
-# ruff: noqa
 # pyright: ignore
+# ruff: noqa
 
 
 

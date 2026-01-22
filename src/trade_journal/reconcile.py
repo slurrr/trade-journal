@@ -90,6 +90,13 @@ def load_historical_pnl(
     return [_normalize_record(record, source=source, account_id=account_id) for record in records]
 
 
+def load_historical_pnl_payload(
+    payload: Any, *, source: str | None = None, account_id: str | None = None
+) -> list[PnlRecord]:
+    records = _extract_records(payload)
+    return [_normalize_record(record, source=source, account_id=account_id) for record in records]
+
+
 def _extract_records(payload: Any) -> Iterable[dict[str, Any]]:
     if isinstance(payload, list):
         return [record for record in payload if isinstance(record, dict)]

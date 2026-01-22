@@ -33,6 +33,16 @@ def load_equity_history(
     return EquityHistoryResult(snapshots=snapshots, skipped=skipped)
 
 
+def load_equity_history_payload(
+    payload: Any, *, source: str | None = None, account_id: str | None = None, min_value: float | None = 0.0
+) -> EquityHistoryResult:
+    records = _extract_records(payload)
+    snapshots, skipped = _normalize_records(
+        records, source_name=source, account_id=account_id, min_value=min_value
+    )
+    return EquityHistoryResult(snapshots=snapshots, skipped=skipped)
+
+
 def _extract_records(payload: Any) -> Iterable[Mapping[str, Any]]:
     if isinstance(payload, list):
         return payload
@@ -78,7 +88,9 @@ def _normalize_record(
     min_value: float | None,
 ) -> EquitySnapshot:
     timestamp = _parse_timestamp(_pick(raw, "dateTime", "timestamp", "ts", "time"))
-    total_value = _to_float(_pick(raw, "accountTotalValue", "totalValue", "equity", "balance"))
+    total_value = _to_float(
+        _pick(raw, "accountTotalValue", "totalValue", "total_value", "equity", "balance")
+    )
     if min_value is not None and total_value <= min_value:
         raise ValueError("Equity below minimum threshold")
     return EquitySnapshot(

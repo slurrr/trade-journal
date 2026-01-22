@@ -33,6 +33,14 @@ def load_funding(
     raise ValueError(f"Unsupported file type: {source_path.suffix}")
 
 
+def load_funding_payload(
+    payload: Any, *, source: str | None = None, account_id: str | None = None
+) -> FundingIngestResult:
+    records = _extract_records(payload)
+    events, skipped = _normalize_records(records, source_name=source, account_id=account_id)
+    return FundingIngestResult(events=events, skipped=skipped)
+
+
 def _load_funding_json(
     path: Path, *, source_name: str | None, account_id: str | None
 ) -> FundingIngestResult:

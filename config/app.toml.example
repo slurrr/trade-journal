@@ -1,0 +1,53 @@
+[app]
+# SQLite database path for the journal.
+db_path = "data/trade_journal.sqlite"
+# Web server bind settings.
+host = "127.0.0.1"
+port = 8010
+reload = true
+# Optional initial equity for ROI calculations (leave blank if unknown).
+initial_equity = ""
+# Path to the env file containing API secrets.
+env_path = ".env"
+
+[api]
+# ApeX Omni API base URL (host only; /api is appended internally).
+base_url = "https://omni.apex.exchange"
+# Equity history endpoint for account balance snapshots.
+equity_endpoint = "/v3/history-value"
+# Request settings.
+timeout_seconds = 30
+fills_limit = 100
+retry_attempts = 3
+retry_backoff_seconds = 0.75
+debug = false
+
+[pricing]
+# Price series endpoint (public market data).
+base_url = "https://omni.apex.exchange/api"
+endpoint = "/v3/klines"
+interval = "1"
+timeout_seconds = 30
+param_symbol = "symbol"
+param_interval = "interval"
+param_start = "start"
+param_end = "end"
+time_unit = "s"
+symbol_transform = "strip-dash"
+max_bars = 200
+
+[paths]
+# Leave blank to use per-account data files under data/<account>/.
+excursions = ""
+trade_series = ""
+equity_history = ""
+
+[sync]
+auto_sync = true
+interval_seconds = 900
+overlap_hours = 48
+limit = ""
+max_pages = 200
+end_ms = ""
+run_excursions = true
+series_max_points = ""

@@ -33,6 +33,14 @@ def load_fills(
     raise ValueError(f"Unsupported file type: {source_path.suffix}")
 
 
+def load_fills_payload(
+    payload: Any, *, source: str | None = None, account_id: str | None = None
+) -> IngestResult:
+    records = _extract_records(payload)
+    fills, skipped = _normalize_records(records, source_name=source, account_id=account_id)
+    return IngestResult(fills=fills, skipped=skipped)
+
+
 def _load_fills_json(
     path: Path, *, source_name: str | None, account_id: str | None
 ) -> IngestResult:

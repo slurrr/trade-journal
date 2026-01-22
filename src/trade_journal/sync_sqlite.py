@@ -248,3 +248,7 @@ def _log_json(db_path: Path, total: int, report: dict[str, dict[str, int]]) -> s
         "report": report,
     }
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

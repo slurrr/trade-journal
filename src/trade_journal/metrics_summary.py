@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 from trade_journal.config.accounts import resolve_account_context, resolve_data_path
 from trade_journal.ingest.apex_funding import load_funding
@@ -122,7 +123,7 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _metrics_to_dict(metrics: AggregateMetrics) -> dict[str, float | int | None]:
+def _metrics_to_dict(metrics: AggregateMetrics) -> dict[str, Any]:
     return {
         "total_trades": metrics.total_trades,
         "wins": metrics.wins,

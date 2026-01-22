@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from trade_journal.config.accounts import resolve_account_context, resolve_data_path
-from trade_journal.ingest.apex_api import load_dotenv
+from trade_journal.config.app_config import load_app_config
 from trade_journal.ingest.apex_funding import load_funding
 from trade_journal.ingest.apex_omni import load_fills
 from trade_journal.metrics.excursions import apply_trade_excursions
@@ -43,18 +43,24 @@ def main(argv: list[str] | None = None) -> int:
         help="Max points per trade series (downsample if needed).",
     )
     parser.add_argument("--local", action="store_true", help="Use local timestamps for keys (default uses UTC).")
+    parser.add_argument("--db", type=Path, default=None, help="SQLite DB path (overrides fills file).")
     args = parser.parse_args(argv)
 
     context = resolve_account_context(args.account, env=os.environ)
-    fills_path = args.fills_path or resolve_data_path(None, context, "fills.json")
-    if not fills_path.exists():
-        candidate = resolve_data_path(None, context, "fills.csv")
-        fills_path = candidate if candidate.exists() else fills_path
+    db_path = args.db or _resolve_db_path()
+    funding_result = None
+    if db_path is not None and db_path.exists():
+        trades, funding_result = _load_from_db(db_path, context)
+    else:
+        fills_path = args.fills_path or resolve_data_path(None, context, "fills.json")
+        if not fills_path.exists():
+            candidate = resolve_data_path(None, context, "fills.csv")
+            fills_path = candidate if candidate.exists() else fills_path
 
-    result = load_fills(fills_path, source=context.source, account_id=context.account_id)
-    trades = reconstruct_trades(result.fills)
-    if result.skipped:
-        print(f"Skipped {result.skipped} fill rows during normalization.", file=sys.stderr)
+        result = load_fills(fills_path, source=context.source, account_id=context.account_id)
+        trades = reconstruct_trades(result.fills)
+        if result.skipped:
+            print(f"Skipped {result.skipped} fill rows during normalization.", file=sys.stderr)
 
     funding_path = args.funding
     if funding_path is None:
@@ -62,8 +68,10 @@ def main(argv: list[str] | None = None) -> int:
         if default_funding.exists():
             funding_path = default_funding
 
-    if funding_path is not None:
+    if funding_result is None and funding_path is not None:
         funding_result = load_funding(funding_path, source=context.source, account_id=context.account_id)
+
+    if funding_result is not None:
         attributions = apply_funding_events(trades, funding_result.events)
         unmatched = sum(1 for item in attributions if item.matched_trade_id is None)
         if funding_result.skipped:
@@ -74,9 +82,11 @@ def main(argv: list[str] | None = None) -> int:
         if unmatched:
             print(f"Unmatched funding events: {unmatched}.", file=sys.stderr)
 
-    env = dict(os.environ)
-    env.update(load_dotenv(args.env))
-    price_client = ApexPriceClient(PriceSeriesConfig.from_env(env))
+    app_config = load_app_config()
+    price_client = ApexPriceClient(PriceSeriesConfig.from_settings(app_config.pricing))
+    series_max_points = args.series_max_points
+    if series_max_points is None:
+        series_max_points = app_config.sync.series_max_points
 
     payload: dict[str, dict[str, float | None]] = {}
     series_payload: dict[str, list[dict[str, float | None]]] = {}
@@ -91,7 +101,7 @@ def main(argv: list[str] | None = None) -> int:
                 "etd": trade.etd,
             }
             series = compute_trade_series(trade, bars)
-            series = downsample_series(series, args.series_max_points)
+            series = downsample_series(series, series_max_points)
             series_payload[key] = [
                 {
                     "t": int(point.timestamp.timestamp() * 1000),
@@ -117,10 +127,22 @@ def main(argv: list[str] | None = None) -> int:
             }
             series_payload[key] = []
 
-    out_path = args.out or resolve_data_path(None, context, "excursions.json")
+    out_path = args.out
+    if out_path is None:
+        candidate = app_config.paths.excursions
+        if candidate is not None:
+            out_path = candidate
+        else:
+            out_path = resolve_data_path(None, context, "excursions.json")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    series_out = args.series_out or resolve_data_path(None, context, "trade_series.json")
+    series_out = args.series_out
+    if series_out is None:
+        candidate = app_config.paths.trade_series
+        if candidate is not None:
+            series_out = candidate
+        else:
+            series_out = resolve_data_path(None, context, "trade_series.json")
     series_out.parent.mkdir(parents=True, exist_ok=True)
     series_out.write_text(json.dumps(series_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return 0
@@ -143,6 +165,30 @@ def _trade_key(trade, local: bool) -> str:
         f"{trade.realized_pnl:.8f}",
     ]
     return "|".join(parts)
+
+
+def _resolve_db_path() -> Path | None:
+    app_config = load_app_config()
+    return app_config.app.db_path
+
+
+def _load_from_db(db_path: Path, context):
+    from trade_journal.storage import sqlite_reader
+
+    conn = sqlite_reader.connect(db_path)
+    try:
+        fills = sqlite_reader.load_fills(conn, source=context.source, account_id=context.account_id)
+        trades = reconstruct_trades(fills)
+        funding_events = sqlite_reader.load_funding(conn, source=context.source, account_id=context.account_id)
+        return trades, _FundingResult(funding_events)
+    finally:
+        conn.close()
+
+
+class _FundingResult:
+    def __init__(self, events):
+        self.events = events
+        self.skipped = 0
 
 
 if __name__ == "__main__":

@@ -294,7 +294,7 @@ def _extract_r_values(trades: list[Trade]) -> list[float]:
     return values
 
 
-def compute_time_performance(trades: Iterable[Trade]) -> dict[str, list[dict[str, float | int]]]:
+def compute_time_performance(trades: Iterable[Trade]) -> dict[str, list[dict[str, float | int | None]]]:
     hourly: dict[int, list[float]] = {}
     weekday: dict[int, list[float]] = {}
     for trade in trades:
@@ -412,11 +412,11 @@ def compute_performance_score(trades: Iterable[Trade], metrics: AggregateMetrics
     if total_weight == 0:
         overall = None
     else:
-        weighted_sum = sum(
-            component_scores[key] * weights[key]
-            for key in component_scores
-            if component_scores[key] is not None
-        )
+        weighted_sum = 0.0
+        for key, value in component_scores.items():
+            if value is None:
+                continue
+            weighted_sum += value * weights[key]
         overall = weighted_sum / total_weight
 
     return {

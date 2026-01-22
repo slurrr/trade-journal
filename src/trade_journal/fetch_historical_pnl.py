@@ -6,19 +6,22 @@ import os
 from pathlib import Path
 from typing import Any, Iterable
 
+from trade_journal.config.app_config import apply_api_settings, load_app_config
 from trade_journal.ingest.apex_api import ApexApiClient, ApexApiConfig, load_dotenv
 
 
 def main(argv: list[str] | None = None) -> int:
+    app_config = load_app_config()
     parser = argparse.ArgumentParser(description="Fetch ApeX Omni historical PnL records.")
     parser.add_argument("--limit", type=int, default=None, help="Number of records per page.")
     parser.add_argument("--page", type=int, default=0, help="Page number (0-based).")
     parser.add_argument("--raw", action="store_true", help="Print raw JSON instead of summary.")
-    parser.add_argument("--env", type=Path, default=Path(".env"), help="Path to .env file.")
+    parser.add_argument("--env", type=Path, default=app_config.app.env_path, help="Path to .env file.")
     args = parser.parse_args(argv)
 
     env = dict(os.environ)
     env.update(load_dotenv(args.env))
+    env = apply_api_settings(env, app_config)
     config = ApexApiConfig.from_env(env)
     client = ApexApiClient(config)
 

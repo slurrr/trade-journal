@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
@@ -17,6 +17,7 @@ from trade_journal.reconcile import PnlRecord
 def connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
@@ -160,6 +161,20 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS account_snapshots (
+            account_id TEXT NOT NULL,
+            source TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            total_equity REAL,
+            available_balance REAL,
+            margin_balance REAL,
+            raw_json TEXT NOT NULL,
+            PRIMARY KEY (account_id, source, timestamp)
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS tags (
             tag_id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
@@ -248,6 +263,42 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, col_type: 
     if column in existing:
         return
     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+
+
+def get_sync_state(
+    conn: sqlite3.Connection, endpoint: str
+) -> dict[str, object] | None:
+    row = conn.execute(
+        "SELECT endpoint, source, account_id, last_timestamp_ms, last_id, last_success_at FROM sync_state WHERE endpoint = ?",
+        (endpoint,),
+    ).fetchone()
+    if row is None:
+        return None
+    return dict(row)
+
+
+def upsert_sync_state(
+    conn: sqlite3.Connection,
+    endpoint: str,
+    source: str,
+    account_id: str | None,
+    last_timestamp_ms: int | None,
+    last_id: str | None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO sync_state (endpoint, source, account_id, last_timestamp_ms, last_id, last_success_at)
+        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(endpoint) DO UPDATE SET
+            source=excluded.source,
+            account_id=excluded.account_id,
+            last_timestamp_ms=excluded.last_timestamp_ms,
+            last_id=excluded.last_id,
+            last_success_at=excluded.last_success_at
+        """,
+        (endpoint, source, account_id, last_timestamp_ms, last_id),
+    )
+    conn.commit()
 
 
 def upsert_fills(conn: sqlite3.Connection, fills: Iterable[Fill]) -> int:
@@ -369,6 +420,40 @@ def upsert_account_equity(conn: sqlite3.Connection, snapshots: Iterable[EquitySn
         )
         ON CONFLICT(account_id, source, timestamp) DO UPDATE SET
             total_value=excluded.total_value,
+            raw_json=excluded.raw_json
+        """,
+        rows,
+    )
+    conn.commit()
+    return len(rows)
+
+
+def upsert_account_snapshots(conn: sqlite3.Connection, snapshots: Iterable[dict[str, object]]) -> int:
+    rows = []
+    for snap in snapshots:
+        rows.append(
+            {
+                "account_id": snap.get("account_id"),
+                "source": snap.get("source"),
+                "timestamp": snap.get("timestamp"),
+                "total_equity": snap.get("total_equity"),
+                "available_balance": snap.get("available_balance"),
+                "margin_balance": snap.get("margin_balance"),
+                "raw_json": _json_dump(snap.get("raw_json", {})),
+            }
+        )
+    conn.executemany(
+        """
+        INSERT INTO account_snapshots (
+            account_id, source, timestamp, total_equity, available_balance, margin_balance, raw_json
+        )
+        VALUES (
+            :account_id, :source, :timestamp, :total_equity, :available_balance, :margin_balance, :raw_json
+        )
+        ON CONFLICT(account_id, source, timestamp) DO UPDATE SET
+            total_equity=excluded.total_equity,
+            available_balance=excluded.available_balance,
+            margin_balance=excluded.margin_balance,
             raw_json=excluded.raw_json
         """,
         rows,
@@ -656,6 +741,6 @@ def _scoped_id(source: str, account_id: str | None, raw_id: str | None) -> str |
 def _json_dump(value: object) -> str:
     if value is None:
         return "{}"
-    if hasattr(value, "__dataclass_fields__"):
+    if is_dataclass(value) and not isinstance(value, type):
         value = asdict(value)
     return json.dumps(value, sort_keys=True)

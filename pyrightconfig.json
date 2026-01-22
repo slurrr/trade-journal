@@ -8,5 +8,6 @@
   "reportGeneralTypeIssues": true,
   "reportOptionalSubscript": true,
   "reportOptionalMemberAccess": true,
-  "reportOptionalCall": true
+  "reportOptionalCall": true,
+  "exclude": ["reference/**"]
 }

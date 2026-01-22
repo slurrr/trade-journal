@@ -1,3 +1,5 @@
 from __future__ import annotations
 
-__all__ = ["sqlite_store"]
+from . import sqlite_reader, sqlite_store
+
+__all__ = ["sqlite_store", "sqlite_reader"]

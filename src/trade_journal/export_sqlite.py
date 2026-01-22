@@ -9,11 +9,18 @@ from typing import Any
 
 
 DEFAULT_TABLES = [
+    "accounts",
     "fills",
     "orders",
     "funding",
     "liquidations",
     "historical_pnl",
+    "account_equity",
+    "account_snapshots",
+    "tags",
+    "trade_tags",
+    "benchmark_prices",
+    "regime_series",
     "sync_state",
     "schema_version",
 ]

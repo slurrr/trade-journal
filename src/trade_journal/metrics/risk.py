@@ -85,6 +85,8 @@ def _stop_from_open_sl(order: OrderRecord) -> float | None:
     if not order.is_set_open_sl:
         return None
     price = order.open_sl_param.get("price") or order.open_sl_param.get("triggerPrice")
+    if price is None:
+        return None
     try:
         return float(price)
     except (TypeError, ValueError):
