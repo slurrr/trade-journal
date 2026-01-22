@@ -51,5 +51,11 @@ run_excursions = true
 series_max_points = ""
 
 [sessions]
-# Use "utc" for FX session bucketing (default) or "local" for local-time buckets.
+# Timezone for session bucketing (UTC by default).
 timezone = "utc"
+
+[sessions.auxiliary_windows]
+# Auxiliary exposure windows used for session overlap filters.
+tokyo_london_overlap = ["08:00", "09:59"]
+london_ny_overlap = ["16:00", "17:59"]
+

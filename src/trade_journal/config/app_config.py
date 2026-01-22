@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -67,6 +68,7 @@ class SyncSettings:
 @dataclass(frozen=True)
 class SessionSettings:
     timezone: str
+    auxiliary_windows: dict[str, tuple[int, int]]
 
 
 @dataclass(frozen=True)
@@ -159,8 +161,13 @@ def load_app_config(path: Path | None = None) -> AppConfig:
         series_max_points=_int_or_none(sync_raw.get("series_max_points")),
     )
 
+    aux_windows = _parse_auxiliary_windows(sessions_raw.get("auxiliary_windows"))
+    if not aux_windows:
+        aux_windows = _default_auxiliary_windows()
+
     sessions = SessionSettings(
-        timezone=str(sessions_raw.get("timezone", "utc")).strip().lower() or "utc"
+        timezone=str(sessions_raw.get("timezone", "utc")).strip().lower() or "utc",
+        auxiliary_windows=aux_windows,
     )
 
     return AppConfig(app=app, api=api, pricing=pricing, paths=paths, sync=sync, sessions=sessions)
@@ -186,3 +193,80 @@ def _path_or_none(value: Any) -> Path | None:
     if value in (None, ""):
         return None
     return Path(str(value))
+
+
+def _default_auxiliary_windows() -> dict[str, tuple[int, int]]:
+    return {
+        "tokyo_london_overlap": (_minutes("08:00"), _minutes("09:59", inclusive_end=True)),
+        "london_ny_overlap": (_minutes("16:00"), _minutes("17:59", inclusive_end=True)),
+    }
+
+
+def _parse_auxiliary_windows(raw: Any) -> dict[str, tuple[int, int]]:
+    if not isinstance(raw, Mapping):
+        return {}
+    output: dict[str, tuple[int, int]] = {}
+    for name, value in raw.items():
+        if not name:
+            continue
+        normalized = _normalize_window_name(name)
+        window = _parse_time_window(value)
+        if window is None:
+            continue
+        if window[0] == window[1]:
+            continue
+        output[normalized] = window
+    return output
+
+
+def _parse_time_window(value: Any) -> tuple[int, int] | None:
+    if isinstance(value, Mapping):
+        start = value.get("start")
+        end = value.get("end")
+        if isinstance(start, str) and isinstance(end, str):
+            try:
+                start_min = _minutes(start)
+                end_min = _minutes(end, inclusive_end=True)
+            except ValueError:
+                return None
+            return start_min, end_min
+        return None
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        start, end = value
+        if isinstance(start, str) and isinstance(end, str):
+            try:
+                start_min = _minutes(start)
+                end_min = _minutes(end, inclusive_end=True)
+            except ValueError:
+                return None
+            return start_min, end_min
+    if isinstance(value, str) and "-" in value:
+        start, end = value.split("-", 1)
+        try:
+            start_min = _minutes(start.strip())
+            end_min = _minutes(end.strip(), inclusive_end=True)
+        except ValueError:
+            return None
+        return start_min, end_min
+    return None
+
+
+def _minutes(value: str, *, inclusive_end: bool = False) -> int:
+    match = re.match(r"^(\d{1,2}):(\d{2})$", value.strip())
+    if not match:
+        raise ValueError(f"Invalid time value: {value}")
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        raise ValueError(f"Invalid time value: {value}")
+    total = hour * 60 + minute
+    if inclusive_end:
+        total += 1
+    return total
+
+
+def _normalize_window_name(value: str) -> str:
+    cleaned = str(value).strip().lower()
+    cleaned = cleaned.replace("-", "_").replace(" ", "_")
+    cleaned = re.sub(r"[^a-z0-9_]+", "", cleaned)
+    return cleaned or "window"

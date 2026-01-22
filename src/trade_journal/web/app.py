@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+from collections import defaultdict
+from datetime import date, datetime, timedelta, timezone
+from functools import lru_cache
 import hashlib
 import json
 import os
-from collections import defaultdict
-import asyncio
-from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -46,12 +47,12 @@ app = FastAPI(title="Trade Journal")
 app.mount("/static", StaticFiles(directory=str(APP_ROOT / "static")), name="static")
 
 _SYNC_LOCK = asyncio.Lock()
-_SESSION_WINDOWS = {
-    "asia": (0, 8),
-    "london": (8, 16),
-    "ny": (16, 24),
+_BASE_SESSION_WINDOWS = {
+    "asia": (0, 8 * 60),
+    "london": (8 * 60, 16 * 60),
+    "ny": (16 * 60, 24 * 60),
 }
-_SESSION_LABELS = ("asia", "london", "ny")
+_BASE_SESSION_LABELS = ("asia", "london", "ny")
 _NORMALIZATION_MODES = ("usd", "percent", "r")
 
 
@@ -126,7 +127,8 @@ def analytics_page(request: Request) -> HTMLResponse:
 
     accounts = payload.get("accounts") or _accounts_from_trades(trade_items)
     strategies = payload.get("strategies") or _strategies_from_trades(trade_items)
-    filters = _parse_analytics_filters(request, payload["symbols"], accounts, strategies)
+    exposure_windows = list(_exposure_windows().keys())
+    filters = _parse_analytics_filters(request, payload["symbols"], accounts, strategies, exposure_windows)
     filtered_items = _filter_trade_items(trade_items, filters)
     filtered_ids = {item["trade_id"] for item in filtered_items}
     filtered_trades = [trade for trade in trade_objects if trade.trade_id in filtered_ids]
@@ -802,7 +804,10 @@ def _trade_payload(
     metrics = compute_trade_metrics(trade)
     ui_id = _trade_ui_id(trade)
     capture_pct, heat_pct = _capture_heat_pct(trade)
-    return {
+    entry_session = _base_session_label(trade.entry_time)
+    exit_session = _base_session_label(trade.exit_time)
+    exposures = _session_exposures(trade.entry_time, trade.exit_time)
+    payload = {
         "ui_id": ui_id,
         "trade_id": trade.trade_id,
         "source": trade.source,
@@ -811,7 +816,10 @@ def _trade_payload(
         "side": trade.side,
         "entry_time": trade.entry_time,
         "exit_time": trade.exit_time,
-        "session": _session_label(trade.exit_time),
+        "entry_session": entry_session,
+        "exit_session": exit_session,
+        "session": exit_session,
+        "session_exposures": exposures,
         "entry_price": trade.entry_price,
         "exit_price": trade.exit_price,
         "entry_size": trade.entry_size,
@@ -838,6 +846,9 @@ def _trade_payload(
         "r_multiple": risk_summary.r_multiple if risk_summary else None,
         "stop_source": risk_summary.source if risk_summary else None,
     }
+    for window, seconds in exposures.items():
+        payload[f"exp_{window}_seconds"] = seconds
+    return payload
 
 
 def _apply_trade_tags(
@@ -941,13 +952,69 @@ def _capture_heat_pct(trade) -> tuple[float | None, float | None]:
     return capture_pct, heat_pct
 
 
-def _session_label(timestamp: datetime) -> str:
-    hour = timestamp.astimezone(timezone.utc).hour
-    for label, window in _SESSION_WINDOWS.items():
+def _base_session_label(timestamp: datetime) -> str:
+    minute = _utc_minutes(timestamp)
+    for label, window in _BASE_SESSION_WINDOWS.items():
         start, end = window
-        if start <= hour < end:
+        if start <= minute < end:
             return label
     return "asia"
+
+
+@lru_cache
+def _exposure_windows() -> dict[str, tuple[int, int]]:
+    windows = dict(_BASE_SESSION_WINDOWS)
+    aux = load_app_config().sessions.auxiliary_windows
+    for name, window in aux.items():
+        if name in windows:
+            continue
+        windows[name] = window
+    return windows
+
+
+def _session_exposures(entry_time: datetime, exit_time: datetime) -> dict[str, float]:
+    start = _ensure_utc(entry_time)
+    end = _ensure_utc(exit_time)
+    windows = _exposure_windows()
+    exposures = {name: 0.0 for name in windows}
+    if end <= start:
+        return exposures
+
+    start_day = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
+    end_day = datetime(end.year, end.month, end.day, tzinfo=timezone.utc)
+    days = (end_day - start_day).days
+
+    for offset in range(days + 1):
+        day_anchor = start_day + timedelta(days=offset)
+        for name, window in windows.items():
+            for win_start, win_end in _window_intervals(day_anchor, window):
+                overlap_start = max(start, win_start)
+                overlap_end = min(end, win_end)
+                if overlap_end > overlap_start:
+                    exposures[name] += (overlap_end - overlap_start).total_seconds()
+    return exposures
+
+
+def _window_intervals(day_anchor: datetime, window: tuple[int, int]) -> list[tuple[datetime, datetime]]:
+    start_min, end_min = window
+    start_time = day_anchor + timedelta(minutes=start_min)
+    if start_min < end_min:
+        end_time = day_anchor + timedelta(minutes=end_min)
+        return [(start_time, end_time)]
+    end_day = day_anchor + timedelta(days=1)
+    end_time = day_anchor + timedelta(minutes=end_min)
+    return [(start_time, end_day), (day_anchor, end_time)]
+
+
+def _ensure_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _utc_minutes(value: datetime) -> int:
+    utc = _ensure_utc(value)
+    return utc.hour * 60 + utc.minute
 
 
 def _apply_excursions_cache(trades: list, excursions_map: dict[str, dict[str, Any]]) -> None:
@@ -1218,6 +1285,7 @@ def _parse_analytics_filters(
     symbols: list[str],
     accounts: list[dict[str, Any]],
     strategies: list[str],
+    exposure_windows: list[str],
 ) -> dict[str, Any]:
     params = request.query_params
     tab = params.get("tab", "overview").strip().lower()
@@ -1252,9 +1320,19 @@ def _parse_analytics_filters(
     elif account not in account_ids:
         account = "all"
 
-    session = params.get("session", "all").strip().lower()
-    if session not in _SESSION_LABELS:
-        session = "all"
+    entry_session = params.get("entry_session", "all").strip().lower()
+    if entry_session not in _BASE_SESSION_LABELS:
+        entry_session = "all"
+
+    exit_session = params.get("exit_session", "all").strip().lower()
+    if exit_session not in _BASE_SESSION_LABELS:
+        exit_session = "all"
+
+    session_alias = params.get("session")
+    if exit_session == "all" and session_alias:
+        alias_value = session_alias.strip().lower()
+        if alias_value in _BASE_SESSION_LABELS:
+            exit_session = alias_value
 
     strategy = params.get("strategy", "all").strip()
     if not strategy or strategy.lower() == "all":
@@ -1283,12 +1361,29 @@ def _parse_analytics_filters(
         query_parts.append(f"outcome={outcome}")
     if account != "all":
         query_parts.append(f"account={account}")
-    if session != "all":
-        query_parts.append(f"session={session}")
+    if entry_session != "all":
+        query_parts.append(f"entry_session={entry_session}")
+    if exit_session != "all":
+        query_parts.append(f"exit_session={exit_session}")
     if strategy != "all":
         query_parts.append(f"strategy={strategy}")
     if normalization != "usd":
         query_parts.append(f"normalization={normalization}")
+
+    exposure_filters: dict[str, float] = {}
+    exposure_set = set(exposure_windows)
+    for key, value in params.items():
+        if not key.startswith("exp_") or not key.endswith("_seconds"):
+            continue
+        window = key[4:-8]
+        if window not in exposure_set:
+            continue
+        try:
+            threshold = float(value)
+        except (TypeError, ValueError):
+            continue
+        exposure_filters[window] = threshold
+        query_parts.append(f"{key}={threshold}")
     query_base = "&".join(query_parts)
 
     return {
@@ -1299,9 +1394,11 @@ def _parse_analytics_filters(
         "side": side,
         "outcome": outcome,
         "account": account,
-        "session": session,
+        "entry_session": entry_session,
+        "exit_session": exit_session,
         "strategy": strategy,
         "normalization": normalization,
+        "exposure_filters": exposure_filters,
         "query_base": query_base,
     }
 
@@ -1354,12 +1451,23 @@ def _filter_trade_items(
             continue
         if filters["account"] != "all" and item.get("account_id") != filters["account"]:
             continue
-        if filters["session"] != "all" and item.get("session") != filters["session"]:
+        if filters["entry_session"] != "all" and item.get("entry_session") != filters["entry_session"]:
+            continue
+        if filters["exit_session"] != "all" and item.get("exit_session") != filters["exit_session"]:
             continue
         if filters["strategy"] != "all":
             strategies = item.get("strategy_tags") or []
             if filters["strategy"] not in strategies:
                 continue
+        exposure_filters = filters.get("exposure_filters") or {}
+        exposure_ok = True
+        for window, threshold in exposure_filters.items():
+            value = float(item.get(f"exp_{window}_seconds", 0.0) or 0.0)
+            if value < threshold:
+                exposure_ok = False
+                break
+        if not exposure_ok:
+            continue
         filtered.append(item)
     filtered.sort(key=lambda item: item["exit_time"], reverse=True)
     return filtered
