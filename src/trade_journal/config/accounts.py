@@ -18,6 +18,10 @@ class AccountConfig:
     account_id: str | None
     data_dir: Path
     funding_baseline: str | None
+    exchange: str | None
+    base_currency: str | None
+    starting_equity: float | None
+    active: bool
 
 
 @dataclass(frozen=True)
@@ -33,6 +37,10 @@ class AccountContext:
     account_id: str | None
     data_dir: Path
     funding_baseline: str | None
+    exchange: str | None
+    base_currency: str | None
+    starting_equity: float | None
+    active: bool
 
 
 def load_accounts_config(path: Path) -> AccountsConfig:
@@ -49,12 +57,21 @@ def load_accounts_config(path: Path) -> AccountsConfig:
         account_id = cfg.get("account_id") or cfg.get("accountId")
         data_dir = cfg.get("data_dir") or cfg.get("dataDir") or f"data/{name}"
         funding_baseline = cfg.get("funding_baseline") or cfg.get("fundingBaseline")
+        exchange = cfg.get("exchange")
+        base_currency = cfg.get("base_currency") or cfg.get("baseCurrency")
+        starting_equity = cfg.get("starting_equity") or cfg.get("startingEquity")
+        active_raw = cfg.get("active")
+        active = True if active_raw is None else bool(active_raw)
         accounts[name] = AccountConfig(
             name=name,
             source=source,
             account_id=str(account_id) if account_id else None,
             data_dir=Path(data_dir),
             funding_baseline=str(funding_baseline) if funding_baseline else None,
+            exchange=str(exchange) if exchange else None,
+            base_currency=str(base_currency) if base_currency else None,
+            starting_equity=float(starting_equity) if starting_equity is not None else None,
+            active=active,
         )
     if default_account and default_account not in accounts:
         raise ValueError(f"Default account '{default_account}' not found in accounts config.")
@@ -88,6 +105,10 @@ def resolve_account_context(
             account_id=account.account_id or account.name,
             data_dir=account.data_dir,
             funding_baseline=account.funding_baseline,
+            exchange=account.exchange or account.source,
+            base_currency=account.base_currency,
+            starting_equity=account.starting_equity,
+            active=account.active,
         )
     data_dir = Path(env.get("TRADE_JOURNAL_DATA_DIR", "data"))
     source = env.get("TRADE_JOURNAL_SOURCE", "apex")
@@ -98,6 +119,10 @@ def resolve_account_context(
         account_id=account_id if account_id else resolved_name,
         data_dir=data_dir,
         funding_baseline=None,
+        exchange=source,
+        base_currency=None,
+        starting_equity=None,
+        active=True,
     )
 
 

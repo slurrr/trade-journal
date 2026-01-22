@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from trade_journal.config.accounts import resolve_account_context, resolve_data_path
+from trade_journal.ingest.apex_equity import load_equity_history
 from trade_journal.ingest.apex_funding import load_funding
 from trade_journal.ingest.apex_liquidations import load_liquidations
 from trade_journal.ingest.apex_omni import load_fills
@@ -12,6 +13,8 @@ from trade_journal.reconcile import load_historical_pnl
 from trade_journal.storage.sqlite_store import (
     connect,
     init_db,
+    upsert_account_equity,
+    upsert_accounts,
     upsert_fills,
     upsert_funding,
     upsert_historical_pnl,
@@ -40,6 +43,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Historical PnL JSON path.",
     )
     parser.add_argument(
+        "--equity-history",
+        type=Path,
+        default=None,
+        help="Account balance history JSON path.",
+    )
+    parser.add_argument(
         "--report-out",
         type=Path,
         default=None,
@@ -64,6 +73,9 @@ def main(argv: list[str] | None = None) -> int:
     funding_path = args.funding or resolve_data_path(None, context, "funding.json")
     liquidations_path = args.liquidations or resolve_data_path(None, context, "liquidations.json")
     historical_pnl_path = args.historical_pnl or resolve_data_path(None, context, "historical_pnl.json")
+    equity_history_path = args.equity_history or resolve_data_path(
+        None, context, "equity_history.json"
+    )
 
     conn = connect(args.db)
     init_db(conn)
@@ -71,6 +83,26 @@ def main(argv: list[str] | None = None) -> int:
     total = 0
     summaries: list[str] = []
     report: dict[str, dict[str, int]] = {}
+    account_rows = upsert_accounts(
+        conn,
+        [
+            {
+                "account_id": context.account_id or context.name,
+                "name": context.name,
+                "exchange": context.exchange or context.source,
+                "base_currency": context.base_currency,
+                "starting_equity": context.starting_equity,
+                "active": context.active,
+                "raw_json": {
+                    "source": context.source,
+                    "data_dir": str(context.data_dir),
+                },
+            }
+        ],
+    )
+    total += account_rows
+    summaries.append(_summary_line("accounts", account_rows, 0, 0))
+    report["accounts"] = _report_entry(account_rows, 0, 0)
     if fills_path.exists():
         result = load_fills(fills_path, source=context.source, account_id=context.account_id)
         valid_fills, skipped_invalid = _validate_fills(result.fills)
@@ -101,6 +133,16 @@ def main(argv: list[str] | None = None) -> int:
         total += upsert_historical_pnl(conn, valid_pnl)
         summaries.append(_summary_line("historical_pnl", len(valid_pnl), 0, skipped_invalid))
         report["historical_pnl"] = _report_entry(len(valid_pnl), 0, skipped_invalid)
+    if equity_history_path.exists():
+        result = load_equity_history(
+            equity_history_path,
+            source=context.source,
+            account_id=context.account_id,
+            min_value=0.0,
+        )
+        total += upsert_account_equity(conn, result.snapshots)
+        summaries.append(_summary_line("equity_history", len(result.snapshots), result.skipped, 0))
+        report["equity_history"] = _report_entry(len(result.snapshots), result.skipped, 0)
 
     print(f"upserted_rows {total}")
     for line in summaries:
@@ -114,10 +156,6 @@ def main(argv: list[str] | None = None) -> int:
         log_out.parent.mkdir(parents=True, exist_ok=True)
         log_out.write_text(_log_json(args.db, total, report), encoding="utf-8")
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
 
 
 def _validate_fills(items):

@@ -87,6 +87,9 @@ def _normalize_records(
 def _normalize_fill(
     raw: Mapping[str, Any], *, source_name: str | None, account_id: str | None
 ) -> Fill:
+    status = _pick(raw, "status", "fillStatus", "orderStatus")
+    if status is not None and not _is_success_status(status):
+        raise ValueError("Non-success fill status")
     fill_id = _pick(raw, "id", "fill_id", "fillId", "matchFillId")
     order_id = _pick(raw, "order_id", "orderId")
     resolved_account = account_id or _pick(raw, "accountId", "account_id")
@@ -115,6 +118,15 @@ def _normalize_fill(
         account_id=str(resolved_account) if resolved_account is not None else None,
         raw=dict(raw),
     )
+
+
+def _is_success_status(value: Any) -> bool:
+    text = str(value).strip().upper()
+    if "SUCCESS" in text:
+        return True
+    if "FILLED" in text:
+        return True
+    return False
 
 
 def _pick(raw: Mapping[str, Any], *keys: str) -> Any:

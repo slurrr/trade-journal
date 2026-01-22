@@ -9,7 +9,7 @@ Phase 2 completes the full analytics vision described in `analytics_vision_spec.
 Add to Phase 1 filters:
 - Session filter (Asia / London / NY)
 - Strategy selector (fixed list; tags mapped to strategy type)
-- Account selector (future mulit/sub account capable)
+- Account selector (future multi/sub account capable)
 - Normalization mode: USD | % of account | R‑multiples
 
 Notes:

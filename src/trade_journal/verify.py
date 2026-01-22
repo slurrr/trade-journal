@@ -31,6 +31,9 @@ class VerifyConfig:
     funding_since: datetime | None
 
 
+POSITION_EPSILON = 1e-9
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run verification checks on trades and inputs.")
     parser.add_argument(
@@ -179,6 +182,8 @@ def _run_checks(
 
     funding_unmatched: list[dict[str, Any]] = []
     funding_open_matches: list[dict[str, Any]] = []
+    unmatched_records: list[tuple[Any, dict[str, Any]]] = []
+    funding_drift: list[dict[str, Any]] = []
     open_positions = _load_open_positions(context)
     funding_since = config.funding_since
     if funding_since is None and getattr(context, "funding_baseline", None):
@@ -207,6 +212,14 @@ def _run_checks(
                     funding_open_matches.append(record)
                 else:
                     funding_unmatched.append(record)
+                    unmatched_records.append((event, record))
+
+        if unmatched_records:
+            events = [event for event, _ in unmatched_records]
+            inferred_positions = _infer_positions_for_events(fills, events)
+            for (_, record), inferred in zip(unmatched_records, inferred_positions):
+                record["inferred_position"] = inferred
+            funding_drift = _detect_funding_drift(fills, events, inferred_positions)
 
     orders = (
         load_orders(orders_path, source=source, account_id=account_id).orders if orders_path.exists() else []
@@ -256,6 +269,7 @@ def _run_checks(
         "tiny_trades": tiny_trades,
         "funding_unmatched": funding_unmatched,
         "funding_open_matches": funding_open_matches,
+        "funding_drift": funding_drift,
     }
 
 
@@ -546,6 +560,7 @@ def _print_summary(report: dict[str, Any]) -> None:
     print(f"tiny_trades {len(report['tiny_trades'])}")
     print(f"funding_unmatched {len(report['funding_unmatched'])}")
     print(f"funding_open_matches {len(report['funding_open_matches'])}")
+    print(f"funding_drift {len(report.get('funding_drift', []))}")
 
 
 def _print_funding_table(items: list[dict[str, Any]]) -> None:
@@ -556,21 +571,31 @@ def _print_funding_table(items: list[dict[str, Any]]) -> None:
 
 
 def _format_funding_table(items: list[dict[str, Any]]) -> str:
+    include_inferred = any("inferred_position" in item for item in items)
     headers = ["time", "symbol", "side", "size", "funding", "context"]
+    if include_inferred:
+        headers += ["inferred_size", "inferred_side", "size_diff", "side_match"]
     rows = []
     for item in items:
         context = item.get("context") or {}
         status = context.get("status", "")
-        rows.append(
-            [
-                item.get("funding_time", ""),
-                item.get("symbol", ""),
-                item.get("side", ""),
-                _format_float(item.get("position_size")),
-                _format_float(item.get("funding_value")),
-                status,
+        row = [
+            item.get("funding_time", ""),
+            item.get("symbol", ""),
+            item.get("side", ""),
+            _format_float(item.get("position_size")),
+            _format_float(item.get("funding_value")),
+            status,
+        ]
+        if include_inferred:
+            inferred = item.get("inferred_position") or {}
+            row += [
+                _format_float(inferred.get("size")),
+                inferred.get("side") or "",
+                _format_float(inferred.get("size_abs_diff")),
+                "yes" if inferred.get("side_match") else "no",
             ]
-        )
+        rows.append(row)
     widths = [len(h) for h in headers]
     for row in rows:
         for idx, cell in enumerate(row):
@@ -655,6 +680,124 @@ def _match_open_position(event, positions: list[dict[str, Any]]) -> dict[str, An
             "size": position["size"],
         }
     return None
+
+
+def _infer_positions_for_events(fills, events) -> list[dict[str, Any]]:
+    if not events:
+        return []
+    fills_by_symbol: dict[str, list[Any]] = {}
+    for fill in sorted(fills, key=_fill_sort_key):
+        fills_by_symbol.setdefault(fill.symbol, []).append(fill)
+
+    events_by_symbol: dict[str, list[tuple[int, Any]]] = {}
+    for idx, event in enumerate(events):
+        events_by_symbol.setdefault(event.symbol, []).append((idx, event))
+
+    results: list[dict[str, Any]] = [{} for _ in events]
+    for symbol, symbol_events in events_by_symbol.items():
+        symbol_fills = fills_by_symbol.get(symbol, [])
+        symbol_events.sort(key=lambda item: item[1].funding_time)
+        pos = 0.0
+        fill_idx = 0
+        for idx, event in symbol_events:
+            while fill_idx < len(symbol_fills):
+                fill = symbol_fills[fill_idx]
+                if fill.timestamp > event.funding_time:
+                    break
+                pos += fill.size if fill.side == "BUY" else -fill.size
+                fill_idx += 1
+            side = None
+            if pos > POSITION_EPSILON:
+                side = "LONG"
+            elif pos < -POSITION_EPSILON:
+                side = "SHORT"
+            inferred_size = abs(pos)
+            size_abs_diff = None
+            size_rel_diff = None
+            if event.position_size is not None:
+                size_abs_diff = inferred_size - event.position_size
+                if event.position_size:
+                    size_rel_diff = size_abs_diff / event.position_size
+            results[idx] = {
+                "signed_size": pos,
+                "size": inferred_size,
+                "side": side,
+                "size_abs_diff": size_abs_diff,
+                "size_rel_diff": size_rel_diff,
+                "side_match": side == event.side if side else False,
+            }
+    return results
+
+
+def _fill_sort_key(fill: Any) -> tuple:
+    tie = fill.fill_id or fill.order_id or ""
+    return (fill.timestamp, tie)
+
+
+def _detect_funding_drift(fills, events, inferred_positions) -> list[dict[str, Any]]:
+    if not events:
+        return []
+    fills_by_symbol: dict[str, list[Any]] = {}
+    for fill in sorted(fills, key=_fill_sort_key):
+        fills_by_symbol.setdefault(fill.symbol, []).append(fill)
+
+    drift_records: list[dict[str, Any]] = []
+    events_by_symbol: dict[str, list[tuple[int, Any, dict[str, Any]]]] = {}
+    for idx, (event, inferred) in enumerate(zip(events, inferred_positions)):
+        events_by_symbol.setdefault(event.symbol, []).append((idx, event, inferred))
+
+    for symbol, symbol_events in events_by_symbol.items():
+        symbol_fills = fills_by_symbol.get(symbol, [])
+        symbol_events.sort(key=lambda item: item[1].funding_time)
+        pos = 0.0
+        fill_idx = 0
+        for _, event, inferred in symbol_events:
+            while fill_idx < len(symbol_fills):
+                fill = symbol_fills[fill_idx]
+                if fill.timestamp > event.funding_time:
+                    break
+                pos += fill.size if fill.side == "BUY" else -fill.size
+                fill_idx += 1
+            if inferred.get("side") is None:
+                continue
+            if not inferred.get("side_match"):
+                continue
+            if inferred.get("size_abs_diff") is None:
+                continue
+            if abs(inferred["size_abs_diff"]) < POSITION_EPSILON:
+                continue
+            drift_records.append(
+                {
+                    "symbol": symbol,
+                    "funding_time": event.funding_time.isoformat(),
+                    "funding_side": event.side,
+                    "funding_position_size": event.position_size,
+                    "inferred_size": inferred.get("size"),
+                    "size_abs_diff": inferred.get("size_abs_diff"),
+                    "size_rel_diff": inferred.get("size_rel_diff"),
+                    "first_missing_fill_before": _fill_summary(
+                        symbol_fills[fill_idx - 1] if fill_idx - 1 >= 0 else None
+                    ),
+                    "next_fill_after": _fill_summary(
+                        symbol_fills[fill_idx] if fill_idx < len(symbol_fills) else None
+                    ),
+                }
+            )
+            break
+    return drift_records
+
+
+def _fill_summary(fill: Any | None) -> dict[str, Any] | None:
+    if fill is None:
+        return None
+    return {
+        "fill_id": fill.fill_id,
+        "order_id": fill.order_id,
+        "side": fill.side,
+        "size": fill.size,
+        "price": fill.price,
+        "timestamp": fill.timestamp.isoformat(),
+    }
 
 
 if __name__ == "__main__":

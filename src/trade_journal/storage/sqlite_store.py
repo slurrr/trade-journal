@@ -10,7 +10,7 @@ from typing import Iterable
 
 from trade_journal.ingest.apex_liquidations import LiquidationEvent
 from trade_journal.ingest.apex_orders import OrderRecord
-from trade_journal.models import Fill, FundingEvent
+from trade_journal.models import EquitySnapshot, Fill, FundingEvent
 from trade_journal.reconcile import PnlRecord
 
 
@@ -134,6 +134,80 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS accounts (
+            account_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            exchange TEXT,
+            base_currency TEXT,
+            starting_equity REAL,
+            created_at TEXT NOT NULL,
+            active INTEGER NOT NULL,
+            raw_json TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS account_equity (
+            account_id TEXT NOT NULL,
+            source TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            total_value REAL NOT NULL,
+            raw_json TEXT NOT NULL,
+            PRIMARY KEY (account_id, source, timestamp)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tags (
+            tag_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            type TEXT NOT NULL,
+            active INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS trade_tags (
+            trade_id TEXT NOT NULL,
+            tag_id TEXT NOT NULL,
+            PRIMARY KEY (trade_id, tag_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS benchmark_prices (
+            symbol TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            open REAL NOT NULL,
+            high REAL NOT NULL,
+            low REAL NOT NULL,
+            close REAL NOT NULL,
+            PRIMARY KEY (symbol, timeframe, timestamp)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS regime_series (
+            regime_id TEXT PRIMARY KEY,
+            account_id TEXT,
+            ts_start TEXT NOT NULL,
+            ts_end TEXT,
+            regime_label TEXT NOT NULL,
+            confidence REAL,
+            source TEXT NOT NULL,
+            raw_json TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS schema_version (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             schema_version INTEGER NOT NULL,
@@ -228,6 +302,73 @@ def upsert_fills(conn: sqlite3.Connection, fills: Iterable[Fill]) -> int:
             fee=excluded.fee,
             fee_asset=excluded.fee_asset,
             timestamp=excluded.timestamp,
+            raw_json=excluded.raw_json
+        """,
+        rows,
+    )
+    conn.commit()
+    return len(rows)
+
+
+def upsert_accounts(conn: sqlite3.Connection, accounts: Iterable[dict[str, object]]) -> int:
+    rows = []
+    for account in accounts:
+        account_id = str(account["account_id"])
+        rows.append(
+            {
+                "account_id": account_id,
+                "name": str(account.get("name") or account_id),
+                "exchange": account.get("exchange"),
+                "base_currency": account.get("base_currency"),
+                "starting_equity": account.get("starting_equity"),
+                "active": 1 if account.get("active", True) else 0,
+                "raw_json": _json_dump(account.get("raw_json", {})),
+            }
+        )
+    conn.executemany(
+        """
+        INSERT INTO accounts (
+            account_id, name, exchange, base_currency, starting_equity, created_at, active, raw_json
+        )
+        VALUES (
+            :account_id, :name, :exchange, :base_currency, :starting_equity, CURRENT_TIMESTAMP, :active, :raw_json
+        )
+        ON CONFLICT(account_id) DO UPDATE SET
+            name=excluded.name,
+            exchange=excluded.exchange,
+            base_currency=excluded.base_currency,
+            starting_equity=excluded.starting_equity,
+            active=excluded.active,
+            raw_json=excluded.raw_json
+        """,
+        rows,
+    )
+    conn.commit()
+    return len(rows)
+
+
+def upsert_account_equity(conn: sqlite3.Connection, snapshots: Iterable[EquitySnapshot]) -> int:
+    rows = []
+    for snap in snapshots:
+        rows.append(
+            {
+                "account_id": snap.account_id,
+                "source": snap.source,
+                "timestamp": snap.timestamp.isoformat(),
+                "total_value": snap.total_value,
+                "raw_json": _json_dump(snap.raw),
+            }
+        )
+    conn.executemany(
+        """
+        INSERT INTO account_equity (
+            account_id, source, timestamp, total_value, raw_json
+        )
+        VALUES (
+            :account_id, :source, :timestamp, :total_value, :raw_json
+        )
+        ON CONFLICT(account_id, source, timestamp) DO UPDATE SET
+            total_value=excluded.total_value,
             raw_json=excluded.raw_json
         """,
         rows,

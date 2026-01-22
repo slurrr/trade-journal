@@ -36,6 +36,7 @@ trade-journal-excursions = "trade_journal.compute_excursions:main"
 trade-journal-probe-api = "trade_journal.probe_api:main"
 trade-journal-verify = "trade_journal.verify:main"
 trade-journal-web = "trade_journal.web.app:main"
+trade-journal-import-equity-history = "trade_journal.import_equity_history:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

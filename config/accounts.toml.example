@@ -2,10 +2,15 @@ default_account = "main"
 
 [accounts.main]
 source = "apex"
+# Optional: exchange name (defaults to source).
+exchange = "apex"
 # Optional: the accountId from ApeX payloads.
 account_id = ""
 # Where this account's data files live.
 data_dir = "data/main"
-# Optional: ignore unmatched funding events before this datetime.
-# Example: "2025-09-26T00:00:00Z"
-funding_baseline = ""
+# Optional: base currency for equity/normalization.
+base_currency = "USDT"
+# Optional: starting equity (used for equity snapshots/backfill).
+starting_equity = 0
+# Optional: disable an account without deleting config.
+active = true

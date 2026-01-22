@@ -16,8 +16,10 @@ from jinja2 import Undefined
 
 from trade_journal.config.accounts import resolve_account_context, resolve_data_path
 from trade_journal.ingest.apex_funding import load_funding
+from trade_journal.ingest.apex_equity import load_equity_history
 from trade_journal.ingest.apex_liquidations import load_liquidations
 from trade_journal.ingest.apex_omni import load_fills
+from trade_journal.metrics.equity import apply_equity_at_entry
 from trade_journal.metrics.risk import initial_stop_for_trade
 from trade_journal.metrics.summary import (
     compute_aggregate_metrics,
@@ -215,7 +217,14 @@ def trade_series_api(trade_id: str) -> dict[str, Any]:
 
 def _load_journal_state() -> dict[str, Any]:
     context = resolve_account_context(env=os.environ)
-    fills_path, funding_path, liquidations_path, excursions_path, orders_path = _resolve_paths(context)
+    (
+        fills_path,
+        funding_path,
+        liquidations_path,
+        excursions_path,
+        orders_path,
+        equity_history_path,
+    ) = _resolve_paths(context)
     data_note = None
 
     if fills_path is None:
@@ -238,15 +247,13 @@ def _load_journal_state() -> dict[str, Any]:
     ingest_result = load_fills(fills_path, source=context.source, account_id=context.account_id)
     trades = reconstruct_trades(ingest_result.fills)
 
-    if ingest_result.skipped:
-        data_note = f"Skipped {ingest_result.skipped} fill rows during normalization."
+    # Skipped-row counts are useful in CLI stdout but noisy for UI; keep quiet here.
 
     if funding_path is not None:
         funding_result = load_funding(funding_path, source=context.source, account_id=context.account_id)
         attributions = apply_funding_events(trades, funding_result.events)
         unmatched = sum(1 for item in attributions if item.matched_trade_id is None)
-        if funding_result.skipped:
-            data_note = _append_note(data_note, f"Skipped {funding_result.skipped} funding rows.")
+        # Skip-row notes suppressed for UI; see CLI output for ingest warnings.
         if unmatched:
             data_note = _append_note(data_note, f"Unmatched funding events: {unmatched}.")
 
@@ -254,8 +261,7 @@ def _load_journal_state() -> dict[str, Any]:
     if orders_path is not None:
         orders_result = load_orders(orders_path, source=context.source, account_id=context.account_id)
         orders = orders_result.orders
-        if orders_result.skipped:
-            data_note = _append_note(data_note, f"Skipped {orders_result.skipped} order rows.")
+        # Skip-row notes suppressed for UI; see CLI output for ingest warnings.
     elif trades:
         data_note = _append_note(data_note, "Orders file missing: R metrics unavailable.")
 
@@ -265,8 +271,7 @@ def _load_journal_state() -> dict[str, Any]:
         liquidation_result = load_liquidations(
             liquidations_path, source=context.source, account_id=context.account_id
         )
-        if liquidation_result.skipped:
-            data_note = _append_note(data_note, f"Skipped {liquidation_result.skipped} liquidation rows.")
+        # Skip-row notes suppressed for UI; see CLI output for ingest warnings.
 
         liquidation_matches = _match_liquidations(trades, liquidation_result.events)
         liquidation_events = _build_liquidation_events(trades, liquidation_result.events, liquidation_matches)
@@ -282,6 +287,22 @@ def _load_journal_state() -> dict[str, Any]:
 
     if excursions_map:
         _apply_excursions_cache(trades, excursions_map)
+
+    if equity_history_path is not None:
+        try:
+            equity_result = load_equity_history(
+                equity_history_path,
+                source=context.source,
+                account_id=context.account_id,
+                min_value=0.0,
+            )
+        except (ValueError, OSError, json.JSONDecodeError):
+            data_note = _append_note(data_note, "Failed to parse equity history.")
+        else:
+            fallback_equity = _initial_equity()
+            if fallback_equity is None:
+                fallback_equity = context.starting_equity
+            apply_equity_at_entry(trades, equity_result.snapshots, fallback_equity=fallback_equity)
 
     risk_map: dict[str, Any] = {}
     if orders:
@@ -331,12 +352,13 @@ def _load_journal_state() -> dict[str, Any]:
 
 def _resolve_paths(
     context,
-) -> tuple[Path | None, Path | None, Path | None, Path | None, Path | None]:
+) -> tuple[Path | None, Path | None, Path | None, Path | None, Path | None, Path | None]:
     fills_env = os.environ.get("TRADE_JOURNAL_FILLS")
     funding_env = os.environ.get("TRADE_JOURNAL_FUNDING")
     liquidations_env = os.environ.get("TRADE_JOURNAL_LIQUIDATIONS")
     excursions_env = os.environ.get("TRADE_JOURNAL_EXCURSIONS")
     orders_env = os.environ.get("TRADE_JOURNAL_ORDERS")
+    equity_env = os.environ.get("TRADE_JOURNAL_EQUITY_HISTORY")
 
     fills_path = Path(fills_env) if fills_env else resolve_data_path(None, context, "fills.json")
     if not fills_path.exists():
@@ -391,7 +413,17 @@ def _resolve_paths(
             if candidate.exists():
                 orders_path = candidate
 
-    return fills_path, funding_path, liquidations_path, excursions_path, orders_path
+    equity_path = None
+    if equity_env:
+        candidate = Path(equity_env)
+        if candidate.exists():
+            equity_path = candidate
+    else:
+        candidate = resolve_data_path(None, context, "equity_history.json")
+        if candidate.exists():
+            equity_path = candidate
+
+    return fills_path, funding_path, liquidations_path, excursions_path, orders_path, equity_path
 
 
 def _append_note(existing: str | None, extra: str) -> str:
@@ -444,6 +476,7 @@ def _trade_payload(
         "realized_pnl_net": trade.realized_pnl_net,
         "fees": trade.fees,
         "funding_fees": trade.funding_fees,
+        "equity_at_entry": getattr(trade, "equity_at_entry", None),
         "mae": trade.mae,
         "mfe": trade.mfe,
         "etd": trade.etd,

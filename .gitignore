@@ -46,3 +46,4 @@ exports/
 tests/
 reference/ui_examples/freshy
 reference/ui_examples/seasoned
+config/accounts.toml
