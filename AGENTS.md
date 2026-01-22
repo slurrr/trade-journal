@@ -108,3 +108,5 @@ All Python code MUST adhere to:
 - pyright (default settings unless overridden)
 
 Ruff + Pyright are hygiene only; no refactors requested
+
+Reference files are not required to pass ruff or pyright focus on src/ only

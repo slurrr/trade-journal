@@ -17,7 +17,6 @@ class AppSettings:
     port: int
     reload: bool
     env_path: Path
-    initial_equity: float | None
 
 
 @dataclass(frozen=True)
@@ -66,12 +65,18 @@ class SyncSettings:
 
 
 @dataclass(frozen=True)
+class SessionSettings:
+    timezone: str
+
+
+@dataclass(frozen=True)
 class AppConfig:
     app: AppSettings
     api: ApiSettings
     pricing: PricingSettings
     paths: PathsSettings
     sync: SyncSettings
+    sessions: SessionSettings
 
 
 def apply_api_settings(
@@ -103,6 +108,7 @@ def load_app_config(path: Path | None = None) -> AppConfig:
     pricing_raw = _section(raw, "pricing")
     paths_raw = _section(raw, "paths")
     sync_raw = _section(raw, "sync")
+    sessions_raw = _section(raw, "sessions")
 
     app = AppSettings(
         db_path=Path(app_raw.get("db_path", "data/trade_journal.sqlite")),
@@ -110,7 +116,6 @@ def load_app_config(path: Path | None = None) -> AppConfig:
         port=int(app_raw.get("port", 8000)),
         reload=bool(app_raw.get("reload", True)),
         env_path=Path(app_raw.get("env_path", ".env")),
-        initial_equity=_float_or_none(app_raw.get("initial_equity")),
     )
 
     api = ApiSettings(
@@ -154,7 +159,11 @@ def load_app_config(path: Path | None = None) -> AppConfig:
         series_max_points=_int_or_none(sync_raw.get("series_max_points")),
     )
 
-    return AppConfig(app=app, api=api, pricing=pricing, paths=paths, sync=sync)
+    sessions = SessionSettings(
+        timezone=str(sessions_raw.get("timezone", "utc")).strip().lower() or "utc"
+    )
+
+    return AppConfig(app=app, api=api, pricing=pricing, paths=paths, sync=sync, sessions=sessions)
 
 
 def _section(raw: Mapping[str, Any], key: str) -> Mapping[str, Any]:
@@ -169,15 +178,6 @@ def _int_or_none(value: Any) -> int | None:
         return None
     try:
         return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _float_or_none(value: Any) -> float | None:
-    if value in (None, "", 0):
-        return None
-    try:
-        return float(value)
     except (TypeError, ValueError):
         return None
 

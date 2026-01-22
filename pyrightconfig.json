@@ -1,4 +1,20 @@
 {
+  "include": ["src", "tests"],
+  "exclude": [
+    ".venv/**",
+    "data/**",
+    "reference/**",
+    "docs/**",
+    "scripts/**",
+    "config/**",
+    "build/**",
+    "dist/**"
+  ],
+  "pythonVersion": "3.10",
+  "pythonPlatform": "Linux",
+  "venvPath": ".",
+  "venv": ".venv",
+  "useLibraryCodeForTypes": false,
   "typeCheckingMode": "basic",
   "reportMissingImports": false,
   "reportMissingTypeStubs": false,
@@ -8,6 +24,5 @@
   "reportGeneralTypeIssues": true,
   "reportOptionalSubscript": true,
   "reportOptionalMemberAccess": true,
-  "reportOptionalCall": true,
-  "exclude": ["reference/**"]
+  "reportOptionalCall": true
 }

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import hashlib
 from typing import Iterable
-from uuid import uuid4
 
 from trade_journal.models import Fill, Trade
 
@@ -149,8 +149,22 @@ def _finalize_trade(state: PositionState, exit_time: datetime, trades: list[Trad
         else state.avg_entry_price
     )
 
+    trade_id = _stable_trade_id(
+        source=state.source,
+        account_id=state.account_id,
+        symbol=state.symbol,
+        side=state.side,
+        entry_time=state.entry_time,
+        exit_time=exit_time,
+        entry_price=entry_price,
+        exit_price=exit_price,
+        entry_size=state.entry_qty_total,
+        exit_size=state.exit_qty_total,
+        realized_pnl=state.realized_pnl,
+    )
+
     trade = Trade(
-        trade_id=str(uuid4()),
+        trade_id=trade_id,
         source=state.source,
         account_id=state.account_id,
         symbol=state.symbol,
@@ -204,3 +218,34 @@ def _slice_fill(fill: Fill, size: float, fee: float, suffix: str, reason: str) -
         account_id=fill.account_id,
         raw=raw,
     )
+
+
+def _stable_trade_id(
+    *,
+    source: str,
+    account_id: str | None,
+    symbol: str,
+    side: str,
+    entry_time: datetime,
+    exit_time: datetime,
+    entry_price: float,
+    exit_price: float,
+    entry_size: float,
+    exit_size: float,
+    realized_pnl: float,
+) -> str:
+    parts = [
+        source,
+        account_id or "",
+        symbol,
+        side,
+        entry_time.isoformat(),
+        exit_time.isoformat(),
+        f"{entry_price:.8f}",
+        f"{exit_price:.8f}",
+        f"{entry_size:.8f}",
+        f"{exit_size:.8f}",
+        f"{realized_pnl:.8f}",
+    ]
+    digest = hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()
+    return digest

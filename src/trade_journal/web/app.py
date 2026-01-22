@@ -32,6 +32,7 @@ from trade_journal.metrics.summary import (
     compute_symbol_breakdown,
     compute_time_performance,
 )
+from trade_journal.models import Trade
 from trade_journal.ingest.apex_orders import load_orders
 from trade_journal.reconstruct.funding import apply_funding_events
 from trade_journal.reconstruct.trades import reconstruct_trades
@@ -45,6 +46,13 @@ app = FastAPI(title="Trade Journal")
 app.mount("/static", StaticFiles(directory=str(APP_ROOT / "static")), name="static")
 
 _SYNC_LOCK = asyncio.Lock()
+_SESSION_WINDOWS = {
+    "asia": (0, 8),
+    "london": (8, 16),
+    "ny": (16, 24),
+}
+_SESSION_LABELS = ("asia", "london", "ny")
+_NORMALIZATION_MODES = ("usd", "percent", "r")
 
 
 @app.on_event("startup")
@@ -107,25 +115,36 @@ def calendar_page(request: Request) -> HTMLResponse:
 
 @app.get("/analytics", response_class=HTMLResponse)
 def analytics_page(request: Request) -> HTMLResponse:
-    payload = _load_journal_state()
+    context = resolve_account_context(env=os.environ)
+    db_path = _resolve_db_path()
+    if db_path is not None and db_path.exists():
+        payload = _load_analytics_state_db(db_path)
+    else:
+        payload = _load_journal_state()
     trade_items = payload["trades"]
     trade_objects = payload.get("trade_objects", [])
 
-    filters = _parse_analytics_filters(request, payload["symbols"])
+    accounts = payload.get("accounts") or _accounts_from_trades(trade_items)
+    strategies = payload.get("strategies") or _strategies_from_trades(trade_items)
+    filters = _parse_analytics_filters(request, payload["symbols"], accounts, strategies)
     filtered_items = _filter_trade_items(trade_items, filters)
     filtered_ids = {item["trade_id"] for item in filtered_items}
     filtered_trades = [trade for trade in trade_objects if trade.trade_id in filtered_ids]
 
-    initial_equity = _initial_equity()
-    metrics = compute_aggregate_metrics(filtered_trades, initial_equity=initial_equity) if filtered_trades else None
+    normalization = _resolve_normalization(filtered_trades, filters["normalization"])
+    chart_items = _normalized_trade_items(filtered_items, normalization)
+    normalized_trades = normalization["trades"]
+
+    initial_equity = context.starting_equity if normalization["mode"] == "usd" else None
+    metrics = compute_aggregate_metrics(normalized_trades, initial_equity=initial_equity) if normalized_trades else None
     summary = _summary_payload(metrics) if metrics else _empty_summary()
-    performance_score = compute_performance_score(filtered_trades, metrics) if metrics else None
-    time_perf = compute_time_performance(filtered_trades) if filtered_trades else {"hourly": [], "weekday": []}
-    symbol_breakdown = compute_symbol_breakdown(filtered_trades) if filtered_trades else []
-    pnl_distribution = compute_pnl_distribution(filtered_trades) if filtered_trades else {"bins": []}
-    daily_pnl = _daily_pnl(filtered_items)
-    equity_curve = _equity_curve(filtered_items)
-    diagnostics = _diagnostics_payload(filtered_items)
+    performance_score = compute_performance_score(normalized_trades, metrics) if metrics else None
+    time_perf = compute_time_performance(normalized_trades) if normalized_trades else {"hourly": [], "weekday": []}
+    symbol_breakdown = compute_symbol_breakdown(normalized_trades) if normalized_trades else []
+    pnl_distribution = compute_pnl_distribution(normalized_trades) if normalized_trades else {"bins": []}
+    daily_pnl = _daily_pnl(chart_items)
+    equity_curve = _equity_curve(chart_items)
+    diagnostics = _diagnostics_payload(chart_items)
     diagnostics_table = [
         {
             "symbol": row["symbol"],
@@ -139,13 +158,23 @@ def analytics_page(request: Request) -> HTMLResponse:
         }
         for row in diagnostics.get("table", [])
     ]
-    calendar_data = _calendar_data(filtered_items)
+    calendar_data = _calendar_data(chart_items)
+    comparisons = _build_comparisons(
+        trade_items=trade_items,
+        trade_objects=trade_objects,
+        filters=filters,
+        normalization=normalization,
+        db_path=db_path,
+        initial_equity=context.starting_equity,
+    )
 
     context = {
         "request": request,
         "page": "analytics",
         "filters": filters,
         "tab": filters["tab"],
+        "normalization": normalization,
+        "comparisons": comparisons,
         "summary": summary,
         "performance_score": performance_score,
         "equity_curve": equity_curve,
@@ -153,13 +182,15 @@ def analytics_page(request: Request) -> HTMLResponse:
         "pnl_distribution": pnl_distribution,
         "time_performance": time_perf,
         "symbol_breakdown": symbol_breakdown,
-        "direction_stats": _direction_analysis(filtered_trades),
+        "direction_stats": _direction_analysis(normalized_trades),
         "diagnostics": diagnostics,
         "scatter": diagnostics,
         "diagnostics_table": diagnostics_table,
         "trades": filtered_items,
         "calendar": calendar_data,
         "symbols": payload["symbols"],
+        "accounts": accounts,
+        "strategies": strategies,
         "query_base": filters["query_base"],
         "data_note": payload.get("data_note"),
         "data_note_class": _note_class(payload.get("data_note")),
@@ -321,10 +352,12 @@ def _load_journal_state() -> dict[str, Any]:
         for trade in trades:
             risk = initial_stop_for_trade(trade, orders)
             setattr(trade, "r_multiple", risk.r_multiple)
+            setattr(trade, "initial_risk", risk.risk_amount)
             risk_map[trade.trade_id] = risk
 
-    initial_equity = _initial_equity()
-    metrics = compute_aggregate_metrics(trades, initial_equity=initial_equity) if trades else None
+    metrics = (
+        compute_aggregate_metrics(trades, initial_equity=context.starting_equity) if trades else None
+    )
     summary = _summary_payload(metrics) if metrics else _empty_summary()
     performance_score = compute_performance_score(trades, metrics) if metrics else None
 
@@ -421,10 +454,12 @@ def _load_journal_state_db(context, db_path: Path) -> dict[str, Any]:
         for trade in trades:
             risk = initial_stop_for_trade(trade, orders)
             setattr(trade, "r_multiple", risk.r_multiple)
+            setattr(trade, "initial_risk", risk.risk_amount)
             risk_map[trade.trade_id] = risk
 
-    initial_equity = _initial_equity()
-    metrics = compute_aggregate_metrics(trades, initial_equity=initial_equity) if trades else None
+    metrics = (
+        compute_aggregate_metrics(trades, initial_equity=context.starting_equity) if trades else None
+    )
     summary = _summary_payload(metrics) if metrics else _empty_summary()
     performance_score = compute_performance_score(trades, metrics) if metrics else None
 
@@ -460,6 +495,91 @@ def _load_journal_state_db(context, db_path: Path) -> dict[str, Any]:
         "symbols": sorted({item["symbol"] for item in trade_items}),
         "liquidations": liquidation_events,
         "data_note": data_note,
+    }
+
+
+def _load_analytics_state_db(db_path: Path) -> dict[str, Any]:
+    conn = sqlite_reader.connect(db_path)
+    from trade_journal.storage.sqlite_store import init_db
+
+    init_db(conn)
+    try:
+        fills = sqlite_reader.load_fills_all(conn)
+        trades = reconstruct_trades(fills)
+        funding_events = sqlite_reader.load_funding_all(conn)
+        attributions = apply_funding_events(trades, funding_events)
+        unmatched = sum(1 for item in attributions if item.matched_trade_id is None)
+        orders = sqlite_reader.load_orders_all(conn)
+        liquidation_events_raw = sqlite_reader.load_liquidations_all(conn)
+        equity_snapshots = sqlite_reader.load_equity_history_all(conn)
+        accounts = sqlite_reader.load_accounts(conn)
+        tags = sqlite_reader.load_tags(conn, active_only=True)
+        trade_tags = sqlite_reader.load_trade_tags(conn)
+    finally:
+        conn.close()
+
+    data_note = None
+    if not fills:
+        data_note = "No fills found in database."
+    if unmatched:
+        data_note = _append_note(data_note, f"Unmatched funding events: {unmatched}.")
+
+    app_config = load_app_config()
+    excursions_map: dict[str, dict[str, Any]] = {}
+    excursions_path = None
+    candidate = app_config.paths.excursions
+    if candidate and candidate.exists():
+        excursions_path = candidate
+    else:
+        candidate = resolve_data_path(None, resolve_account_context(env=os.environ), "excursions.json")
+        if candidate.exists():
+            excursions_path = candidate
+    if excursions_path is not None:
+        try:
+            excursions_map = json.loads(excursions_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            data_note = _append_note(data_note, "Failed to parse excursions cache.")
+    elif trades:
+        data_note = _append_note(data_note, "Excursions cache missing: MAE/MFE/ETD shown as n/a.")
+
+    if excursions_map:
+        _apply_excursions_cache(trades, excursions_map)
+
+    if equity_snapshots:
+        _apply_equity_multi(trades, equity_snapshots, accounts)
+
+    liquidation_matches = _match_liquidations(trades, liquidation_events_raw)
+    liquidation_events = _build_liquidation_events(trades, liquidation_events_raw, liquidation_matches)
+
+    risk_map: dict[str, Any] = {}
+    if orders:
+        for trade in trades:
+            risk = initial_stop_for_trade(trade, orders)
+            setattr(trade, "r_multiple", risk.r_multiple)
+            setattr(trade, "initial_risk", risk.risk_amount)
+            risk_map[trade.trade_id] = risk
+
+    trade_items = [
+        _trade_payload(
+            trade,
+            liquidation_matches.get(trade.trade_id),
+            risk_map.get(trade.trade_id),
+        )
+        for trade in trades
+    ]
+    trade_items.sort(key=lambda item: item["exit_time"], reverse=True)
+
+    strategies = _apply_trade_tags(trade_items, tags, trade_tags)
+    active_accounts = [row for row in accounts if row.get("active", 1)]
+
+    return {
+        "trades": trade_items,
+        "trade_objects": trades,
+        "symbols": sorted({item["symbol"] for item in trade_items}),
+        "liquidations": liquidation_events,
+        "data_note": data_note,
+        "accounts": active_accounts,
+        "strategies": strategies,
     }
 
 
@@ -522,10 +642,40 @@ def _resolve_db_path() -> Path | None:
 
 
 def _apply_equity(trades: list, snapshots, context) -> None:
-    fallback_equity = _initial_equity()
-    if fallback_equity is None:
-        fallback_equity = context.starting_equity
-    apply_equity_at_entry(trades, snapshots, fallback_equity=fallback_equity)
+    apply_equity_at_entry(trades, snapshots, fallback_equity=context.starting_equity)
+
+
+def _apply_equity_multi(
+    trades: list,
+    snapshots: list,
+    accounts: list[dict[str, Any]],
+) -> None:
+    fallback_equity = None
+    account_map = {
+        str(account.get("account_id")): account
+        for account in accounts
+        if account.get("account_id")
+    }
+    trades_by_key: dict[tuple[str, str | None], list] = defaultdict(list)
+    snapshots_by_key: dict[tuple[str, str | None], list] = defaultdict(list)
+
+    for trade in trades:
+        trades_by_key[(trade.source, trade.account_id)].append(trade)
+    for snap in snapshots:
+        snapshots_by_key[(snap.source, snap.account_id)].append(snap)
+
+    for key, trade_group in trades_by_key.items():
+        account_id = key[1]
+        fallback = None
+        if account_id and account_id in account_map:
+            fallback = account_map[account_id].get("starting_equity")
+        if fallback is None:
+            fallback = fallback_equity
+        apply_equity_at_entry(
+            trade_group,
+            snapshots_by_key.get(key, []),
+            fallback_equity=fallback,
+        )
 
 
 def _auto_sync_enabled() -> bool:
@@ -661,6 +811,7 @@ def _trade_payload(
         "side": trade.side,
         "entry_time": trade.entry_time,
         "exit_time": trade.exit_time,
+        "session": _session_label(trade.exit_time),
         "entry_price": trade.entry_price,
         "exit_price": trade.exit_price,
         "entry_size": trade.entry_size,
@@ -687,6 +838,63 @@ def _trade_payload(
         "r_multiple": risk_summary.r_multiple if risk_summary else None,
         "stop_source": risk_summary.source if risk_summary else None,
     }
+
+
+def _apply_trade_tags(
+    items: list[dict[str, Any]],
+    tags: list[dict[str, Any]],
+    trade_tags: list[dict[str, Any]],
+) -> list[str]:
+    tag_map = {tag["tag_id"]: tag for tag in tags if tag.get("tag_id")}
+    trade_map: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for link in trade_tags:
+        trade_id = link.get("trade_id")
+        tag_id = link.get("tag_id")
+        if not trade_id or not tag_id:
+            continue
+        tag = tag_map.get(tag_id)
+        if tag is None:
+            continue
+        trade_map[trade_id].append(tag)
+
+    strategies: set[str] = set()
+    for item in items:
+        tag_list = trade_map.get(item["trade_id"], [])
+        item["tags"] = [tag["name"] for tag in tag_list]
+        tags_by_type: dict[str, list[str]] = defaultdict(list)
+        for tag in tag_list:
+            tag_type = (tag.get("type") or "other").strip()
+            tag_name = tag.get("name")
+            if not tag_name:
+                continue
+            tag_name_value = str(tag_name)
+            tags_by_type[tag_type].append(tag_name_value)
+            if tag_type == "strategy":
+                strategies.add(tag_name_value)
+        item["tags_by_type"] = dict(tags_by_type)
+        item["strategy_tags"] = tags_by_type.get("strategy", [])
+    return sorted(strategies)
+
+
+def _accounts_from_trades(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    account_ids_set: set[str] = set()
+    for item in items:
+        account_id = item.get("account_id")
+        if not account_id:
+            continue
+        account_ids_set.add(str(account_id))
+    account_ids = sorted(account_ids_set)
+    return [{"account_id": account_id, "name": account_id} for account_id in account_ids]
+
+
+def _strategies_from_trades(items: list[dict[str, Any]]) -> list[str]:
+    strategies: set[str] = set()
+    for item in items:
+        for strategy in item.get("strategy_tags") or []:
+            if not strategy:
+                continue
+            strategies.add(str(strategy))
+    return sorted(strategies)
 
 
 def _trade_ui_id(trade) -> str:
@@ -731,6 +939,15 @@ def _capture_heat_pct(trade) -> tuple[float | None, float | None]:
     capture_pct = (trade.realized_pnl_net / mfe) * 100.0
     heat_pct = abs((trade.mae / mfe) * 100.0) if trade.mae is not None else None
     return capture_pct, heat_pct
+
+
+def _session_label(timestamp: datetime) -> str:
+    hour = timestamp.astimezone(timezone.utc).hour
+    for label, window in _SESSION_WINDOWS.items():
+        start, end = window
+        if start <= hour < end:
+            return label
+    return "asia"
 
 
 def _apply_excursions_cache(trades: list, excursions_map: dict[str, dict[str, Any]]) -> None:
@@ -926,11 +1143,6 @@ def _empty_summary() -> dict[str, Any]:
     }
 
 
-def _initial_equity() -> float | None:
-    app_config = load_app_config()
-    return app_config.app.initial_equity
-
-
 def _load_account_snapshot(context) -> dict[str, Any] | None:
     db_path = _resolve_db_path()
     if db_path is not None:
@@ -1001,7 +1213,12 @@ def _first_float(data: dict[str, Any], *keys: str) -> float | None:
     return None
 
 
-def _parse_analytics_filters(request: Request, symbols: list[str]) -> dict[str, Any]:
+def _parse_analytics_filters(
+    request: Request,
+    symbols: list[str],
+    accounts: list[dict[str, Any]],
+    strategies: list[str],
+) -> dict[str, Any]:
     params = request.query_params
     tab = params.get("tab", "overview").strip().lower()
     if tab not in {"overview", "diagnostics", "edge", "time", "trades"}:
@@ -1028,6 +1245,31 @@ def _parse_analytics_filters(request: Request, symbols: list[str]) -> dict[str, 
     if outcome not in {"all", "win", "loss", "breakeven"}:
         outcome = "all"
 
+    account_ids = [str(account.get("account_id")) for account in accounts if account.get("account_id")]
+    account = params.get("account", "all").strip()
+    if not account or account.lower() == "all":
+        account = "all"
+    elif account not in account_ids:
+        account = "all"
+
+    session = params.get("session", "all").strip().lower()
+    if session not in _SESSION_LABELS:
+        session = "all"
+
+    strategy = params.get("strategy", "all").strip()
+    if not strategy or strategy.lower() == "all":
+        strategy = "all"
+    elif strategy not in strategies:
+        strategy = "all"
+
+    norm_raw = (
+        params.get("normalization")
+        or params.get("normalize")
+        or params.get("norm")
+        or "usd"
+    )
+    normalization = _parse_normalization(norm_raw)
+
     query_parts = []
     if from_date:
         query_parts.append(f"from={from_date.isoformat()}")
@@ -1039,6 +1281,14 @@ def _parse_analytics_filters(request: Request, symbols: list[str]) -> dict[str, 
         query_parts.append(f"side={side}")
     if outcome != "all":
         query_parts.append(f"outcome={outcome}")
+    if account != "all":
+        query_parts.append(f"account={account}")
+    if session != "all":
+        query_parts.append(f"session={session}")
+    if strategy != "all":
+        query_parts.append(f"strategy={strategy}")
+    if normalization != "usd":
+        query_parts.append(f"normalization={normalization}")
     query_base = "&".join(query_parts)
 
     return {
@@ -1048,6 +1298,10 @@ def _parse_analytics_filters(request: Request, symbols: list[str]) -> dict[str, 
         "symbols": valid_symbols,
         "side": side,
         "outcome": outcome,
+        "account": account,
+        "session": session,
+        "strategy": strategy,
+        "normalization": normalization,
         "query_base": query_base,
     }
 
@@ -1061,13 +1315,36 @@ def _parse_date(value: str | None) -> date | None:
         return None
 
 
-def _filter_trade_items(items: list[dict[str, Any]], filters: dict[str, Any]) -> list[dict[str, Any]]:
+def _parse_normalization(value: str) -> str:
+    cleaned = value.strip().lower()
+    if cleaned in {"usd", "$"}:
+        return "usd"
+    if cleaned in {"%", "pct", "percent", "account"}:
+        return "percent"
+    if cleaned in {"r", "r-multiple", "r_multiple", "rmultiple"}:
+        return "r"
+    return "usd"
+
+
+def _filter_trade_items(
+    items: list[dict[str, Any]],
+    filters: dict[str, Any],
+    *,
+    override_from: date | None = None,
+    override_to: date | None = None,
+    ignore_date: bool = False,
+) -> list[dict[str, Any]]:
     filtered: list[dict[str, Any]] = []
+    from_date = None
+    to_date = None
+    if not ignore_date:
+        from_date = override_from if override_from is not None else filters["from"]
+        to_date = override_to if override_to is not None else filters["to"]
     for item in items:
         exit_day = item["exit_time"].date()
-        if filters["from"] and exit_day < filters["from"]:
+        if from_date and exit_day < from_date:
             continue
-        if filters["to"] and exit_day > filters["to"]:
+        if to_date and exit_day > to_date:
             continue
         if filters["symbols"] and item["symbol"] not in filters["symbols"]:
             continue
@@ -1075,49 +1352,393 @@ def _filter_trade_items(items: list[dict[str, Any]], filters: dict[str, Any]) ->
             continue
         if filters["outcome"] != "all" and item["outcome"] != filters["outcome"]:
             continue
+        if filters["account"] != "all" and item.get("account_id") != filters["account"]:
+            continue
+        if filters["session"] != "all" and item.get("session") != filters["session"]:
+            continue
+        if filters["strategy"] != "all":
+            strategies = item.get("strategy_tags") or []
+            if filters["strategy"] not in strategies:
+                continue
         filtered.append(item)
     filtered.sort(key=lambda item: item["exit_time"], reverse=True)
     return filtered
 
 
+def _resolve_normalization(trades: list, requested: str) -> dict[str, Any]:
+    availability = {
+        "usd": True,
+        "percent": all(
+            trade.equity_at_entry is not None and trade.equity_at_entry > 0 for trade in trades
+        )
+        if trades
+        else False,
+        "r": any(
+            getattr(trade, "initial_risk", None) not in (None, 0)
+            for trade in trades
+        )
+        if trades
+        else False,
+    }
+    mode = requested if requested in _NORMALIZATION_MODES else "usd"
+    forced = False
+    if mode == "percent" and not availability["percent"]:
+        mode = "usd"
+        forced = True
+
+    normalized_trades, excluded_trade_ids = _normalize_trades(trades, mode)
+
+    return {
+        "mode": mode,
+        "requested": requested,
+        "available": availability,
+        "forced": forced,
+        "excluded_trade_ids": excluded_trade_ids,
+        "trades": normalized_trades,
+    }
+
+
+def _normalize_trades(trades: list, mode: str) -> tuple[list[Trade], set[str]]:
+    if mode == "usd":
+        return list(trades), set()
+
+    outcomes = {trade.trade_id: compute_trade_metrics(trade).outcome for trade in trades}
+    normalized: list[Trade] = []
+    excluded: set[str] = set()
+    for trade in trades:
+        factor = _normalization_factor(trade, mode)
+        if factor is None:
+            excluded.add(trade.trade_id)
+            continue
+        outcome = outcomes.get(trade.trade_id)
+        normalized.append(_clone_trade_scaled(trade, factor, outcome))
+    return normalized, excluded
+
+
+def _normalization_factor(trade, mode: str) -> float | None:
+    if mode == "percent":
+        equity = trade.equity_at_entry
+        if equity is None or equity == 0:
+            return None
+        return 1.0 / equity
+    if mode == "r":
+        risk = getattr(trade, "initial_risk", None)
+        if risk is None or risk == 0:
+            return None
+        return 1.0 / risk
+    return 1.0
+
+
+def _clone_trade_scaled(trade: Trade, factor: float, outcome: str | None) -> Trade:
+    scaled_realized = trade.realized_pnl * factor
+    scaled_fees = trade.fees * factor
+    scaled_funding = trade.funding_fees * factor
+    scaled_mae = trade.mae * factor if trade.mae is not None else None
+    scaled_mfe = trade.mfe * factor if trade.mfe is not None else None
+    scaled_etd = trade.etd * factor if trade.etd is not None else None
+
+    clone = Trade(
+        trade_id=trade.trade_id,
+        source=trade.source,
+        account_id=trade.account_id,
+        symbol=trade.symbol,
+        side=trade.side,
+        entry_time=trade.entry_time,
+        exit_time=trade.exit_time,
+        entry_price=trade.entry_price,
+        exit_price=trade.exit_price,
+        entry_size=trade.entry_size,
+        exit_size=trade.exit_size,
+        max_size=trade.max_size,
+        realized_pnl=scaled_realized,
+        fees=scaled_fees,
+        funding_fees=scaled_funding,
+        equity_at_entry=trade.equity_at_entry,
+        fills=trade.fills,
+        mae=scaled_mae,
+        mfe=scaled_mfe,
+        etd=scaled_etd,
+    )
+    setattr(clone, "r_multiple", getattr(trade, "r_multiple", None))
+    setattr(clone, "initial_risk", getattr(trade, "initial_risk", None))
+    if outcome is not None:
+        setattr(clone, "outcome_override", outcome)
+    return clone
+
+
+def _normalized_trade_items(
+    items: list[dict[str, Any]],
+    normalization: dict[str, Any],
+) -> list[dict[str, Any]]:
+    mode = normalization["mode"]
+    if mode == "usd":
+        return items
+    trade_map = {trade.trade_id: trade for trade in normalization["trades"]}
+    normalized_items: list[dict[str, Any]] = []
+    for item in items:
+        trade = trade_map.get(item["trade_id"])
+        if trade is None:
+            if mode == "r":
+                continue
+            normalized_items.append(item)
+            continue
+        payload = dict(item)
+        payload["pnl_value"] = trade.realized_pnl_net
+        payload["mae_value"] = trade.mae
+        payload["mfe_value"] = trade.mfe
+        payload["etd_value"] = trade.etd
+        normalized_items.append(payload)
+    return normalized_items
+
+
+def _trades_from_items(trades: list[Trade], items: list[dict[str, Any]]) -> list[Trade]:
+    ids = {item["trade_id"] for item in items}
+    return [trade for trade in trades if trade.trade_id in ids]
+
+
+def _previous_period_range(filters: dict[str, Any]) -> tuple[date, date] | None:
+    start = filters.get("from")
+    end = filters.get("to")
+    if start is None or end is None:
+        return None
+    span = (end - start).days + 1
+    prev_end = start - timedelta(days=1)
+    prev_start = prev_end - timedelta(days=span - 1)
+    return prev_start, prev_end
+
+
+def _normalize_for_comparison(trades: list[Trade], mode: str) -> dict[str, Any]:
+    if mode == "percent":
+        if any(trade.equity_at_entry is None or trade.equity_at_entry <= 0 for trade in trades):
+            return {"trades": [], "available": False, "excluded": set()}
+    normalized_trades, excluded = _normalize_trades(trades, mode)
+    if mode == "r" and trades and not normalized_trades:
+        return {"trades": [], "available": False, "excluded": excluded}
+    return {"trades": normalized_trades, "available": True, "excluded": excluded}
+
+
+def _metrics_payload(
+    trades: list[Trade],
+    mode: str,
+    *,
+    initial_equity: float | None,
+) -> tuple[Any | None, Any | None]:
+    if not trades:
+        return None, None
+    initial_equity = initial_equity if mode == "usd" else None
+    metrics = compute_aggregate_metrics(trades, initial_equity=initial_equity)
+    score = compute_performance_score(trades, metrics)
+    return metrics, score
+
+
+def _kpi_payload(metrics, performance_score) -> dict[str, float | None]:
+    if metrics is None:
+        return {}
+    score_value = None
+    if performance_score is not None:
+        if isinstance(performance_score, dict):
+            score_value = performance_score.get("score")
+        else:
+            score_value = getattr(performance_score, "score", None)
+    return {
+        "net_pnl": metrics.total_net_pnl,
+        "win_rate": metrics.win_rate,
+        "expectancy": metrics.expectancy,
+        "profit_factor": metrics.profit_factor,
+        "avg_win": metrics.avg_win,
+        "avg_loss": metrics.avg_loss,
+        "max_drawdown": metrics.max_drawdown,
+        "performance_score": score_value,
+    }
+
+
+def _kpi_delta(current: dict[str, float | None], baseline: dict[str, float | None]) -> dict[str, float | None]:
+    deltas: dict[str, float | None] = {}
+    for key, value in current.items():
+        other = baseline.get(key)
+        if value is None or other is None:
+            deltas[key] = None
+        else:
+            deltas[key] = value - other
+    return deltas
+
+
+def _benchmark_window(filters: dict[str, Any], trades: list[dict[str, Any]]) -> tuple[datetime, datetime] | None:
+    if filters.get("from") and filters.get("to"):
+        start = datetime.combine(filters["from"], datetime.min.time(), tzinfo=timezone.utc)
+        end = datetime.combine(filters["to"], datetime.max.time(), tzinfo=timezone.utc)
+        return start, end
+    if not trades:
+        return None
+    ordered = sorted(trades, key=lambda item: item["exit_time"])
+    start = ordered[0]["exit_time"].astimezone(timezone.utc)
+    end = ordered[-1]["exit_time"].astimezone(timezone.utc)
+    return start, end
+
+
+def _benchmark_candidates() -> tuple[list[str], list[str]]:
+    app_config = load_app_config()
+    interval = str(app_config.pricing.interval)
+    timeframes = []
+    if interval.endswith(("m", "h", "d")):
+        timeframes.append(interval)
+    else:
+        timeframes.extend([f"{interval}m", interval])
+    if "1m" not in timeframes:
+        timeframes.append("1m")
+    symbols = ["BTCUSDT", "BTC-USD", "BTC-USDT"]
+    return symbols, timeframes
+
+
+def _benchmark_return(
+    db_path: Path | None,
+    window: tuple[datetime, datetime] | None,
+) -> float | None:
+    if db_path is None or window is None or not db_path.exists():
+        return None
+    start, end = window
+    symbols, timeframes = _benchmark_candidates()
+    conn = sqlite_reader.connect(db_path)
+    try:
+        for symbol in symbols:
+            for timeframe in timeframes:
+                rows = sqlite_reader.load_benchmark_prices(
+                    conn,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    start=start,
+                    end=end,
+                )
+                if len(rows) < 2:
+                    continue
+                first_open = rows[0].get("open")
+                last_close = rows[-1].get("close")
+                if not first_open:
+                    continue
+                return (last_close - first_open) / first_open
+    finally:
+        conn.close()
+    return None
+
+
+def _build_comparisons(
+    *,
+    trade_items: list[dict[str, Any]],
+    trade_objects: list[Trade],
+    filters: dict[str, Any],
+    normalization: dict[str, Any],
+    db_path: Path | None,
+    initial_equity: float | None,
+) -> dict[str, Any]:
+    mode = normalization["mode"]
+
+    current_items = _filter_trade_items(trade_items, filters)
+    current_trades = _trades_from_items(trade_objects, current_items)
+    current_norm = _normalize_for_comparison(current_trades, mode)
+    current_metrics, current_score = _metrics_payload(
+        current_norm["trades"], mode, initial_equity=initial_equity
+    )
+    current_kpis = _kpi_payload(current_metrics, current_score)
+
+    all_items = _filter_trade_items(trade_items, filters, ignore_date=True)
+    all_trades = _trades_from_items(trade_objects, all_items)
+    all_norm = _normalize_for_comparison(all_trades, mode)
+    all_metrics, all_score = (
+        _metrics_payload(all_norm["trades"], mode, initial_equity=initial_equity)
+        if all_norm["available"]
+        else (None, None)
+    )
+    all_kpis = _kpi_payload(all_metrics, all_score) if all_metrics else {}
+
+    prev_range = _previous_period_range(filters)
+    prev_metrics = None
+    prev_score = None
+    prev_kpis: dict[str, float | None] = {}
+    prev_available = False
+    if prev_range is not None:
+        prev_items = _filter_trade_items(
+            trade_items,
+            filters,
+            override_from=prev_range[0],
+            override_to=prev_range[1],
+        )
+        prev_trades = _trades_from_items(trade_objects, prev_items)
+        prev_norm = _normalize_for_comparison(prev_trades, mode)
+        prev_available = prev_norm["available"]
+        if prev_available:
+            prev_metrics, prev_score = _metrics_payload(
+                prev_norm["trades"], mode, initial_equity=initial_equity
+            )
+            prev_kpis = _kpi_payload(prev_metrics, prev_score) if prev_metrics else {}
+
+    benchmark_return = _benchmark_return(db_path, _benchmark_window(filters, current_items))
+
+    return {
+        "current": {
+            "metrics": current_metrics,
+            "score": current_score,
+            "kpis": current_kpis,
+        },
+        "all_trades": {
+            "available": all_norm["available"],
+            "metrics": all_metrics,
+            "score": all_score,
+            "kpis": all_kpis,
+            "delta": _kpi_delta(current_kpis, all_kpis) if all_kpis else {},
+        },
+        "previous_period": {
+            "available": prev_available,
+            "metrics": prev_metrics,
+            "score": prev_score,
+            "kpis": prev_kpis,
+            "delta": _kpi_delta(current_kpis, prev_kpis) if prev_kpis else {},
+            "range": prev_range,
+        },
+        "benchmark": {
+            "return": benchmark_return,
+        },
+    }
+
+
 def _diagnostics_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
     mae_mfe = [
         {
-            "x": item["mae"],
-            "y": item["mfe"],
+            "x": item.get("mae_value", item["mae"]),
+            "y": item.get("mfe_value", item["mfe"]),
             "symbol": item["symbol"],
             "trade_id": item["ui_id"],
-            "pnl": item["realized_pnl_net"],
-            "mae": item["mae"],
-            "mfe": item["mfe"],
+            "pnl": item.get("pnl_value", item["realized_pnl_net"]),
+            "mae": item.get("mae_value", item["mae"]),
+            "mfe": item.get("mfe_value", item["mfe"]),
             "capture_pct": item.get("capture_pct"),
             "heat_pct": item.get("heat_pct"),
         }
         for item in items
-        if item["mae"] is not None and item["mfe"] is not None
+        if item.get("mae_value", item["mae"]) is not None
+        and item.get("mfe_value", item["mfe"]) is not None
     ]
     mfe_pnl = [
         {
-            "x": item["mfe"],
-            "y": item["realized_pnl_net"],
+            "x": item.get("mfe_value", item["mfe"]),
+            "y": item.get("pnl_value", item["realized_pnl_net"]),
             "symbol": item["symbol"],
             "trade_id": item["ui_id"],
-            "pnl": item["realized_pnl_net"],
-            "mae": item["mae"],
-            "mfe": item["mfe"],
+            "pnl": item.get("pnl_value", item["realized_pnl_net"]),
+            "mae": item.get("mae_value", item["mae"]),
+            "mfe": item.get("mfe_value", item["mfe"]),
             "capture_pct": item.get("capture_pct"),
             "heat_pct": item.get("heat_pct"),
         }
         for item in items
-        if item["mfe"] is not None
+        if item.get("mfe_value", item["mfe"]) is not None
     ]
     table = [
         {
             "symbol": item["symbol"],
-            "pnl": item["realized_pnl_net"],
-            "mae": item["mae"],
-            "mfe": item["mfe"],
-            "etd": item["etd"],
+            "pnl": item.get("pnl_value", item["realized_pnl_net"]),
+            "mae": item.get("mae_value", item["mae"]),
+            "mfe": item.get("mfe_value", item["mfe"]),
+            "etd": item.get("etd_value", item["etd"]),
             "ui_id": item["ui_id"],
             "capture_pct": item.get("capture_pct"),
             "heat_pct": item.get("heat_pct"),
@@ -1171,13 +1792,14 @@ def _equity_curve(trades: list[dict[str, Any]]) -> dict[str, Any]:
     cumulative = 0.0
     points = []
     for item in ordered:
-        cumulative += item["realized_pnl_net"]
+        pnl_value = item.get("pnl_value", item["realized_pnl_net"])
+        cumulative += pnl_value
         points.append(
             {
                 "t": item["exit_time"].isoformat(),
                 "v": cumulative,
                 "symbol": item["symbol"],
-                "pnl": item["realized_pnl_net"],
+                "pnl": pnl_value,
             }
         )
     return {
@@ -1189,7 +1811,7 @@ def _daily_pnl(trades: list[dict[str, Any]]) -> dict[str, Any]:
     buckets: dict[str, float] = defaultdict(float)
     for item in trades:
         day = item["exit_time"].date().isoformat()
-        buckets[day] += item["realized_pnl_net"]
+        buckets[day] += item.get("pnl_value", item["realized_pnl_net"])
     series = [
         {"day": day, "pnl": pnl}
         for day, pnl in sorted(buckets.items(), key=lambda pair: pair[0])
@@ -1265,12 +1887,12 @@ def _calendar_data(trades: list[dict[str, Any]], month_param: str | None = None)
         day = item["exit_time"].astimezone().date()
         key = day.isoformat()
         bucket = daily_buckets.setdefault(key, {"pnl": 0.0, "trades": []})
-        bucket["pnl"] += item["realized_pnl_net"]
+        bucket["pnl"] += item.get("pnl_value", item["realized_pnl_net"])
         bucket["trades"].append(
             {
                 "symbol": item["symbol"],
                 "side": item["side"],
-                "pnl": item["realized_pnl_net"],
+                "pnl": item.get("pnl_value", item["realized_pnl_net"]),
                 "exit_time": item["exit_time"],
             }
         )

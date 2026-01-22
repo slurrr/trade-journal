@@ -7,12 +7,14 @@ Phase 2 completes the full analytics vision described in `analytics_vision_spec.
 ## 1) Global Filter Bar (Expanded)
 
 Add to Phase 1 filters:
+
 - Session filter (Asia / London / NY)
 - Strategy selector (fixed list; tags mapped to strategy type)
 - Account selector (future multi/sub account capable)
 - Normalization mode: USD | % of account | R‑multiples
 
 Notes:
+
 - Normalization in % uses **account equity at time of trade** (baseline per trade).
 - If equity history is missing, % mode should be disabled or show n/a.
 
@@ -21,11 +23,13 @@ Notes:
 ## 2) Comparison Mode (Overview tab)
 
 Add comparison sets:
+
 - vs All Trades
 - vs Previous Period
 - vs BTC Benchmark
 
 Implementation notes:
+
 - Previous period uses same length as current date filter.
 - Benchmark needs OHLC or benchmark returns series (BTC).
 - KPIs show deltas vs comparison.
@@ -35,6 +39,7 @@ Implementation notes:
 ## 3) Diagnostics (Expanded)
 
 Add metrics:
+
 - MFE Capture %
 - MAE Tolerance
 - ETD Avg (already present)
@@ -44,6 +49,7 @@ Add metrics:
 - Target Hit Rate (requires target orders, or a planned TP tag)
 
 Requirements:
+
 - Target data from orders (TP) or planned TP tag
 - Stop‑hit detection (requires stop orders or liquidation flags)
 
@@ -52,11 +58,13 @@ Requirements:
 ## 4) Edge (Expanded)
 
 Add:
+
 - Strategy attribution table
 - Position size buckets (configured rules)
 - Market regime attribution (requires regime labels per trade)
 
 Requirements:
+
 - Tagging model with strategy types
 - Size‑bucket config
 - Regime data source (external or computed)
@@ -66,10 +74,12 @@ Requirements:
 ## 5) Time (Expanded)
 
 Add:
+
 - PnL vs duration scatter
 - Hold time distribution histogram
 
 Requires:
+
 - duration bins or scatter data (already available at trade level)
 
 ---
@@ -77,11 +87,13 @@ Requires:
 ## 6) Trades Tab (Expanded)
 
 Add columns:
+
 - Tags
 - Strategy
 - Account
 
 Requires:
+
 - Tag system
 - Strategy taxonomy
 - Account table
@@ -91,7 +103,8 @@ Requires:
 ## 7) Data & Schema Requirements
 
 To avoid rework:
-- `accounts` table (multi account/sub account) 
+
+- `accounts` table (multi account/sub account)
 - `tags` + `trade_tags`
 - `strategies` (or tag types)
 - `trade_equity_snapshots` or account equity history per trade
@@ -107,6 +120,7 @@ To avoid rework:
 - **R‑multiples**: net PnL / risk_amount (only where stop exists).
 
 Missing values:
+
 - If R is missing, display `n/a` or exclude from R‑mode charts.
 - If equity history missing, disable % mode or show `n/a`.
 
@@ -115,6 +129,7 @@ Missing values:
 ## 9) Completion Definition
 
 Phase 2 is complete when:
+
 - All filters are live and URL‑driven.
 - All tab definitions from `analytics_vision_spec.md` are implemented.
 - Normalization + comparisons work across all charts/tables.

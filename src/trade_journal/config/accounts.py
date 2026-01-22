@@ -59,7 +59,11 @@ def load_accounts_config(path: Path) -> AccountsConfig:
         funding_baseline = cfg.get("funding_baseline") or cfg.get("fundingBaseline")
         exchange = cfg.get("exchange")
         base_currency = cfg.get("base_currency") or cfg.get("baseCurrency")
-        starting_equity = cfg.get("starting_equity") or cfg.get("startingEquity")
+        starting_equity = (
+            cfg.get("starting_equity")
+            if "starting_equity" in cfg
+            else cfg.get("startingEquity")
+        )
         active_raw = cfg.get("active")
         active = True if active_raw is None else bool(active_raw)
         accounts[name] = AccountConfig(
@@ -70,7 +74,7 @@ def load_accounts_config(path: Path) -> AccountsConfig:
             funding_baseline=str(funding_baseline) if funding_baseline else None,
             exchange=str(exchange) if exchange else None,
             base_currency=str(base_currency) if base_currency else None,
-            starting_equity=float(starting_equity) if starting_equity is not None else None,
+            starting_equity=_parse_optional_float(starting_equity),
             active=active,
         )
     if default_account and default_account not in accounts:
@@ -132,3 +136,19 @@ def resolve_data_path(
     if override:
         return Path(override)
     return context.data_dir / filename
+
+
+def _parse_optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    if not isinstance(value, (str, int, float)):
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        value = stripped
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None

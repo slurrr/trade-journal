@@ -5,8 +5,6 @@ db_path = "data/trade_journal.sqlite"
 host = "127.0.0.1"
 port = 8010
 reload = true
-# Optional initial equity for ROI calculations (leave blank if unknown).
-initial_equity = ""
 # Path to the env file containing API secrets.
 env_path = ".env"
 

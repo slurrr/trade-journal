@@ -79,7 +79,7 @@ def compute_trade_metrics(trade: Trade) -> TradeMetrics:
     return TradeMetrics(
         trade_id=trade.trade_id,
         symbol=trade.symbol,
-        outcome=classify_outcome(net_pnl, entry_notional),
+        outcome=_resolve_outcome(trade, net_pnl, entry_notional),
         gross_pnl=trade.realized_pnl,
         net_pnl=net_pnl,
         entry_notional=entry_notional,
@@ -228,7 +228,7 @@ def _max_streaks(trades: Iterable[Trade]) -> tuple[int, int]:
 
     for trade in ordered:
         entry_notional = trade.entry_price * trade.entry_size
-        outcome = classify_outcome(trade.realized_pnl_net, entry_notional)
+        outcome = _resolve_outcome(trade, trade.realized_pnl_net, entry_notional)
         if outcome == OUTCOME_WIN:
             current_wins += 1
             current_losses = 0
@@ -242,6 +242,13 @@ def _max_streaks(trades: Iterable[Trade]) -> tuple[int, int]:
         max_losses = max(max_losses, current_losses)
 
     return max_wins, max_losses
+
+
+def _resolve_outcome(trade: Trade, net_pnl: float, entry_notional: float) -> Outcome:
+    override = getattr(trade, "outcome_override", None)
+    if override in {OUTCOME_WIN, OUTCOME_LOSS, OUTCOME_BREAKEVEN}:
+        return override
+    return classify_outcome(net_pnl, entry_notional)
 
 
 def _mean(values: list[float]) -> float | None:
