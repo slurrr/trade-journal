@@ -61,7 +61,7 @@
             data-mae="{{ trade.mae or 0 }}"
             data-dte="{{ trade.etd or 0 }}"
             data-liq="{{ 1 if trade.liquidated else 0 }}"
-            data-url="/trades/{{ trade.ui_id }}"
+            data-url="/trades/{{ trade.ui_id }}?venue={{ venue }}"
             class="{{ 'trade-rekt' if trade.liquidated else '' }}"
           >
             <td>{{ trade.exit_time | timestamp }}</td>

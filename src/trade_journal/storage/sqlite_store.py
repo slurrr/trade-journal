@@ -23,6 +23,7 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
+    _migrate_accounts_table(conn)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS fills (
@@ -136,14 +137,16 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS accounts (
-            account_id TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            account_id TEXT NOT NULL,
             name TEXT NOT NULL,
             exchange TEXT,
             base_currency TEXT,
             starting_equity REAL,
             created_at TEXT NOT NULL,
             active INTEGER NOT NULL,
-            raw_json TEXT
+            raw_json TEXT,
+            PRIMARY KEY (source, account_id)
         )
         """
     )
@@ -209,6 +212,24 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS price_bars (
+            source TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            open REAL NOT NULL,
+            high REAL NOT NULL,
+            low REAL NOT NULL,
+            close REAL NOT NULL,
+            volume REAL,
+            trade_count INTEGER,
+            raw_json TEXT,
+            PRIMARY KEY (source, symbol, timeframe, timestamp)
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS regime_series (
             regime_id TEXT PRIMARY KEY,
             account_id TEXT,
@@ -238,6 +259,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
     )
     _ensure_columns(conn)
+    _migrate_benchmark_prices_to_price_bars(conn)
     conn.commit()
 
 
@@ -254,6 +276,156 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "historical_pnl", "account_id", "TEXT")
     _ensure_column(conn, "sync_state", "source", "TEXT")
     _ensure_column(conn, "sync_state", "account_id", "TEXT")
+
+
+def _migrate_accounts_table(conn: sqlite3.Connection) -> None:
+    table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='accounts'"
+    ).fetchone()
+    if table_exists is None:
+        return
+
+    info_rows = conn.execute("PRAGMA table_info(accounts)").fetchall()
+    if not info_rows:
+        return
+    cols = {str(row[1]) for row in info_rows}
+    pk_cols = [str(row[1]) for row in sorted(info_rows, key=lambda row: int(row[5] or 0)) if int(row[5] or 0) > 0]
+    if "source" in cols and pk_cols == ["source", "account_id"]:
+        return
+
+    existing_rows = [dict(row) for row in conn.execute("SELECT * FROM accounts").fetchall()]
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS accounts_v2 (
+            source TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            exchange TEXT,
+            base_currency TEXT,
+            starting_equity REAL,
+            created_at TEXT NOT NULL,
+            active INTEGER NOT NULL,
+            raw_json TEXT,
+            PRIMARY KEY (source, account_id)
+        )
+        """
+    )
+    for row in existing_rows:
+        raw_json = row.get("raw_json")
+        source = _account_row_source(row, raw_json)
+        account_id = str(row.get("account_id") or "").strip()
+        if not account_id:
+            continue
+        conn.execute(
+            """
+            INSERT INTO accounts_v2 (
+                source, account_id, name, exchange, base_currency, starting_equity, created_at, active, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source, account_id) DO UPDATE SET
+                name=excluded.name,
+                exchange=excluded.exchange,
+                base_currency=excluded.base_currency,
+                starting_equity=excluded.starting_equity,
+                active=excluded.active,
+                raw_json=excluded.raw_json
+            """,
+            (
+                source,
+                account_id,
+                str(row.get("name") or account_id),
+                row.get("exchange"),
+                row.get("base_currency"),
+                row.get("starting_equity"),
+                str(row.get("created_at") or datetime.utcnow().isoformat()),
+                _active_int(row.get("active", 1)),
+                raw_json if isinstance(raw_json, str) else _json_dump(raw_json),
+            ),
+        )
+    conn.execute("DROP TABLE accounts")
+    conn.execute("ALTER TABLE accounts_v2 RENAME TO accounts")
+    conn.commit()
+
+
+def _account_row_source(row: dict[str, object], raw_json: object) -> str:
+    source = row.get("source")
+    if source:
+        return str(source)
+    if isinstance(raw_json, str):
+        try:
+            raw_json = json.loads(raw_json)
+        except json.JSONDecodeError:
+            raw_json = None
+    if isinstance(raw_json, dict):
+        raw_source = raw_json.get("source")
+        if raw_source:
+            return str(raw_source)
+    return "apex"
+
+
+def _migrate_benchmark_prices_to_price_bars(conn: sqlite3.Connection) -> None:
+    """One-time copy of legacy benchmark bars into venue-scoped price_bars.
+
+    This preserves any existing benchmark_prices data while the app converges on
+    the unified price_bars table.
+    """
+
+    try:
+        benchmark_count = int(conn.execute("SELECT COUNT(*) FROM benchmark_prices").fetchone()[0])
+    except sqlite3.Error:
+        return
+    if benchmark_count <= 0:
+        return
+
+    try:
+        price_count = int(conn.execute("SELECT COUNT(*) FROM price_bars").fetchone()[0])
+    except sqlite3.Error:
+        return
+    if price_count > 0:
+        return
+
+    rows = conn.execute(
+        "SELECT symbol, timeframe, timestamp, open, high, low, close FROM benchmark_prices"
+    ).fetchall()
+    if not rows:
+        return
+
+    payload = [
+        {
+            "source": "legacy_benchmark",
+            "symbol": row["symbol"],
+            "timeframe": row["timeframe"],
+            "timestamp": row["timestamp"],
+            "open": row["open"],
+            "high": row["high"],
+            "low": row["low"],
+            "close": row["close"],
+            "volume": None,
+            "trade_count": None,
+            "raw_json": None,
+        }
+        for row in rows
+    ]
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO price_bars (
+            source, symbol, timeframe, timestamp, open, high, low, close, volume, trade_count, raw_json
+        ) VALUES (
+            :source, :symbol, :timeframe, :timestamp, :open, :high, :low, :close, :volume, :trade_count, :raw_json
+        )
+        """,
+        payload,
+    )
+
+
+def _active_int(value: object) -> int:
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, (int, float)):
+        return 1 if int(value) != 0 else 0
+    text = str(value or "").strip().lower()
+    if text in {"", "0", "false", "no", "off"}:
+        return 0
+    return 1
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, col_type: str) -> None:
@@ -365,8 +537,10 @@ def upsert_accounts(conn: sqlite3.Connection, accounts: Iterable[dict[str, objec
     rows = []
     for account in accounts:
         account_id = str(account["account_id"])
+        source = str(account.get("source") or "apex")
         rows.append(
             {
+                "source": source,
                 "account_id": account_id,
                 "name": str(account.get("name") or account_id),
                 "exchange": account.get("exchange"),
@@ -379,12 +553,12 @@ def upsert_accounts(conn: sqlite3.Connection, accounts: Iterable[dict[str, objec
     conn.executemany(
         """
         INSERT INTO accounts (
-            account_id, name, exchange, base_currency, starting_equity, created_at, active, raw_json
+            source, account_id, name, exchange, base_currency, starting_equity, created_at, active, raw_json
         )
         VALUES (
-            :account_id, :name, :exchange, :base_currency, :starting_equity, CURRENT_TIMESTAMP, :active, :raw_json
+            :source, :account_id, :name, :exchange, :base_currency, :starting_equity, CURRENT_TIMESTAMP, :active, :raw_json
         )
-        ON CONFLICT(account_id) DO UPDATE SET
+        ON CONFLICT(source, account_id) DO UPDATE SET
             name=excluded.name,
             exchange=excluded.exchange,
             base_currency=excluded.base_currency,
@@ -712,6 +886,54 @@ def upsert_historical_pnl(conn: sqlite3.Connection, records: Iterable[PnlRecord]
             size=excluded.size,
             exit_time=excluded.exit_time,
             total_pnl=excluded.total_pnl,
+            raw_json=excluded.raw_json
+        """,
+        rows,
+    )
+    conn.commit()
+    return len(rows)
+
+
+def upsert_price_bars(conn: sqlite3.Connection, bars: Iterable[dict[str, object]]) -> int:
+    rows = []
+    for bar in bars:
+        source = str(bar.get("source") or "").strip().lower()
+        symbol = str(bar.get("symbol") or "").strip().upper()
+        timeframe = str(bar.get("timeframe") or "").strip().lower()
+        timestamp = str(bar.get("timestamp") or "").strip()
+        if not source or not symbol or not timeframe or not timestamp:
+            continue
+        rows.append(
+            {
+                "source": source,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "timestamp": timestamp,
+                "open": bar.get("open"),
+                "high": bar.get("high"),
+                "low": bar.get("low"),
+                "close": bar.get("close"),
+                "volume": bar.get("volume"),
+                "trade_count": bar.get("trade_count"),
+                "raw_json": _json_dump(bar.get("raw_json")),
+            }
+        )
+    if not rows:
+        return 0
+    conn.executemany(
+        """
+        INSERT INTO price_bars (
+            source, symbol, timeframe, timestamp, open, high, low, close, volume, trade_count, raw_json
+        ) VALUES (
+            :source, :symbol, :timeframe, :timestamp, :open, :high, :low, :close, :volume, :trade_count, :raw_json
+        )
+        ON CONFLICT(source, symbol, timeframe, timestamp) DO UPDATE SET
+            open=excluded.open,
+            high=excluded.high,
+            low=excluded.low,
+            close=excluded.close,
+            volume=excluded.volume,
+            trade_count=excluded.trade_count,
             raw_json=excluded.raw_json
         """,
         rows,

@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from trade_journal.config.accounts import account_key
 from trade_journal.ingest.apex_liquidations import LiquidationEvent
 from trade_journal.ingest.apex_orders import OrderRecord
 from trade_journal.models import EquitySnapshot, Fill, FundingEvent
@@ -367,7 +368,13 @@ def load_equity_history_all(conn: sqlite3.Connection) -> list[EquitySnapshot]:
 
 def load_accounts(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = _fetch_all(conn, "accounts", order_by="name")
-    return [dict(row) for row in rows]
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["raw_json"] = _maybe_json(item.get("raw_json"))
+        item["account_key"] = account_key(str(item.get("source") or ""), item.get("account_id"))
+        output.append(item)
+    return output
 
 
 def load_tags(conn: sqlite3.Connection, *, active_only: bool = True) -> list[dict[str, Any]]:
@@ -400,5 +407,67 @@ def load_benchmark_prices(
         clauses.append("timestamp <= ?")
         params.append(end.isoformat())
     query = "SELECT * FROM benchmark_prices WHERE " + " AND ".join(clauses) + " ORDER BY timestamp"
+    rows = conn.execute(query, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def load_price_bars(
+    conn: sqlite3.Connection,
+    *,
+    source: str,
+    symbol: str,
+    timeframe: str,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> list[dict[str, Any]]:
+    clauses = ["source = ?", "symbol = ?", "timeframe = ?"]
+    params: list[Any] = [source, symbol, timeframe]
+    if start is not None:
+        clauses.append("timestamp >= ?")
+        params.append(start.isoformat())
+    if end is not None:
+        clauses.append("timestamp <= ?")
+        params.append(end.isoformat())
+    query = "SELECT * FROM price_bars WHERE " + " AND ".join(clauses) + " ORDER BY timestamp"
+    rows = conn.execute(query, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def load_regime_series(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = conn.execute("SELECT * FROM regime_series ORDER BY ts_start").fetchall()
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        data = dict(row)
+        if data.get("ts_start"):
+            data["ts_start"] = _parse_iso(data["ts_start"])
+        if data.get("ts_end"):
+            data["ts_end"] = _parse_iso(data["ts_end"])
+        output.append(data)
+    return output
+
+
+def load_sync_states(
+    conn: sqlite3.Connection,
+    *,
+    source: str | None = None,
+    account_id: str | None = None,
+    endpoint_prefix: str | None = None,
+) -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if source:
+        clauses.append("source = ?")
+        params.append(source)
+    if account_id:
+        clauses.append("account_id = ?")
+        params.append(account_id)
+    if endpoint_prefix:
+        clauses.append("endpoint LIKE ?")
+        params.append(f"{endpoint_prefix}%")
+    where_clause = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    query = (
+        "SELECT endpoint, source, account_id, last_timestamp_ms, last_id, last_success_at "
+        f"FROM sync_state{where_clause} ORDER BY endpoint"
+    )
     rows = conn.execute(query, params).fetchall()
     return [dict(row) for row in rows]

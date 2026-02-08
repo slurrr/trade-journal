@@ -38,6 +38,7 @@ trade-journal-verify = "trade_journal.verify:main"
 trade-journal-web = "trade_journal.web.app:main"
 trade-journal-import-equity-history = "trade_journal.import_equity_history:main"
 trade-journal-sync-api = "trade_journal.sync_api:main"
+trade-journal-hl-sanity = "trade_journal.sanity_hyperliquid:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

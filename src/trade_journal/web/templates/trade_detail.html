@@ -6,7 +6,7 @@
     <h1>Trade Detail</h1>
     <p>Zoom in on fills and execution flow.</p>
   </div>
-  <a class="ghost-link" href="/trades">Back to trades</a>
+  <a class="ghost-link" href="/trades?venue={{ venue }}">Back to trades</a>
 </section>
 
 {% if trade %}
@@ -141,6 +141,7 @@
 {% if trade %}
 <script>
   const tradeSeriesId = "{{ trade.ui_id }}";
+  const globalVenue = {{ venue | json | safe }};
   const unrealizedCanvas = document.getElementById('unrealizedChart');
   const priceCanvas = document.getElementById('priceChart');
 
@@ -174,7 +175,7 @@
   const buildChart = async () => {
     if (!tradeSeriesId || !unrealizedCanvas || !priceCanvas) return;
     try {
-      const response = await fetch(`/api/trades/${tradeSeriesId}/series`);
+      const response = await fetch(`/api/trades/${tradeSeriesId}/series?venue=${encodeURIComponent(globalVenue)}`);
       if (!response.ok) return;
       const payload = await response.json();
       const series = payload.series || [];

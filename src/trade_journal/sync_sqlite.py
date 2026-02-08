@@ -87,6 +87,7 @@ def main(argv: list[str] | None = None) -> int:
         conn,
         [
             {
+                "source": context.source,
                 "account_id": context.account_id or context.name,
                 "name": context.name,
                 "exchange": context.exchange or context.source,

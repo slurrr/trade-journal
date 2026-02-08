@@ -15,3 +15,13 @@ base_currency = "USDT"
 starting_equity = ""
 # Optional: disable an account without deleting config.
 active = true
+
+[accounts.hl_main]
+source = "hyperliquid"
+exchange = "hyperliquid"
+# Required for Hyperliquid: wallet address (canonicalized to lowercase).
+account_id = "0x0000000000000000000000000000000000000000"
+data_dir = "data/hl_main"
+base_currency = "USDC"
+starting_equity = ""
+active = false
