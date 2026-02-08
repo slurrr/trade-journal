@@ -70,17 +70,18 @@ class AggregateMetrics:
 
 
 def compute_trade_metrics(trade: Trade) -> TradeMetrics:
+    gross_pnl = trade.realized_pnl
     net_pnl = trade.realized_pnl_net
     entry_notional = trade.entry_price * trade.entry_size
     return_pct = None
     if entry_notional:
-        return_pct = net_pnl / entry_notional
+        return_pct = gross_pnl / entry_notional
     duration = trade.exit_time - trade.entry_time
     return TradeMetrics(
         trade_id=trade.trade_id,
         symbol=trade.symbol,
-        outcome=_resolve_outcome(trade, net_pnl, entry_notional),
-        gross_pnl=trade.realized_pnl,
+        outcome=_resolve_outcome(trade, gross_pnl, entry_notional),
+        gross_pnl=gross_pnl,
         net_pnl=net_pnl,
         entry_notional=entry_notional,
         return_pct=return_pct,
@@ -88,13 +89,13 @@ def compute_trade_metrics(trade: Trade) -> TradeMetrics:
     )
 
 
-def classify_outcome(net_pnl: float, entry_notional: float) -> Outcome:
+def classify_outcome(pnl: float, entry_notional: float) -> Outcome:
     band = 0.0
     if entry_notional > 0:
         band = entry_notional * BREAKEVEN_BAND_PCT
-    if abs(net_pnl) <= band:
+    if abs(pnl) <= band:
         return OUTCOME_BREAKEVEN
-    return OUTCOME_WIN if net_pnl > 0 else OUTCOME_LOSS
+    return OUTCOME_WIN if pnl > 0 else OUTCOME_LOSS
 
 
 def compute_aggregate_metrics(
@@ -117,15 +118,15 @@ def compute_aggregate_metrics(
     if win_count + loss_count:
         win_rate = win_count / (win_count + loss_count)
 
-    total_win = sum(metric.net_pnl for metric in wins)
-    total_loss = sum(metric.net_pnl for metric in losses)
+    total_win = sum(metric.gross_pnl for metric in wins)
+    total_loss = sum(metric.gross_pnl for metric in losses)
     profit_factor = None
     if total_loss < 0:
         profit_factor = total_win / abs(total_loss)
 
     expectancy = None
     if total_trades:
-        expectancy = sum(metric.net_pnl for metric in trade_metrics) / total_trades
+        expectancy = sum(metric.gross_pnl for metric in trade_metrics) / total_trades
 
     avg_win = None
     if win_count:
@@ -135,8 +136,8 @@ def compute_aggregate_metrics(
     if loss_count:
         avg_loss = total_loss / loss_count
 
-    largest_win = max((metric.net_pnl for metric in wins), default=None)
-    largest_loss = min((metric.net_pnl for metric in losses), default=None)
+    largest_win = max((metric.gross_pnl for metric in wins), default=None)
+    largest_loss = min((metric.gross_pnl for metric in losses), default=None)
 
     max_wins, max_losses = _max_streaks(trade_list)
 
@@ -170,9 +171,9 @@ def compute_aggregate_metrics(
     roi_pct = None
     net_return = None
     if initial_equity is not None:
-        net_return = total_net_pnl
+        net_return = total_gross_pnl
         if initial_equity:
-            roi_pct = total_net_pnl / initial_equity
+            roi_pct = total_gross_pnl / initial_equity
 
     avg_trades_per_day, max_trades_in_day = _trade_counts_by_day(trade_list)
     avg_pnl_after_loss = _avg_pnl_after_loss(trade_list)
@@ -228,7 +229,7 @@ def _max_streaks(trades: Iterable[Trade]) -> tuple[int, int]:
 
     for trade in ordered:
         entry_notional = trade.entry_price * trade.entry_size
-        outcome = _resolve_outcome(trade, trade.realized_pnl_net, entry_notional)
+        outcome = _resolve_outcome(trade, trade.realized_pnl, entry_notional)
         if outcome == OUTCOME_WIN:
             current_wins += 1
             current_losses = 0
@@ -244,11 +245,11 @@ def _max_streaks(trades: Iterable[Trade]) -> tuple[int, int]:
     return max_wins, max_losses
 
 
-def _resolve_outcome(trade: Trade, net_pnl: float, entry_notional: float) -> Outcome:
+def _resolve_outcome(trade: Trade, pnl: float, entry_notional: float) -> Outcome:
     override = getattr(trade, "outcome_override", None)
     if override in {OUTCOME_WIN, OUTCOME_LOSS, OUTCOME_BREAKEVEN}:
         return override
-    return classify_outcome(net_pnl, entry_notional)
+    return classify_outcome(pnl, entry_notional)
 
 
 def _mean(values: list[float]) -> float | None:
@@ -275,7 +276,7 @@ def _max_drawdown(trades: list[Trade]) -> tuple[float | None, float | None]:
     max_dd_pct: float | None = None
 
     for trade in ordered:
-        equity += trade.realized_pnl_net
+        equity += trade.realized_pnl
         if equity > peak:
             peak = equity
         drawdown = peak - equity
@@ -308,8 +309,8 @@ def compute_time_performance(trades: Iterable[Trade]) -> dict[str, list[dict[str
         exit_local = trade.exit_time.astimezone()
         hour = exit_local.hour
         day = exit_local.weekday()
-        hourly.setdefault(hour, []).append(trade.realized_pnl_net)
-        weekday.setdefault(day, []).append(trade.realized_pnl_net)
+        hourly.setdefault(hour, []).append(trade.realized_pnl)
+        weekday.setdefault(day, []).append(trade.realized_pnl)
 
     hourly_rows = [_bucket_summary(hour, values) for hour, values in sorted(hourly.items())]
     weekday_rows = [_bucket_summary(day, values) for day, values in sorted(weekday.items())]
@@ -343,7 +344,7 @@ def compute_pnl_distribution(
     trades: Iterable[Trade],
     bins: int = 20,
 ) -> dict[str, float | int | list[dict[str, float | int]]]:
-    values = [trade.realized_pnl_net for trade in trades]
+    values = [trade.realized_pnl for trade in trades]
     if not values:
         return {"min": 0.0, "max": 0.0, "bins": []}
     min_val = min(values)
@@ -400,7 +401,7 @@ def compute_performance_score(trades: Iterable[Trade], metrics: AggregateMetrics
 
     recovery_factor = None
     if metrics.max_drawdown is not None and metrics.max_drawdown > 0:
-        recovery_factor = metrics.total_net_pnl / metrics.max_drawdown
+        recovery_factor = metrics.total_gross_pnl / metrics.max_drawdown
     recovery_factor_score = _score_ratio(recovery_factor, cap=5.0)
 
     consistency_raw = _consistency_ratio(trades)
@@ -481,7 +482,7 @@ def _daily_pnls(trades: Iterable[Trade]) -> list[float]:
     buckets: dict[str, float] = {}
     for trade in trades:
         day = trade.exit_time.astimezone().date().isoformat()
-        buckets[day] = buckets.get(day, 0.0) + trade.realized_pnl_net
+        buckets[day] = buckets.get(day, 0.0) + trade.realized_pnl
     return list(buckets.values())
 
 
@@ -501,8 +502,8 @@ def _avg_pnl_after_loss(trades: list[Trade]) -> float | None:
     values = []
     for idx in range(1, len(ordered)):
         prev = ordered[idx - 1]
-        if prev.realized_pnl_net < 0:
-            values.append(ordered[idx].realized_pnl_net)
+        if prev.realized_pnl < 0:
+            values.append(ordered[idx].realized_pnl)
     if not values:
         return None
     return sum(values) / len(values)

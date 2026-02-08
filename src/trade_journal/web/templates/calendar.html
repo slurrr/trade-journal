@@ -73,6 +73,7 @@
 
 <script>
   const calendar = {{ calendar | json | safe }};
+  const globalVenue = {{ venue | json | safe }};
   const maxAbs = calendar.max_abs_pnl || 1;
   const tiles = document.querySelectorAll('.calendar-day');
 
@@ -128,7 +129,7 @@
         const date = tile.dataset.date;
         if (date) {
           const month = date.slice(0, 7);
-          window.location.href = `/calendar?month=${month}&day=${date}`;
+          window.location.href = `/calendar?venue=${encodeURIComponent(globalVenue)}&month=${month}&day=${date}`;
         }
         return;
       }
@@ -253,7 +254,7 @@
     const active = pickerItems.find(item => item.classList.contains('active'));
     if (!active) return;
     const monthKey = active.dataset.month;
-    window.location.href = `/calendar?month=${monthKey}`;
+    window.location.href = `/calendar?venue=${encodeURIComponent(globalVenue)}&month=${monthKey}`;
   };
 
   pickerList.addEventListener('click', () => {
@@ -264,7 +265,7 @@
     item.addEventListener('click', event => {
       event.stopPropagation();
       const monthKey = item.dataset.month;
-      window.location.href = `/calendar?month=${monthKey}`;
+      window.location.href = `/calendar?venue=${encodeURIComponent(globalVenue)}&month=${monthKey}`;
     });
   });
 

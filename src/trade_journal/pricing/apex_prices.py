@@ -94,11 +94,20 @@ class ApexPriceClient:
         # Expand the window by one interval to capture the entry/exit bars.
         start_ms = int(start_time.timestamp() * 1000) - interval_ms
         end_ms = int(end_time.timestamp() * 1000) + interval_ms
-        bars = self._fetch_bars_window(symbol, start_ms, end_ms, interval_ms)
-        if not bars:
-            raise RuntimeError(f"No price data returned for {symbol}.")
-        _ensure_coverage(bars, start_time, end_time)
-        return bars
+        last_error: RuntimeError | None = None
+        for candidate in _symbol_candidates(symbol):
+            try:
+                bars = self._fetch_bars_window(candidate, start_ms, end_ms, interval_ms)
+            except RuntimeError as exc:
+                last_error = exc
+                continue
+            if not bars:
+                continue
+            _ensure_coverage(bars, start_time, end_time)
+            return bars
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(f"No price data returned for {symbol}.")
 
     def _fetch_bars_window(self, symbol: str, start_ms: int, end_ms: int, interval_ms: int) -> list[PriceBar]:
         max_bars = max(1, self._config.max_bars_per_request)
@@ -136,6 +145,23 @@ def _build_url(base_url: str, endpoint: str, params: Mapping[str, str]) -> str:
     path = endpoint if endpoint.startswith("/") else f"/{endpoint}"
     query = urllib.parse.urlencode(params)
     return f"{base_url}{path}?{query}"
+
+
+def _symbol_candidates(symbol: str) -> list[str]:
+    cleaned = str(symbol).strip().upper()
+    if not cleaned:
+        return []
+    candidates = [cleaned]
+    if cleaned.endswith("-USDC"):
+        candidates.append(cleaned[:-5] + "-USDT")
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in candidates:
+        if item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
 
 
 def _fetch_json(url: str, timeout_seconds: float) -> Any:

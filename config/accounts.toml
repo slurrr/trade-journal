@@ -11,7 +11,16 @@ data_dir = "data/main"
 # Optional: base currency for equity/normalization.
 base_currency = "USDT"
 # Optional: starting equity (used for equity snapshots/backfill).
-# Leave blank or remove the line if unknown.
-starting_equity = ""
+starting_equity = 588
 # Optional: disable an account without deleting config.
+active = true
+
+[accounts.hl_main]
+source = "hyperliquid"
+exchange = "hyperliquid"
+# Required for Hyperliquid: wallet address (canonicalized to lowercase).
+account_id = "0x371B6D542a2471c1E8f38495e0dea578D00a377C"
+data_dir = "data/hl_main"
+base_currency = "USDC"
+starting_equity = ""
 active = true

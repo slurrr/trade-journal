@@ -42,6 +42,20 @@ def initial_stop_for_trade(trade: Trade, orders: Iterable[OrderRecord]) -> RiskS
             r_multiple = _r_multiple(trade, risk_amount)
             return RiskSummary(stop_price=stop_price, risk_amount=risk_amount, r_multiple=r_multiple, source="tpsl")
 
+    if trade.source == "hyperliquid":
+        stop_order = _hyperliquid_stop_at_entry(trade, symbol_orders)
+        if stop_order is not None:
+            stop_price = _stop_from_tpsl(stop_order)
+            if stop_price is not None:
+                risk_amount = _risk_amount(trade, stop_price, trade.entry_size)
+                r_multiple = _r_multiple(trade, risk_amount)
+                return RiskSummary(
+                    stop_price=stop_price,
+                    risk_amount=risk_amount,
+                    r_multiple=r_multiple,
+                    source="hl_stop_at_entry",
+                )
+
     return RiskSummary(stop_price=None, risk_amount=None, r_multiple=None, source=None)
 
 
@@ -121,6 +135,36 @@ def _stop_from_tpsl(order: OrderRecord) -> float | None:
     if order.trigger_price is None:
         return None
     return order.trigger_price
+
+
+def _hyperliquid_stop_at_entry(trade: Trade, orders: list[OrderRecord]) -> OrderRecord | None:
+    entry_side = "BUY" if trade.side == "LONG" else "SELL"
+    entry_fills = [fill for fill in trade.fills if fill.side == entry_side]
+    if not entry_fills:
+        return None
+    entry_start = min(fill.timestamp for fill in entry_fills)
+    entry_end = max(fill.timestamp for fill in entry_fills)
+    opposite_side = "SELL" if trade.side == "LONG" else "BUY"
+
+    candidates = []
+    for order in orders:
+        if order.side != opposite_side:
+            continue
+        if not order.reduce_only:
+            continue
+        if order.trigger_price is None:
+            continue
+        # "At fill time": choose a stop present at/around entry fill timestamp.
+        if order.created_at < entry_start:
+            candidates.append(order)
+            continue
+        if order.created_at <= entry_end:
+            candidates.append(order)
+            continue
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item.created_at, reverse=True)
+    return candidates[0]
 
 
 def _risk_amount(trade: Trade, stop_price: float, size: float) -> float | None:

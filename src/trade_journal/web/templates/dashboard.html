@@ -4,7 +4,7 @@
 <section class="hero">
   <div>
     <h1>Seth's Perpetual Learning Curve</h1>
-    <p>Clean summary of your ApeX fills and reconstructed trades. No clutter, just signal.</p>
+    <p>Clean summary of reconstructed trades. No clutter, just signal.</p>
   </div>
   <div class="hero-card">
     <div class="hero-label">Net P&L</div>
@@ -66,7 +66,7 @@
   <div class="metric-card calendar-card">
     <div class="metric-label">Calendar Heatmap</div>
     <div class="metric-value">{{ calendar.month_label }}</div>
-    <a class="calendar-mini" href="/calendar">
+    <a class="calendar-mini" href="/calendar?venue={{ venue }}">
       <div class="calendar-mini-grid">
         {% for week in calendar.weeks %}
           {% for day in week %}
@@ -114,10 +114,56 @@
 <section class="panel">
   <div class="panel-header">
     <div>
+      <h2>Open Positions</h2>
+      <p>
+        Latest snapshot from the selected account.
+        <span id="openPositionsTimestamp">
+          {% if account and account.timestamp %}Updated {{ account.timestamp | timestamp }}{% endif %}
+        </span>
+      </p>
+    </div>
+  </div>
+  <div class="table-wrap">
+    <table class="table">
+      <thead>
+        <tr>
+          <th>Symbol</th>
+          <th>Side</th>
+          <th>Size</th>
+          <th>Entry</th>
+          <th>uPnL</th>
+          <th>Liq</th>
+        </tr>
+      </thead>
+      <tbody id="openPositionsBody">
+        {% if open_positions %}
+          {% for pos in open_positions %}
+          <tr>
+            <td>{{ pos.symbol }}</td>
+            <td><span class="pill {{ pos.side | lower }}">{{ pos.side }}</span></td>
+            <td>{{ pos.size | round(6) }}</td>
+            <td>{{ pos.entry_price | money if pos.entry_price is not none else 'n/a' }}</td>
+            <td class="{{ 'positive' if pos.unrealized_pnl and pos.unrealized_pnl >= 0 else 'negative' }}">
+              {{ pos.unrealized_pnl | money if pos.unrealized_pnl is not none else 'n/a' }}
+            </td>
+            <td>{{ pos.liquidation_price | money if pos.liquidation_price is not none else 'n/a' }}</td>
+          </tr>
+          {% endfor %}
+        {% else %}
+          <tr><td colspan="6" class="empty">No open positions in latest snapshot.</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-header">
+    <div>
       <h2>Recent Trades</h2>
       <p>Latest closes with outcomes.</p>
     </div>
-    <a class="ghost-link" href="/trades">View all</a>
+    <a class="ghost-link" href="/trades?venue={{ venue }}">View all</a>
   </div>
   <div class="table-wrap">
     <table class="table">
@@ -157,7 +203,7 @@
       <h2>Recent Liquidations</h2>
       <p>Latest force-closed positions.</p>
     </div>
-    <a class="ghost-link" href="/trades">View all</a>
+    <a class="ghost-link" href="/trades?venue={{ venue }}">View all</a>
   </div>
   <div class="table-wrap">
     <table class="table">
@@ -432,5 +478,62 @@
       day.style.background = color;
     });
   }
+
+  const openPositionsBody = document.getElementById('openPositionsBody');
+  const openPositionsTimestamp = document.getElementById('openPositionsTimestamp');
+  const globalVenue = {{ venue | json | safe }};
+
+  const formatMoney = value => {
+    if (value === null || value === undefined || Number.isNaN(Number(value))) return 'n/a';
+    const numeric = Number(value);
+    const sign = numeric < 0 ? '-' : '';
+    return `${sign}$${Math.abs(numeric).toFixed(2)}`;
+  };
+
+  const formatSize = value => {
+    if (value === null || value === undefined || Number.isNaN(Number(value))) return 'n/a';
+    return Number(value).toFixed(6).replace(/\.?0+$/, '');
+  };
+
+  const renderOpenPositions = payload => {
+    if (!openPositionsBody) return;
+    const positions = Array.isArray(payload?.open_positions) ? payload.open_positions : [];
+    if (!positions.length) {
+      openPositionsBody.innerHTML = '<tr><td colspan="6" class="empty">No open positions in latest snapshot.</td></tr>';
+    } else {
+      openPositionsBody.innerHTML = positions.map(pos => {
+        const pnl = Number(pos.unrealized_pnl ?? 0);
+        const pnlClass = pnl >= 0 ? 'positive' : 'negative';
+        const side = String(pos.side || '').toLowerCase();
+        return `
+          <tr>
+            <td>${pos.symbol ?? 'n/a'}</td>
+            <td><span class="pill ${side}">${pos.side ?? 'n/a'}</span></td>
+            <td>${formatSize(pos.size)}</td>
+            <td>${formatMoney(pos.entry_price)}</td>
+            <td class="${pnlClass}">${formatMoney(pos.unrealized_pnl)}</td>
+            <td>${formatMoney(pos.liquidation_price)}</td>
+          </tr>
+        `;
+      }).join('');
+    }
+    const ts = payload?.account?.timestamp;
+    if (openPositionsTimestamp) {
+      openPositionsTimestamp.textContent = ts ? `Updated ${new Date(ts).toLocaleString()}` : '';
+    }
+  };
+
+  const refreshOpenPositions = async () => {
+    try {
+      const response = await fetch(`/api/account/open-positions?venue=${encodeURIComponent(globalVenue)}`, { cache: 'no-store' });
+      if (!response.ok) return;
+      const payload = await response.json();
+      renderOpenPositions(payload);
+    } catch (_err) {
+      // Keep last rendered state on transient polling failures.
+    }
+  };
+
+  window.setInterval(refreshOpenPositions, 15000);
 </script>
 {% endblock %}

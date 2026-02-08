@@ -18,8 +18,18 @@
 </section>
 
 <form class="filter-bar" method="get" action="/analytics">
+  <input type="hidden" name="venue" value="{{ venue }}" />
   <input type="hidden" name="tab" value="{{ tab }}" />
   <input type="hidden" name="symbol" id="symbolValue" value="{{ filters.symbols | join(',') }}" />
+  {% set session_options = [
+    {'key': 'asia', 'label': 'Asia', 'type': 'base'},
+    {'key': 'london', 'label': 'London', 'type': 'base'},
+    {'key': 'ny', 'label': 'NY', 'type': 'base'},
+    {'key': 'tokyo_london_overlap', 'label': 'Asia-London', 'type': 'overlap'},
+    {'key': 'london_ny_overlap', 'label': 'London-NY', 'type': 'overlap'},
+  ] %}
+  {% set exit_sessions = filters.exit_session if filters.exit_session != 'all' else [] %}
+  {% set exit_windows = filters.exit_window if filters.exit_window != 'all' else [] %}
   <label>
     <span>From</span>
     <input type="date" name="from" value="{{ filters['from'] or '' }}" />
@@ -49,6 +59,28 @@
       <option value="short" {% if filters.side == 'short' %}selected{% endif %}>Short</option>
     </select>
   </label>
+  <div class="symbol-picker">
+    <span>Session</span>
+    <input type="hidden" name="exit_session" id="sessionValue"
+      value="{% if exit_sessions %}{{ exit_sessions | join(',') }}{% endif %}" />
+    <input type="hidden" name="exit_window" id="sessionWindowValue"
+      value="{% if exit_windows %}{{ exit_windows | join(',') }}{% endif %}" />
+    <div class="symbol-wheel" id="sessionWheel">
+      <div class="symbol-wheel-current month-wheel-current" id="sessionWheelCurrent">Session</div>
+      <div class="symbol-wheel-list month-wheel-list" id="sessionWheelList" aria-hidden="true">
+        {% for option in session_options %}
+        <div class="symbol-wheel-item month-wheel-item
+          {% if option.type == 'base' and option.key in exit_sessions %}active{% endif %}
+          {% if option.type == 'overlap' and option.key in exit_windows %}active{% endif %}
+        "
+          data-session="{{ option.key }}"
+          data-kind="{{ option.type }}">
+          {{ option.label }}
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
   <label>
     <span>Outcome</span>
     <select name="outcome">
@@ -56,6 +88,46 @@
       <option value="win" {% if filters.outcome == 'win' %}selected{% endif %}>Wins</option>
       <option value="loss" {% if filters.outcome == 'loss' %}selected{% endif %}>Losses</option>
       <option value="breakeven" {% if filters.outcome == 'breakeven' %}selected{% endif %}>Breakeven</option>
+    </select>
+  </label>
+  <label>
+    <span>Strategy</span>
+    <select name="strategy">
+      <option value="all" {% if filters.strategy == 'all' %}selected{% endif %}>All</option>
+      {% for strategy in strategies %}
+      <option value="{{ strategy }}" {% if filters.strategy == strategy %}selected{% endif %}>
+        {{ strategy }}
+      </option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>
+    <span>Account</span>
+    <select name="account">
+      <option value="all" {% if filters.account == 'all' %}selected{% endif %}>All</option>
+      {% for account in accounts %}
+      <option value="{{ account.account_key }}" {% if filters.account == account.account_key %}selected{% endif %}>
+        {{ account.label or account.account_key }}
+      </option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>
+    <span>Normalization</span>
+    <select name="normalization">
+      <option value="usd" {% if normalization.mode == 'usd' %}selected{% endif %}>USD</option>
+      <option value="percent"
+        {% if normalization.mode == 'percent' %}selected{% endif %}
+        {% if not normalization.available.percent %}disabled{% endif %}
+      >
+        %
+      </option>
+      <option value="r"
+        {% if normalization.mode == 'r' %}selected{% endif %}
+        {% if not normalization.available.r %}disabled{% endif %}
+      >
+        R
+      </option>
     </select>
   </label>
   <div class="filter-actions">
@@ -66,41 +138,57 @@
 
 <nav class="analytics-tabs">
   {% set base = query_base %}
-  <a class="{% if tab == 'overview' %}active{% endif %}" href="/analytics?tab=overview{% if base %}&{{ base }}{% endif %}">Overview</a>
-  <a class="{% if tab == 'diagnostics' %}active{% endif %}" href="/analytics?tab=diagnostics{% if base %}&{{ base }}{% endif %}">Diagnostics</a>
-  <a class="{% if tab == 'edge' %}active{% endif %}" href="/analytics?tab=edge{% if base %}&{{ base }}{% endif %}">Edge</a>
-  <a class="{% if tab == 'time' %}active{% endif %}" href="/analytics?tab=time{% if base %}&{{ base }}{% endif %}">Time</a>
-  <a class="{% if tab == 'trades' %}active{% endif %}" href="/analytics?tab=trades{% if base %}&{{ base }}{% endif %}">Trades</a>
+  <a class="{% if tab == 'overview' %}active{% endif %}" href="/analytics?venue={{ venue }}&tab=overview{% if base %}&{{ base }}{% endif %}">Overview</a>
+  <a class="{% if tab == 'diagnostics' %}active{% endif %}" href="/analytics?venue={{ venue }}&tab=diagnostics{% if base %}&{{ base }}{% endif %}">Diagnostics</a>
+  <a class="{% if tab == 'edge' %}active{% endif %}" href="/analytics?venue={{ venue }}&tab=edge{% if base %}&{{ base }}{% endif %}">Edge</a>
+  <a class="{% if tab == 'time' %}active{% endif %}" href="/analytics?venue={{ venue }}&tab=time{% if base %}&{{ base }}{% endif %}">Time</a>
+  <a class="{% if tab == 'trades' %}active{% endif %}" href="/analytics?venue={{ venue }}&tab=trades{% if base %}&{{ base }}{% endif %}">Trades</a>
   <div class="analytics-tabs-note">Phase 1 · USD only</div>
 </nav>
 
 {% if tab == 'overview' %}
+<div class="comparison-bar">
+  <div>
+    <div class="comparison-label">Compare to</div>
+  </div>
+  <select id="comparisonSelect">
+    <option value="all_trades">All Trades</option>
+    <option value="previous_period">Previous Period</option>
+    <option value="benchmark">BTC</option>
+  </select>
+  <div class="comparison-meta" id="comparisonMeta"></div>
+</div>
 <section class="metrics-grid">
   <div class="metric-card">
     <div class="metric-label">Net P&amp;L</div>
     <div class="metric-value {{ 'positive' if summary.total_net_pnl and summary.total_net_pnl >= 0 else 'negative' }}">
       {{ summary.total_net_pnl | money }}
     </div>
+    <div class="metric-delta" data-kpi="net_pnl" data-format="money"></div>
     <div class="metric-sub">Gross {{ summary.total_gross_pnl | money }}</div>
   </div>
   <div class="metric-card">
     <div class="metric-label">Win Rate</div>
     <div class="metric-value">{{ summary.win_rate | percent }}</div>
+    <div class="metric-delta" data-kpi="win_rate" data-format="ratio"></div>
     <div class="metric-sub">Wins {{ summary.wins }} / Losses {{ summary.losses }}</div>
   </div>
   <div class="metric-card">
     <div class="metric-label">Expectancy</div>
     <div class="metric-value">{{ summary.expectancy | money }}</div>
+    <div class="metric-delta" data-kpi="expectancy" data-format="money"></div>
     <div class="metric-sub">Payoff {{ summary.payoff_ratio | round(2) if summary.payoff_ratio is not none else 'n/a' }}</div>
   </div>
   <div class="metric-card">
     <div class="metric-label">Profit Factor</div>
     <div class="metric-value">{{ summary.profit_factor | round(2) if summary.profit_factor is not none else 'n/a' }}</div>
+    <div class="metric-delta" data-kpi="profit_factor" data-format="number"></div>
     <div class="metric-sub">Max DD {{ summary.max_drawdown | money }}</div>
   </div>
   <div class="metric-card">
     <div class="metric-label">Avg Win</div>
     <div class="metric-value">{{ summary.avg_win | money }}</div>
+    <div class="metric-delta" data-kpi="avg_win" data-format="money"></div>
     <div class="metric-sub">Avg Loss {{ summary.avg_loss | money }}</div>
   </div>
   <div class="metric-card">
@@ -108,6 +196,7 @@
     <div class="metric-value">
       {{ performance_score.score | round(1) if performance_score and performance_score.score is not none else 'n/a' }}
     </div>
+    <div class="metric-delta" data-kpi="performance_score" data-format="number"></div>
     <div class="metric-sub">Consistency {{ performance_score.raw.consistency | percent if performance_score else 'n/a' }}</div>
   </div>
 </section>
@@ -437,7 +526,7 @@
     <table class="table" id="analyticsTradesTable">
       <thead>
         <tr>
-          <th data-sort="exit">Date</th>
+          <th data-sort="exit">Exit</th>
           <th data-sort="symbol">Symbol</th>
           <th data-sort="side">Side</th>
           <th data-sort="size">Size</th>
@@ -469,10 +558,10 @@
             data-mae="{{ trade.mae or 0 }}"
             data-dte="{{ trade.etd or 0 }}"
             data-liq="{{ 1 if trade.liquidated else 0 }}"
-            data-url="/trades/{{ trade.ui_id }}"
+            data-url="/trades/{{ trade.ui_id }}?venue={{ venue }}"
             class="{{ 'trade-rekt' if trade.liquidated else '' }}"
           >
-            <td>{{ trade.exit_time | date_only }}</td>
+            <td>{{ trade.exit_time | timestamp }}</td>
             <td>{{ trade.symbol | replace('-USDT', '') }}</td>
             <td><span class="pill {{ trade.side | lower }}">{{ trade.side }}</span></td>
             <td>{{ trade.exit_size | round(4) }}</td>
@@ -505,20 +594,27 @@
   const scatterData = {{ scatter | default({}, true) | json | safe }};
   const timePerf = {{ time_performance | default({}, true) | json | safe }};
   const calendarData = {{ calendar | default({}, true) | json | safe }};
+  const comparisons = {{ comparisons | default({}, true) | json | safe }};
 
   const symbolValue = document.getElementById('symbolValue');
   const symbolWheel = document.getElementById('symbolWheel');
   const symbolWheelCurrent = document.getElementById('symbolWheelCurrent');
   const symbolWheelList = document.getElementById('symbolWheelList');
-  const symbolItems = Array.from(document.querySelectorAll('.symbol-wheel-item'));
+  const symbolItems = Array.from(document.querySelectorAll('#symbolWheelList .symbol-wheel-item'));
+  const sessionValue = document.getElementById('sessionValue');
+  const sessionWindowValue = document.getElementById('sessionWindowValue');
+  const sessionWheel = document.getElementById('sessionWheel');
+  const sessionWheelCurrent = document.getElementById('sessionWheelCurrent');
+  const sessionWheelList = document.getElementById('sessionWheelList');
+  const sessionItems = Array.from(document.querySelectorAll('#sessionWheelList .symbol-wheel-item'));
 
-  const syncSymbolWheelPosition = () => {
-    if (!symbolWheel || !symbolWheelCurrent || !symbolWheelList) return;
-    const wheelRect = symbolWheel.getBoundingClientRect();
-    const currentRect = symbolWheelCurrent.getBoundingClientRect();
+  const syncWheelPosition = (wheel, current, list) => {
+    if (!wheel || !current || !list) return;
+    const wheelRect = wheel.getBoundingClientRect();
+    const currentRect = current.getBoundingClientRect();
     const left = currentRect.left - wheelRect.left;
-    symbolWheelList.style.left = `${left}px`;
-    symbolWheelList.style.width = `${currentRect.width}px`;
+    list.style.left = `${left}px`;
+    list.style.width = `${currentRect.width}px`;
   };
 
   const updateSymbolValue = () => {
@@ -527,6 +623,25 @@
     symbolValue.value = selected.join(',');
     if (symbolWheelCurrent) {
       symbolWheelCurrent.textContent = selected.length ? `Symbols (${selected.length})` : 'Symbols (All)';
+    }
+  };
+
+  const updateSessionValue = () => {
+    if (!sessionValue) return;
+    const selected = sessionItems.filter(item => item.classList.contains('active'));
+    const baseSessions = selected
+      .filter(item => item.dataset.kind === 'base')
+      .map(item => item.dataset.session);
+    const overlapSessions = selected
+      .filter(item => item.dataset.kind === 'overlap')
+      .map(item => item.dataset.session);
+    sessionValue.value = baseSessions.join(',');
+    if (sessionWindowValue) {
+      sessionWindowValue.value = overlapSessions.join(',');
+    }
+    if (sessionWheelCurrent) {
+      const count = baseSessions.length + overlapSessions.length;
+      sessionWheelCurrent.textContent = count ? `Session (${count})` : 'Session (All)';
     }
   };
 
@@ -570,7 +685,7 @@
 
   const openSymbolWheel = () => {
     if (!symbolWheel || !symbolWheelList) return;
-    syncSymbolWheelPosition();
+    syncWheelPosition(symbolWheel, symbolWheelCurrent, symbolWheelList);
     symbolWheel.classList.add('open');
     symbolWheelList.setAttribute('aria-hidden', 'false');
     updateSymbolFocus();
@@ -622,11 +737,100 @@
 
     window.addEventListener('resize', () => {
       if (symbolWheel.classList.contains('open')) {
-        syncSymbolWheelPosition();
+        syncWheelPosition(symbolWheel, symbolWheelCurrent, symbolWheelList);
       }
     });
 
     updateSymbolValue();
+  }
+
+  const updateSessionFocus = () => {
+    if (!sessionWheelList) return;
+    const mid = sessionWheelList.scrollTop + sessionWheelList.clientHeight / 2;
+    let closest = sessionItems[0];
+    let closestDist = Infinity;
+    sessionItems.forEach(item => {
+      const itemMid = item.offsetTop + item.clientHeight / 2;
+      const dist = Math.abs(itemMid - mid);
+      if (dist < closestDist) {
+        closest = item;
+        closestDist = dist;
+      }
+    });
+    sessionItems.forEach(item => {
+      item.classList.remove('focus', 'near', 'far');
+    });
+    if (closest) {
+      closest.classList.add('focus');
+      const idx = sessionItems.indexOf(closest);
+      sessionItems.forEach((item, index) => {
+        if (item === closest) return;
+        const distance = Math.abs(index - idx);
+        if (distance === 1) item.classList.add('near');
+        if (distance >= 2) item.classList.add('far');
+      });
+    }
+  };
+
+  const openSessionWheel = () => {
+    if (!sessionWheel || !sessionWheelList) return;
+    syncWheelPosition(sessionWheel, sessionWheelCurrent, sessionWheelList);
+    sessionWheel.classList.add('open');
+    sessionWheelList.setAttribute('aria-hidden', 'false');
+    updateSessionFocus();
+  };
+
+  const closeSessionWheel = () => {
+    if (!sessionWheel || !sessionWheelList) return;
+    sessionWheel.classList.remove('open');
+    sessionWheelList.setAttribute('aria-hidden', 'true');
+  };
+
+  if (sessionWheelCurrent && sessionWheelList && sessionItems.length) {
+    sessionWheelCurrent.addEventListener('click', () => {
+      if (sessionWheel.classList.contains('open')) {
+        closeSessionWheel();
+      } else {
+        openSessionWheel();
+      }
+    });
+
+    sessionWheelCurrent.addEventListener('wheel', event => {
+      event.preventDefault();
+      if (!sessionWheel.classList.contains('open')) {
+        openSessionWheel();
+      }
+      sessionWheelList.scrollTop += event.deltaY;
+      wrapWheelScroll(sessionWheelList);
+      updateSessionFocus();
+    });
+
+    sessionWheelList.addEventListener('scroll', () => {
+      wrapWheelScroll(sessionWheelList);
+      updateSessionFocus();
+    });
+
+    sessionItems.forEach(item => {
+      item.addEventListener('click', event => {
+        event.stopPropagation();
+        item.classList.toggle('active');
+        updateSessionValue();
+      });
+    });
+
+    document.addEventListener('click', event => {
+      if (!sessionWheel.classList.contains('open')) return;
+      if (sessionWheel.contains(event.target)) return;
+      closeSessionWheel();
+    });
+
+    window.addEventListener('resize', () => {
+      if (sessionWheel.classList.contains('open')) {
+        syncWheelPosition(sessionWheel, sessionWheelCurrent, sessionWheelList);
+      }
+    });
+
+    updateSessionValue();
   }
 
   const clearButton = document.getElementById('filterClear');
@@ -635,6 +839,70 @@
       const tab = '{{ tab }}';
       window.location.href = `/analytics?tab=${tab}`;
     });
+  }
+
+  const comparisonSelect = document.getElementById('comparisonSelect');
+  const comparisonMeta = document.getElementById('comparisonMeta');
+  const updateComparison = () => {
+    if (!comparisonSelect) return;
+    const mode = comparisonSelect.value;
+    let deltas = {};
+    if (mode === 'previous_period') {
+      deltas = comparisons.previous_period?.delta || {};
+      if (comparisonMeta) {
+        const range = comparisons.previous_period?.range;
+        if (range && range.length === 2) {
+          const start = new Date(range[0]);
+          const end = new Date(range[1]);
+          if (!Number.isNaN(start.getTime()) && !Number.isNaN(end.getTime())) {
+            comparisonMeta.textContent = `${start.toISOString().slice(0, 10)} → ${end.toISOString().slice(0, 10)}`;
+          } else {
+            comparisonMeta.textContent = 'Previous period';
+          }
+        } else {
+          comparisonMeta.textContent = 'Previous period';
+        }
+      }
+    } else if (mode === 'benchmark') {
+      if (comparisonMeta) {
+        const value = comparisons.benchmark?.return;
+        comparisonMeta.textContent = value !== null && value !== undefined
+          ? `BTC ${formatRatioPercent(value)}`
+          : 'BTC n/a';
+      }
+    } else {
+      deltas = comparisons.all_trades?.delta || {};
+      if (comparisonMeta) {
+        comparisonMeta.textContent = 'All trades baseline';
+      }
+    }
+    document.querySelectorAll('.metric-delta').forEach(node => {
+      const key = node.dataset.kpi;
+      const format = node.dataset.format;
+      node.classList.remove('positive', 'negative');
+      if (mode === 'benchmark') {
+        const value = comparisons.benchmark?.return;
+        node.textContent = value !== null && value !== undefined
+          ? `BTC ${formatRatioPercent(value)}`
+          : 'BTC n/a';
+        if (typeof value === 'number') {
+          node.classList.toggle('positive', value > 0);
+          node.classList.toggle('negative', value < 0);
+        }
+        return;
+      }
+      const value = deltas ? deltas[key] : null;
+      node.textContent = formatDelta(value, format);
+      if (typeof value === 'number') {
+        node.classList.toggle('positive', value > 0);
+        node.classList.toggle('negative', value < 0);
+      }
+    });
+  };
+
+  if (comparisonSelect) {
+    comparisonSelect.addEventListener('change', updateComparison);
+    updateComparison();
   }
 
   const palette = {
@@ -656,6 +924,34 @@
     if (value === null || value === undefined || Number.isNaN(value)) return 'n/a';
     const numeric = Number(value);
     return `${numeric.toFixed(1)}%`;
+  };
+
+  const formatRatioPercent = (value) => {
+    if (value === null || value === undefined || Number.isNaN(value)) return 'n/a';
+    const numeric = Number(value) * 100;
+    return `${numeric.toFixed(1)}%`;
+  };
+
+  const formatNumber = (value) => {
+    if (value === null || value === undefined || Number.isNaN(value)) return 'n/a';
+    return Number(value).toFixed(2);
+  };
+
+  const formatDelta = (value, format) => {
+    if (value === null || value === undefined || Number.isNaN(value)) return 'n/a';
+    const numeric = Number(value);
+    const sign = numeric > 0 ? '+' : numeric < 0 ? '-' : '';
+    const absValue = Math.abs(numeric);
+    if (format === 'money') {
+      return `${sign}${formatMoney(absValue)}`;
+    }
+    if (format === 'ratio') {
+      return `${sign}${formatRatioPercent(absValue)}`;
+    }
+    if (format === 'percent') {
+      return `${sign}${formatPercent(absValue)}`;
+    }
+    return `${sign}${formatNumber(absValue)}`;
   };
 
   const formatMae = (value) => {
@@ -1241,7 +1537,9 @@
       const getValue = row => {
         const value = row.dataset[key] || '';
         if (key === 'exit') return new Date(value).getTime() || 0;
-        if (key === 'symbol' || key === 'side') return value.toLowerCase();
+        if (key === 'symbol' || key === 'side' || key === 'strategy' || key === 'account' || key === 'tags' || key === 'entry_session' || key === 'exit_session') {
+          return value.toLowerCase();
+        }
         if (key === 'liq') return Number(value) || 0;
         return Number(value) || 0;
       };

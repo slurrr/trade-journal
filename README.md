@@ -63,3 +63,7 @@ If you are contributing:
 - `.env` is for **secrets** only (API keys and passphrases). See `.env.example`.
 - General app settings live in `config/app.toml` (see `config/app.toml.example`).
 - Optional multi-account config lives in `config/accounts.toml` (see `config/accounts.toml.example`).
+
+## Usage Docs
+
+- Hyperliquid operator guide: `docs/how-to-hyperliquid.md`
