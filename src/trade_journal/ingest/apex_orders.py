@@ -12,6 +12,8 @@ from typing import Any, Iterable, Mapping
 class OrderRecord:
     order_id: str | None
     client_order_id: str | None
+    source: str
+    account_id: str | None
     symbol: str
     side: str
     size: float
@@ -36,28 +38,47 @@ class OrdersIngestResult:
     skipped: int = 0
 
 
-def load_orders(path: str | Path) -> OrdersIngestResult:
-    source = Path(path)
-    suffix = source.suffix.lower()
+def load_orders(
+    path: str | Path, *, source: str | None = None, account_id: str | None = None
+) -> OrdersIngestResult:
+    source_path = Path(path)
+    suffix = source_path.suffix.lower()
     if suffix == ".json":
-        return _load_orders_json(source)
+        return _load_orders_json(source_path, source_name=source, account_id=account_id)
     if suffix in {".csv", ".tsv"}:
-        return _load_orders_csv(source, delimiter="\t" if suffix == ".tsv" else ",")
-    raise ValueError(f"Unsupported file type: {source.suffix}")
+        return _load_orders_csv(
+            source_path,
+            delimiter="\t" if suffix == ".tsv" else ",",
+            source_name=source,
+            account_id=account_id,
+        )
+    raise ValueError(f"Unsupported file type: {source_path.suffix}")
 
 
-def _load_orders_json(path: Path) -> OrdersIngestResult:
-    with path.open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
+def load_orders_payload(
+    payload: Any, *, source: str | None = None, account_id: str | None = None
+) -> OrdersIngestResult:
     records = _extract_records(payload)
-    orders, skipped = _normalize_records(records)
+    orders, skipped = _normalize_records(records, source_name=source, account_id=account_id)
     return OrdersIngestResult(orders=orders, skipped=skipped)
 
 
-def _load_orders_csv(path: Path, delimiter: str) -> OrdersIngestResult:
+def _load_orders_json(
+    path: Path, *, source_name: str | None, account_id: str | None
+) -> OrdersIngestResult:
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    records = _extract_records(payload)
+    orders, skipped = _normalize_records(records, source_name=source_name, account_id=account_id)
+    return OrdersIngestResult(orders=orders, skipped=skipped)
+
+
+def _load_orders_csv(
+    path: Path, delimiter: str, *, source_name: str | None, account_id: str | None
+) -> OrdersIngestResult:
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter=delimiter)
-        orders, skipped = _normalize_records(reader)
+        orders, skipped = _normalize_records(reader, source_name=source_name, account_id=account_id)
     return OrdersIngestResult(orders=orders, skipped=skipped)
 
 
@@ -80,20 +101,28 @@ def _extract_records(payload: Any) -> Iterable[Mapping[str, Any]]:
     return []
 
 
-def _normalize_records(records: Iterable[Mapping[str, Any]]) -> tuple[list[OrderRecord], int]:
+def _normalize_records(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    source_name: str | None,
+    account_id: str | None,
+) -> tuple[list[OrderRecord], int]:
     orders: list[OrderRecord] = []
     skipped = 0
     for raw in records:
         try:
-            orders.append(_normalize_order(raw))
+            orders.append(_normalize_order(raw, source_name=source_name, account_id=account_id))
         except ValueError:
             skipped += 1
     return orders, skipped
 
 
-def _normalize_order(raw: Mapping[str, Any]) -> OrderRecord:
+def _normalize_order(
+    raw: Mapping[str, Any], *, source_name: str | None, account_id: str | None
+) -> OrderRecord:
     order_id = _pick(raw, "orderId", "id")
     client_order_id = _pick(raw, "clientOrderId", "clientId")
+    resolved_account = account_id or _pick(raw, "accountId", "account_id")
     symbol = _pick(raw, "symbol", "market")
     side = _normalize_side(_pick(raw, "side"))
     size = _to_float(_pick(raw, "size", "qty"))
@@ -110,12 +139,16 @@ def _normalize_order(raw: Mapping[str, Any]) -> OrderRecord:
     status = _pick(raw, "status")
     created_at = _parse_timestamp(_pick(raw, "createdAt", "created_at", "timestamp", "time"))
 
+    if size is None:
+        raise ValueError("Missing order size")
     if not symbol or not side:
         raise ValueError("Missing required order fields")
 
     return OrderRecord(
         order_id=str(order_id) if order_id is not None else None,
         client_order_id=str(client_order_id) if client_order_id is not None else None,
+        source=str(source_name or "apex"),
+        account_id=str(resolved_account) if resolved_account is not None else None,
         symbol=str(symbol),
         side=side,
         size=size,

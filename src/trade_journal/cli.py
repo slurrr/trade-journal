@@ -5,7 +5,8 @@ import os
 import sys
 from pathlib import Path
 
-from trade_journal.ingest.apex_api import load_dotenv
+from trade_journal.config.accounts import resolve_account_context, resolve_data_path
+from trade_journal.config.app_config import load_app_config
 from trade_journal.ingest.apex_funding import load_funding
 from trade_journal.ingest.apex_omni import load_fills
 from trade_journal.metrics.excursions import apply_trade_excursions
@@ -20,9 +21,10 @@ def main(argv: list[str] | None = None) -> int:
         "fills_path",
         type=Path,
         nargs="?",
-        default=Path("data/fills.json"),
+        default=None,
         help="Path to ApeX fills export (json/csv/tsv).",
     )
+    parser.add_argument("--account", type=str, default=None, help="Account name from accounts config.")
     parser.add_argument(
         "--utc",
         action="store_true",
@@ -39,11 +41,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Fetch price series and compute MAE/MFE/ETD for each trade.",
     )
-    parser.add_argument("--env", type=Path, default=Path(".env"), help="Path to .env file.")
     parser.add_argument("--out", type=Path, default=None, help="Write summary to a file instead of stdout.")
     args = parser.parse_args(argv)
 
-    result = load_fills(args.fills_path)
+    context = resolve_account_context(args.account, env=os.environ)
+    fills_path = args.fills_path or resolve_data_path(None, context, "fills.json")
+    if not fills_path.exists():
+        candidate = resolve_data_path(None, context, "fills.csv")
+        fills_path = candidate if candidate.exists() else fills_path
+
+    result = load_fills(fills_path, source=context.source, account_id=context.account_id)
     trades = reconstruct_trades(result.fills)
 
     if result.skipped:
@@ -51,12 +58,12 @@ def main(argv: list[str] | None = None) -> int:
 
     funding_path = args.funding
     if funding_path is None:
-        default_funding = Path("data/funding.json")
+        default_funding = resolve_data_path(None, context, "funding.json")
         if default_funding.exists():
             funding_path = default_funding
 
     if funding_path is not None:
-        funding_result = load_funding(funding_path)
+        funding_result = load_funding(funding_path, source=context.source, account_id=context.account_id)
         attributions = apply_funding_events(trades, funding_result.events)
         unmatched = sum(1 for item in attributions if item.matched_trade_id is None)
         if funding_result.skipped:
@@ -68,9 +75,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Unmatched funding events: {unmatched}.", file=sys.stderr)
 
     if args.prices:
-        env = dict(os.environ)
-        env.update(load_dotenv(args.env))
-        price_client = ApexPriceClient(PriceSeriesConfig.from_env(env))
+        app_config = load_app_config()
+        price_client = ApexPriceClient(PriceSeriesConfig.from_settings(app_config.pricing))
         for trade in trades:
             try:
                 bars = price_client.fetch_bars(trade.symbol, trade.entry_time, trade.exit_time)

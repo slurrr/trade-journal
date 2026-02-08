@@ -44,3 +44,6 @@ exports/
 
 # User-requested
 tests/
+reference/ui_examples/freshy
+reference/ui_examples/seasoned
+config/accounts.toml

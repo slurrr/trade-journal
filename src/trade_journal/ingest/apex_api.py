@@ -17,6 +17,7 @@ DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_FILLS_LIMIT = 100
 DEFAULT_RETRY_ATTEMPTS = 3
 DEFAULT_RETRY_BACKOFF_SECONDS = 0.75
+DEFAULT_EQUITY_ENDPOINT = "/v3/yesterday-pnl"
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,7 @@ class ApexApiConfig:
     api_key: str
     api_secret: str
     api_passphrase: str
+    equity_endpoint: str
     debug: bool
     timeout_seconds: float
     fills_limit: int
@@ -56,12 +58,14 @@ class ApexApiConfig:
         retry_backoff_seconds = _to_float(
             env.get("APEX_RETRY_BACKOFF_SECONDS"), default=DEFAULT_RETRY_BACKOFF_SECONDS
         )
+        equity_endpoint = env.get("APEX_EQUITY_ENDPOINT", DEFAULT_EQUITY_ENDPOINT).strip() or DEFAULT_EQUITY_ENDPOINT
 
         return cls(
             base_url=base_url,
             api_key=api_key,
             api_secret=api_secret,
             api_passphrase=api_passphrase,
+            equity_endpoint=equity_endpoint,
             debug=env.get("APEX_DEBUG", "").lower() in {"1", "true", "yes"},
             timeout_seconds=timeout_seconds,
             fills_limit=fills_limit,
@@ -144,6 +148,10 @@ class ApexApiClient:
 
     def fetch_account(self) -> Mapping[str, Any]:
         return self._request("GET", "/v3/account", params=None)
+
+    def fetch_equity_history(self) -> Mapping[str, Any]:
+        endpoint = self._config.equity_endpoint or DEFAULT_EQUITY_ENDPOINT
+        return self._request("GET", endpoint, params=None)
 
     def _request(self, method: str, path: str, params: Mapping[str, str] | None = None) -> Mapping[str, Any]:
         params = dict(params or {})

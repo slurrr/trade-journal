@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from trade_journal.config.accounts import resolve_account_context, resolve_data_path
 from trade_journal.ingest.apex_funding import load_funding
 from trade_journal.ingest.apex_omni import load_fills
 from trade_journal.ingest.apex_orders import load_orders
@@ -30,40 +31,44 @@ class VerifyConfig:
     funding_since: datetime | None
 
 
+POSITION_EPSILON = 1e-9
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run verification checks on trades and inputs.")
     parser.add_argument(
         "fills_path",
         type=Path,
         nargs="?",
-        default=Path("data/fills.json"),
+        default=None,
         help="Path to ApeX fills export (json/csv/tsv).",
     )
     parser.add_argument(
         "--historical-pnl",
         type=Path,
-        default=Path("data/historical_pnl.json"),
+        default=None,
         help="Historical PnL JSON path.",
     )
     parser.add_argument(
         "--funding",
         type=Path,
-        default=Path("data/funding.json"),
+        default=None,
         help="Optional funding export path.",
     )
     parser.add_argument(
         "--orders",
         type=Path,
-        default=Path("data/history_orders.json"),
+        default=None,
         help="Optional history orders export path.",
     )
     parser.add_argument(
         "--excursions",
         type=Path,
-        default=Path("data/excursions.json"),
+        default=None,
         help="Optional excursions cache path.",
     )
-    parser.add_argument("--out", type=Path, default=Path("data/verify_report.json"), help="Output file.")
+    parser.add_argument("--account", type=str, default=None, help="Account name from accounts config.")
+    parser.add_argument("--out", type=Path, default=None, help="Output file.")
     parser.add_argument("--strict", action="store_true", help="Exit non-zero if critical issues found.")
     parser.add_argument(
         "--funding-table",
@@ -120,17 +125,32 @@ def main(argv: list[str] | None = None) -> int:
         funding_since=_parse_datetime_arg(args.funding_since) if args.funding_since else None,
     )
 
+    context = resolve_account_context(args.account)
+    fills_path = args.fills_path or resolve_data_path(None, context, "fills.json")
+    if not fills_path.exists():
+        candidate = resolve_data_path(None, context, "fills.csv")
+        fills_path = candidate if candidate.exists() else fills_path
+
+    historical_pnl_path = args.historical_pnl or resolve_data_path(None, context, "historical_pnl.json")
+    funding_path = args.funding or resolve_data_path(None, context, "funding.json")
+    orders_path = args.orders or resolve_data_path(None, context, "history_orders.json")
+    excursions_path = args.excursions or resolve_data_path(None, context, "excursions.json")
+
     report = _run_checks(
-        fills_path=args.fills_path,
-        historical_pnl_path=args.historical_pnl,
-        funding_path=args.funding,
-        orders_path=args.orders,
-        excursions_path=args.excursions,
+        fills_path=fills_path,
+        historical_pnl_path=historical_pnl_path,
+        funding_path=funding_path,
+        orders_path=orders_path,
+        excursions_path=excursions_path,
         config=config,
+        context=context,
+        source=context.source,
+        account_id=context.account_id,
     )
 
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    out_path = args.out or resolve_data_path(None, context, "verify_report.json")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     _print_summary(report)
 
@@ -152,21 +172,29 @@ def _run_checks(
     orders_path: Path,
     excursions_path: Path,
     config: VerifyConfig,
+    context,
+    source: str,
+    account_id: str | None,
 ) -> dict[str, Any]:
-    ingest = load_fills(fills_path)
+    ingest = load_fills(fills_path, source=source, account_id=account_id)
     fills = ingest.fills
     trades = reconstruct_trades(fills)
 
     funding_unmatched: list[dict[str, Any]] = []
     funding_open_matches: list[dict[str, Any]] = []
-    open_positions = _load_open_positions()
+    unmatched_records: list[tuple[Any, dict[str, Any]]] = []
+    funding_drift: list[dict[str, Any]] = []
+    open_positions = _load_open_positions(context)
+    funding_since = config.funding_since
+    if funding_since is None and getattr(context, "funding_baseline", None):
+        funding_since = _parse_datetime_arg(context.funding_baseline)
     if funding_path.exists():
-        funding_result = load_funding(funding_path)
+        funding_result = load_funding(funding_path, source=source, account_id=account_id)
         attributions = apply_funding_events(trades, funding_result.events)
         for item in attributions:
             if item.matched_trade_id is None:
                 event = item.event
-                if config.funding_since and event.funding_time < config.funding_since:
+                if funding_since and event.funding_time < funding_since:
                     continue
                 open_match = _match_open_position(event, open_positions)
                 record = {
@@ -184,13 +212,27 @@ def _run_checks(
                     funding_open_matches.append(record)
                 else:
                     funding_unmatched.append(record)
+                    unmatched_records.append((event, record))
 
-    orders = load_orders(orders_path).orders if orders_path.exists() else []
+        if unmatched_records:
+            events = [event for event, _ in unmatched_records]
+            inferred_positions = _infer_positions_for_events(fills, events)
+            for (_, record), inferred in zip(unmatched_records, inferred_positions):
+                record["inferred_position"] = inferred
+            funding_drift = _detect_funding_drift(fills, events, inferred_positions)
+
+    orders = (
+        load_orders(orders_path, source=source, account_id=account_id).orders if orders_path.exists() else []
+    )
     excursions_map = _load_excursions(excursions_path) if excursions_path.exists() else {}
     if excursions_map:
         _apply_excursions_cache(trades, excursions_map)
 
-    historical_records = load_historical_pnl(historical_pnl_path) if historical_pnl_path.exists() else []
+    historical_records = (
+        load_historical_pnl(historical_pnl_path, source=source, account_id=account_id)
+        if historical_pnl_path.exists()
+        else []
+    )
     matches = match_trades(trades, historical_records, window_seconds=config.match_window_seconds)
 
     fill_issues = _check_fills(fills)
@@ -216,6 +258,7 @@ def _run_checks(
             "trades": len(trades),
             "critical": critical,
             "warning": warning,
+            "funding_since": funding_since.isoformat() if funding_since else None,
         },
         "fills": fill_issues,
         "trades": trade_issues,
@@ -226,6 +269,7 @@ def _run_checks(
         "tiny_trades": tiny_trades,
         "funding_unmatched": funding_unmatched,
         "funding_open_matches": funding_open_matches,
+        "funding_drift": funding_drift,
     }
 
 
@@ -503,6 +547,8 @@ def _print_summary(report: dict[str, Any]) -> None:
     print(f"trades {summary['trades']}")
     print(f"critical {summary['critical']}")
     print(f"warning {summary['warning']}")
+    if summary.get("funding_since"):
+        print(f"funding_since {summary['funding_since']}")
     print(f"fill_critical {len(report['fills']['critical'])}")
     print(f"fill_warning {len(report['fills']['warning'])}")
     print(f"trade_critical {len(report['trades']['critical'])}")
@@ -514,6 +560,7 @@ def _print_summary(report: dict[str, Any]) -> None:
     print(f"tiny_trades {len(report['tiny_trades'])}")
     print(f"funding_unmatched {len(report['funding_unmatched'])}")
     print(f"funding_open_matches {len(report['funding_open_matches'])}")
+    print(f"funding_drift {len(report.get('funding_drift', []))}")
 
 
 def _print_funding_table(items: list[dict[str, Any]]) -> None:
@@ -524,21 +571,31 @@ def _print_funding_table(items: list[dict[str, Any]]) -> None:
 
 
 def _format_funding_table(items: list[dict[str, Any]]) -> str:
+    include_inferred = any("inferred_position" in item for item in items)
     headers = ["time", "symbol", "side", "size", "funding", "context"]
+    if include_inferred:
+        headers += ["inferred_size", "inferred_side", "size_diff", "side_match"]
     rows = []
     for item in items:
         context = item.get("context") or {}
         status = context.get("status", "")
-        rows.append(
-            [
-                item.get("funding_time", ""),
-                item.get("symbol", ""),
-                item.get("side", ""),
-                _format_float(item.get("position_size")),
-                _format_float(item.get("funding_value")),
-                status,
+        row = [
+            item.get("funding_time", ""),
+            item.get("symbol", ""),
+            item.get("side", ""),
+            _format_float(item.get("position_size")),
+            _format_float(item.get("funding_value")),
+            status,
+        ]
+        if include_inferred:
+            inferred = item.get("inferred_position") or {}
+            row += [
+                _format_float(inferred.get("size")),
+                inferred.get("side") or "",
+                _format_float(inferred.get("size_abs_diff")),
+                "yes" if inferred.get("side_match") else "no",
             ]
-        )
+        rows.append(row)
     widths = [len(h) for h in headers]
     for row in rows:
         for idx, cell in enumerate(row):
@@ -573,9 +630,9 @@ def _parse_datetime_arg(value: str) -> datetime:
     return parsed
 
 
-def _load_open_positions() -> list[dict[str, Any]]:
+def _load_open_positions(context) -> list[dict[str, Any]]:
     env_path = os.environ.get("TRADE_JOURNAL_ACCOUNT", "").strip()
-    path = Path(env_path) if env_path else Path("data/account.json")
+    path = Path(env_path) if env_path else resolve_data_path(None, context, "account.json")
     if not path.exists():
         return []
     try:
@@ -623,6 +680,124 @@ def _match_open_position(event, positions: list[dict[str, Any]]) -> dict[str, An
             "size": position["size"],
         }
     return None
+
+
+def _infer_positions_for_events(fills, events) -> list[dict[str, Any]]:
+    if not events:
+        return []
+    fills_by_symbol: dict[str, list[Any]] = {}
+    for fill in sorted(fills, key=_fill_sort_key):
+        fills_by_symbol.setdefault(fill.symbol, []).append(fill)
+
+    events_by_symbol: dict[str, list[tuple[int, Any]]] = {}
+    for idx, event in enumerate(events):
+        events_by_symbol.setdefault(event.symbol, []).append((idx, event))
+
+    results: list[dict[str, Any]] = [{} for _ in events]
+    for symbol, symbol_events in events_by_symbol.items():
+        symbol_fills = fills_by_symbol.get(symbol, [])
+        symbol_events.sort(key=lambda item: item[1].funding_time)
+        pos = 0.0
+        fill_idx = 0
+        for idx, event in symbol_events:
+            while fill_idx < len(symbol_fills):
+                fill = symbol_fills[fill_idx]
+                if fill.timestamp > event.funding_time:
+                    break
+                pos += fill.size if fill.side == "BUY" else -fill.size
+                fill_idx += 1
+            side = None
+            if pos > POSITION_EPSILON:
+                side = "LONG"
+            elif pos < -POSITION_EPSILON:
+                side = "SHORT"
+            inferred_size = abs(pos)
+            size_abs_diff = None
+            size_rel_diff = None
+            if event.position_size is not None:
+                size_abs_diff = inferred_size - event.position_size
+                if event.position_size:
+                    size_rel_diff = size_abs_diff / event.position_size
+            results[idx] = {
+                "signed_size": pos,
+                "size": inferred_size,
+                "side": side,
+                "size_abs_diff": size_abs_diff,
+                "size_rel_diff": size_rel_diff,
+                "side_match": side == event.side if side else False,
+            }
+    return results
+
+
+def _fill_sort_key(fill: Any) -> tuple:
+    tie = fill.fill_id or fill.order_id or ""
+    return (fill.timestamp, tie)
+
+
+def _detect_funding_drift(fills, events, inferred_positions) -> list[dict[str, Any]]:
+    if not events:
+        return []
+    fills_by_symbol: dict[str, list[Any]] = {}
+    for fill in sorted(fills, key=_fill_sort_key):
+        fills_by_symbol.setdefault(fill.symbol, []).append(fill)
+
+    drift_records: list[dict[str, Any]] = []
+    events_by_symbol: dict[str, list[tuple[int, Any, dict[str, Any]]]] = {}
+    for idx, (event, inferred) in enumerate(zip(events, inferred_positions)):
+        events_by_symbol.setdefault(event.symbol, []).append((idx, event, inferred))
+
+    for symbol, symbol_events in events_by_symbol.items():
+        symbol_fills = fills_by_symbol.get(symbol, [])
+        symbol_events.sort(key=lambda item: item[1].funding_time)
+        pos = 0.0
+        fill_idx = 0
+        for _, event, inferred in symbol_events:
+            while fill_idx < len(symbol_fills):
+                fill = symbol_fills[fill_idx]
+                if fill.timestamp > event.funding_time:
+                    break
+                pos += fill.size if fill.side == "BUY" else -fill.size
+                fill_idx += 1
+            if inferred.get("side") is None:
+                continue
+            if not inferred.get("side_match"):
+                continue
+            if inferred.get("size_abs_diff") is None:
+                continue
+            if abs(inferred["size_abs_diff"]) < POSITION_EPSILON:
+                continue
+            drift_records.append(
+                {
+                    "symbol": symbol,
+                    "funding_time": event.funding_time.isoformat(),
+                    "funding_side": event.side,
+                    "funding_position_size": event.position_size,
+                    "inferred_size": inferred.get("size"),
+                    "size_abs_diff": inferred.get("size_abs_diff"),
+                    "size_rel_diff": inferred.get("size_rel_diff"),
+                    "first_missing_fill_before": _fill_summary(
+                        symbol_fills[fill_idx - 1] if fill_idx - 1 >= 0 else None
+                    ),
+                    "next_fill_after": _fill_summary(
+                        symbol_fills[fill_idx] if fill_idx < len(symbol_fills) else None
+                    ),
+                }
+            )
+            break
+    return drift_records
+
+
+def _fill_summary(fill: Any | None) -> dict[str, Any] | None:
+    if fill is None:
+        return None
+    return {
+        "fill_id": fill.fill_id,
+        "order_id": fill.order_id,
+        "side": fill.side,
+        "size": fill.size,
+        "price": fill.price,
+        "timestamp": fill.timestamp.isoformat(),
+    }
 
 
 if __name__ == "__main__":

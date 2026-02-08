@@ -60,6 +60,6 @@ If you are contributing:
 
 ## Environment Notes
 
-- `.env` is for **secrets and machine-specific values** only (API keys, passphrases, base URLs).
-- `.env.example` documents all supported knobs and defaults.
-- Keep `.env` minimal so changes are easy to track and review.
+- `.env` is for **secrets** only (API keys and passphrases). See `.env.example`.
+- General app settings live in `config/app.toml` (see `config/app.toml.example`).
+- Optional multi-account config lives in `config/accounts.toml` (see `config/accounts.toml.example`).

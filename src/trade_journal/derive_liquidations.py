@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from trade_journal.config.accounts import resolve_account_context, resolve_data_path
 from trade_journal.ingest.apex_liquidations import LiquidationEvent, extract_liquidations
 from trade_journal.ingest.apex_omni import load_fills
 from trade_journal.ingest.apex_orders import load_orders
@@ -14,11 +15,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Derive liquidation events from fills and/or history orders."
     )
-    parser.add_argument("--fills", type=Path, default=Path("data/fills.json"), help="Fills JSON path.")
+    parser.add_argument("--fills", type=Path, default=None, help="Fills JSON path.")
     parser.add_argument(
         "--orders",
         type=Path,
-        default=Path("data/history_orders.json"),
+        default=None,
         help="History orders JSON path.",
     )
     parser.add_argument(
@@ -28,34 +29,43 @@ def main(argv: list[str] | None = None) -> int:
         help="Data sources to inspect.",
     )
     parser.add_argument("--raw", action="store_true", help="Write raw records instead of normalized events.")
-    parser.add_argument("--out", type=Path, default=Path("data/liquidations.json"), help="Output file.")
+    parser.add_argument("--account", type=str, default=None, help="Account name from accounts config.")
+    parser.add_argument("--out", type=Path, default=None, help="Output file.")
     args = parser.parse_args(argv)
 
+    context = resolve_account_context(args.account)
+    fills_path = args.fills or resolve_data_path(None, context, "fills.json")
+    if not fills_path.exists():
+        candidate = resolve_data_path(None, context, "fills.csv")
+        fills_path = candidate if candidate.exists() else fills_path
+    orders_path = args.orders or resolve_data_path(None, context, "history_orders.json")
+
     records: list[Mapping[str, Any]] = []
-    if args.source in {"fills", "both"} and args.fills.exists():
-        records.extend(_records_from_fills(args.fills))
-    if args.source in {"orders", "both"} and args.orders.exists():
-        records.extend(_records_from_orders(args.orders))
+    if args.source in {"fills", "both"} and fills_path.exists():
+        records.extend(_records_from_fills(fills_path, context))
+    if args.source in {"orders", "both"} and orders_path.exists():
+        records.extend(_records_from_orders(orders_path, context))
 
     candidates = _filter_liquidations(records)
     if args.raw:
         payload = json.dumps(candidates, indent=2, sort_keys=True)
     else:
-        result = extract_liquidations(candidates)
+        result = extract_liquidations(candidates, source=context.source, account_id=context.account_id)
         payload = json.dumps([_event_to_dict(event) for event in result.events], indent=2, sort_keys=True)
 
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(payload + "\n", encoding="utf-8")
+    out_path = args.out or resolve_data_path(None, context, "liquidations.json")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(payload + "\n", encoding="utf-8")
     return 0
 
 
-def _records_from_fills(path: Path) -> list[Mapping[str, Any]]:
-    ingest = load_fills(path)
+def _records_from_fills(path: Path, context) -> list[Mapping[str, Any]]:
+    ingest = load_fills(path, source=context.source, account_id=context.account_id)
     return [fill.raw for fill in ingest.fills]
 
 
-def _records_from_orders(path: Path) -> list[Mapping[str, Any]]:
-    ingest = load_orders(path)
+def _records_from_orders(path: Path, context) -> list[Mapping[str, Any]]:
+    ingest = load_orders(path, source=context.source, account_id=context.account_id)
     return [order.raw for order in ingest.orders]
 
 

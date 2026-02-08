@@ -16,7 +16,13 @@ class RiskSummary:
 
 
 def initial_stop_for_trade(trade: Trade, orders: Iterable[OrderRecord]) -> RiskSummary:
-    symbol_orders = [order for order in orders if order.symbol == trade.symbol]
+    symbol_orders = [
+        order
+        for order in orders
+        if order.symbol == trade.symbol
+        and order.source == trade.source
+        and order.account_id == trade.account_id
+    ]
     stop_price, size_with_stop, total_entry_size = _weighted_open_sl_stop(trade, symbol_orders)
     if stop_price is not None:
         size_for_risk = total_entry_size
@@ -79,6 +85,8 @@ def _stop_from_open_sl(order: OrderRecord) -> float | None:
     if not order.is_set_open_sl:
         return None
     price = order.open_sl_param.get("price") or order.open_sl_param.get("triggerPrice")
+    if price is None:
+        return None
     try:
         return float(price)
     except (TypeError, ValueError):

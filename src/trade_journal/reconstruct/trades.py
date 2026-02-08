@@ -2,14 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import hashlib
 from typing import Iterable
-from uuid import uuid4
 
 from trade_journal.models import Fill, Trade
 
 
 @dataclass
 class PositionState:
+    source: str
+    account_id: str | None
     symbol: str
     size: float = 0.0
     avg_entry_price: float = 0.0
@@ -31,16 +33,17 @@ EPSILON = 1e-9
 def reconstruct_trades(fills: Iterable[Fill]) -> list[Trade]:
     ordered = sorted(fills, key=_sort_key)
     # Assumes one-way position mode per symbol; hedge-mode would need separate buckets.
-    states: dict[str, PositionState] = {}
+    states: dict[tuple[str, str | None, str], PositionState] = {}
     trades: list[Trade] = []
 
     for fill in ordered:
         if fill.size == 0:
             continue
-        state = states.get(fill.symbol)
+        key = (fill.source, fill.account_id, fill.symbol)
+        state = states.get(key)
         if state is None:
-            state = PositionState(symbol=fill.symbol)
-            states[fill.symbol] = state
+            state = PositionState(source=fill.source, account_id=fill.account_id, symbol=fill.symbol)
+            states[key] = state
         _apply_fill_to_state(state, fill, trades)
 
     return trades
@@ -48,7 +51,7 @@ def reconstruct_trades(fills: Iterable[Fill]) -> list[Trade]:
 
 def _sort_key(fill: Fill) -> tuple:
     tie = fill.fill_id or fill.order_id or ""
-    return (fill.timestamp, tie)
+    return (fill.source, fill.account_id or "", fill.timestamp, tie)
 
 
 def _apply_fill_to_state(state: PositionState, fill: Fill, trades: list[Trade]) -> None:
@@ -146,8 +149,24 @@ def _finalize_trade(state: PositionState, exit_time: datetime, trades: list[Trad
         else state.avg_entry_price
     )
 
+    trade_id = _stable_trade_id(
+        source=state.source,
+        account_id=state.account_id,
+        symbol=state.symbol,
+        side=state.side,
+        entry_time=state.entry_time,
+        exit_time=exit_time,
+        entry_price=entry_price,
+        exit_price=exit_price,
+        entry_size=state.entry_qty_total,
+        exit_size=state.exit_qty_total,
+        realized_pnl=state.realized_pnl,
+    )
+
     trade = Trade(
-        trade_id=str(uuid4()),
+        trade_id=trade_id,
+        source=state.source,
+        account_id=state.account_id,
         symbol=state.symbol,
         side=state.side,
         entry_time=state.entry_time,
@@ -195,5 +214,38 @@ def _slice_fill(fill: Fill, size: float, fee: float, suffix: str, reason: str) -
         fee=fee,
         fee_asset=fill.fee_asset,
         timestamp=fill.timestamp,
+        source=fill.source,
+        account_id=fill.account_id,
         raw=raw,
     )
+
+
+def _stable_trade_id(
+    *,
+    source: str,
+    account_id: str | None,
+    symbol: str,
+    side: str,
+    entry_time: datetime,
+    exit_time: datetime,
+    entry_price: float,
+    exit_price: float,
+    entry_size: float,
+    exit_size: float,
+    realized_pnl: float,
+) -> str:
+    parts = [
+        source,
+        account_id or "",
+        symbol,
+        side,
+        entry_time.isoformat(),
+        exit_time.isoformat(),
+        f"{entry_price:.8f}",
+        f"{exit_price:.8f}",
+        f"{entry_size:.8f}",
+        f"{exit_size:.8f}",
+        f"{realized_pnl:.8f}",
+    ]
+    digest = hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()
+    return digest

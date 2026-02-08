@@ -13,7 +13,10 @@
 <section class="panel">
   <div class="trade-header">
     <div>
-      <div class="trade-title">{{ trade.symbol }} - {{ trade.side }}</div>
+      <div class="trade-title">
+        {{ trade.symbol }}
+        <span class="pill {{ trade.side | lower }}">{{ trade.side }}</span>
+      </div>
       <div class="trade-sub">{{ trade.entry_time | timestamp }} -> {{ trade.exit_time | timestamp }}</div>
     </div>
     <div class="trade-pnl {{ 'positive' if trade.realized_pnl_net >= 0 else 'negative' }}">{{ trade.realized_pnl_net | money }}</div>
@@ -61,22 +64,40 @@
   <div class="panel-header">
     <div>
       <h2>Excursion</h2>
-      <p>MAE, MFE, and ETD for this trade.</p>
     </div>
   </div>
   <div class="excursion-grid">
-    <div class="excursion-card negative">
-      <div class="stat-label">MAE</div>
-      <div class="stat-value">{{ trade.mae | money }}</div>
-    </div>
     <div class="excursion-card positive">
       <div class="stat-label">MFE</div>
       <div class="stat-value">{{ trade.mfe | money }}</div>
+    </div>
+    <div class="excursion-card negative">
+      <div class="stat-label">MAE</div>
+      <div class="stat-value">{{ trade.mae | money }}</div>
     </div>
     <div class="excursion-card neutral">
       <div class="stat-label">ETD</div>
       <div class="stat-value">{{ trade.etd | money }}</div>
     </div>
+  </div>
+</section>
+
+<section class="chart-grid trade-series-grid">
+  <div class="panel">
+    <div class="panel-header">
+      <div>
+        <h2>Per-Unit Unrealized P&amp;L</h2>
+      </div>
+    </div>
+    <canvas id="unrealizedChart" height="200"></canvas>
+  </div>
+  <div class="panel">
+    <div class="panel-header">
+      <div>
+        <h2>Price History</h2>
+      </div>
+    </div>
+    <canvas id="priceChart" height="200"></canvas>
   </div>
 </section>
 
@@ -116,5 +137,295 @@
 <section class="panel">
   <div class="empty">Trade not found. Try selecting from the trades list.</div>
 </section>
+{% endif %}
+{% if trade %}
+<script>
+  const tradeSeriesId = "{{ trade.ui_id }}";
+  const unrealizedCanvas = document.getElementById('unrealizedChart');
+  const priceCanvas = document.getElementById('priceChart');
+
+  const enableDragPan = (chart, canvas) => {
+    if (!chart || !canvas || typeof chart.pan !== 'function') {
+      return;
+    }
+    let dragging = false;
+    let lastX = 0;
+    const onDown = event => {
+      dragging = true;
+      lastX = event.clientX;
+      canvas.classList.add('is-panning');
+    };
+    const onUp = () => {
+      dragging = false;
+      canvas.classList.remove('is-panning');
+    };
+    const onMove = event => {
+      if (!dragging) return;
+      const deltaX = event.clientX - lastX;
+      lastX = event.clientX;
+      chart.pan({ x: deltaX, y: 0 });
+    };
+    canvas.addEventListener('pointerdown', onDown);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointerleave', onUp);
+    window.addEventListener('pointermove', onMove);
+  };
+
+  const buildChart = async () => {
+    if (!tradeSeriesId || !unrealizedCanvas || !priceCanvas) return;
+    try {
+      const response = await fetch(`/api/trades/${tradeSeriesId}/series`);
+      if (!response.ok) return;
+      const payload = await response.json();
+      const series = payload.series || [];
+      if (!series.length) return;
+
+      const posColor = 'rgba(26, 118, 90, 0.9)';
+      const negColor = 'rgba(176, 59, 40, 0.9)';
+      const direction = '{{ trade.side }}'.toLowerCase() === 'short' ? -1 : 1;
+      const entryPrice = Number('{{ trade.entry_price }}');
+      const exitPrice = Number('{{ trade.exit_price }}');
+      const guideColor = document.documentElement.dataset.theme === 'dark'
+        ? 'rgba(138, 125, 115, 0.45)'
+        : 'rgba(122, 111, 98, 0.45)';
+
+      const pnlPoints = series.map(point => ({
+        x: point.t,
+        y: point.per_unit_unrealized ?? null,
+      }));
+      const pricePoints = series.map(point => {
+        const entryReturn = point.entry_return ?? null;
+        const denom = entryReturn !== null ? (1 + entryReturn * direction) : null;
+        const entryPrice = denom && denom !== 0 ? point.close / denom : null;
+        return {
+          x: point.t,
+          y: point.close,
+          r: entryReturn,
+          entry: entryPrice,
+          high: point.high,
+          low: point.low,
+        };
+      });
+      const pnlLinePoints = pnlPoints.map(point => ({ ...point }));
+      if (pnlLinePoints.length) {
+        pnlLinePoints[0].y = 0;
+        if (Number.isFinite(entryPrice) && Number.isFinite(exitPrice)) {
+          pnlLinePoints[pnlLinePoints.length - 1].y = (exitPrice - entryPrice) * direction;
+        }
+      }
+      const priceLinePoints = pricePoints.map(point => ({ ...point }));
+      if (priceLinePoints.length) {
+        if (Number.isFinite(entryPrice)) {
+          priceLinePoints[0].y = entryPrice;
+        }
+        if (Number.isFinite(exitPrice)) {
+          priceLinePoints[priceLinePoints.length - 1].y = exitPrice;
+        }
+      }
+      const pnlHighPoints = pricePoints.map(point => ({
+        x: point.x,
+        y: point.entry === null || point.entry === undefined ? null : (point.high - point.entry) * direction,
+      }));
+      const pnlLowPoints = pricePoints.map(point => ({
+        x: point.x,
+        y: point.entry === null || point.entry === undefined ? null : (point.low - point.entry) * direction,
+      }));
+
+      const isAboveEntry = (price, entry) => {
+        if (entry === null || entry === undefined) return true;
+        return direction === 1 ? price >= entry : price <= entry;
+      };
+
+      const priceAbove = pricePoints.map(point => ({
+        x: point.x,
+        y: point.entry === null || point.entry === undefined ? null : (isAboveEntry(point.y, point.entry) ? point.y : null),
+      }));
+      const priceBelow = pricePoints.map(point => ({
+        x: point.x,
+        y: point.entry === null || point.entry === undefined ? null : (!isAboveEntry(point.y, point.entry) ? point.y : null),
+      }));
+
+      const sharedOptions = {
+        responsive: true,
+      interaction: {
+        mode: 'index',
+        intersect: false,
+      },
+      events: ['mousemove', 'mouseout', 'click', 'touchstart', 'touchmove', 'mousedown', 'mouseup'],
+      scales: {
+        x: {
+          type: 'time',
+          time: {
+            displayFormats: {
+              month: 'MMM yyyy',
+              week: 'MMM d',
+              day: 'MMM d',
+              hour: 'MMM d, h a',
+            },
+          },
+          ticks: {
+            autoSkip: true,
+            autoSkipPadding: 18,
+            maxTicksLimit: 7,
+            maxRotation: 0,
+          },
+          grid: { display: false },
+        },
+        y: { grid: { color: 'rgba(0,0,0,0.06)' } },
+      },
+      plugins: {
+        legend: { display: false },
+        tooltip: { enabled: false },
+        zoom: {
+          zoom: {
+            wheel: { enabled: true },
+            pinch: { enabled: true },
+            mode: 'x',
+          },
+          pan: {
+            enabled: true,
+            mode: 'x',
+            threshold: 2,
+            modifierKey: null,
+          },
+        },
+      },
+    };
+
+    const unrealizedChart = new Chart(unrealizedCanvas, {
+      type: 'line',
+      data: {
+        datasets: [{
+          data: pnlLinePoints,
+          borderColor: posColor,
+          backgroundColor: 'rgba(26, 118, 90, 0.15)',
+          tension: 0.25,
+          fill: true,
+          spanGaps: false,
+          pointRadius: 2,
+          pointBackgroundColor: ctx => {
+            const value = ctx.parsed.y;
+            if (value === null || value === undefined) return 'transparent';
+            return value >= 0 ? posColor : negColor;
+          },
+          pointBorderColor: ctx => {
+            const value = ctx.parsed.y;
+            if (value === null || value === undefined) return 'transparent';
+            return value >= 0 ? posColor : negColor;
+          },
+          segment: {
+            borderColor: ctx => {
+              const value = ctx.p1.parsed.y;
+              return value >= 0 ? posColor : negColor;
+            },
+            backgroundColor: ctx => {
+              const value = ctx.p1.parsed.y;
+              return value >= 0 ? 'rgba(26, 118, 90, 0.15)' : 'rgba(176, 59, 40, 0.15)';
+            },
+          },
+        }, {
+          data: pnlHighPoints,
+          borderColor: 'rgba(26, 118, 90, 0.45)',
+          borderDash: [4, 4],
+          borderWidth: 1,
+          tension: 0.25,
+          fill: false,
+          spanGaps: false,
+          pointRadius: 0,
+        }, {
+          data: pnlLowPoints,
+          borderColor: 'rgba(176, 59, 40, 0.45)',
+          borderDash: [4, 4],
+          borderWidth: 1,
+          tension: 0.25,
+          fill: false,
+          spanGaps: false,
+          pointRadius: 0,
+          segment: {
+            borderColor: ctx => (ctx.p1.parsed.y ?? 0) >= 0
+              ? 'rgba(26, 118, 90, 0.45)'
+              : 'rgba(176, 59, 40, 0.45)',
+          },
+        }],
+      },
+      options: sharedOptions,
+    });
+      unrealizedCanvas.addEventListener('dblclick', () => unrealizedChart.resetZoom());
+      enableDragPan(unrealizedChart, unrealizedCanvas);
+
+    const priceChart = new Chart(priceCanvas, {
+      type: 'line',
+      data: {
+        datasets: [
+          {
+            data: priceAbove,
+            borderWidth: 0,
+            pointRadius: 0,
+            tension: 0.25,
+            fill: { target: 3 },
+            backgroundColor: 'rgba(26, 118, 90, 0.15)',
+            spanGaps: false,
+            order: 1,
+          },
+          {
+            data: priceBelow,
+            borderWidth: 0,
+            pointRadius: 0,
+            tension: 0.25,
+            fill: { target: 3 },
+            backgroundColor: 'rgba(176, 59, 40, 0.15)',
+            spanGaps: false,
+            order: 1,
+          },
+          {
+            data: priceLinePoints,
+            borderColor: posColor,
+            tension: 0.25,
+            fill: false,
+            spanGaps: false,
+            pointRadius: 2,
+            pointBackgroundColor: ctx => {
+              const entry = ctx.raw?.entry;
+              if (entry === null || entry === undefined) return posColor;
+              return isAboveEntry(ctx.parsed.y, entry) ? posColor : negColor;
+            },
+            pointBorderColor: ctx => {
+              const entry = ctx.raw?.entry;
+              if (entry === null || entry === undefined) return posColor;
+              return isAboveEntry(ctx.parsed.y, entry) ? posColor : negColor;
+            },
+            segment: {
+              borderColor: ctx => {
+                const entry = ctx.p1.raw?.entry;
+                if (entry === null || entry === undefined) return posColor;
+                return isAboveEntry(ctx.p1.parsed.y, entry) ? posColor : negColor;
+              },
+            },
+            order: 2,
+          },
+          {
+            data: pricePoints.map(point => ({ x: point.x, y: point.entry })),
+            borderColor: guideColor,
+            borderDash: [3, 5],
+            borderWidth: 1,
+            pointRadius: 0,
+            fill: false,
+            stepped: true,
+            spanGaps: false,
+            order: 0,
+          },
+        ],
+      },
+      options: sharedOptions,
+    });
+      priceCanvas.addEventListener('dblclick', () => priceChart.resetZoom());
+      enableDragPan(priceChart, priceCanvas);
+    } catch (error) {
+      console.error('Failed to load trade series', error);
+    }
+  };
+
+  buildChart();
+</script>
 {% endif %}
 {% endblock %}

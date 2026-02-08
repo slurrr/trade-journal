@@ -39,7 +39,7 @@
           <th data-sort="r">R</th>
           <th data-sort="mfe">MFE</th>
           <th data-sort="mae">MAE</th>
-          <th data-sort="dte">DTE</th>
+          <th data-sort="dte">ETD</th>
           <th data-sort="liq">REKT</th>
         </tr>
       </thead>
@@ -69,11 +69,11 @@
             <td><span class="pill {{ trade.side | lower }}">{{ trade.side }}</span></td>
             <td>{{ trade.exit_size | round(4) }}</td>
             <td>{{ (trade.entry_price * trade.entry_size) | money }}</td>
-            <td class="{{ 'positive' if trade.realized_pnl_net >= 0 else 'negative' }}">{{ trade.realized_pnl_net | money }}</td>
+            <td class="{{ 'positive' if trade.realized_pnl_net >= 0 else 'negative' }} pnl-positive">{{ trade.realized_pnl_net | money }}</td>
             <td>{{ trade.return_pct | percent }}</td>
             <td>{{ trade.duration_seconds | duration }}</td>
             <td>{{ trade.r_multiple | round(2) if trade.r_multiple is not none else 'n/a' }}</td>
-            <td>{{ trade.mfe | money }}</td>
+            <td class="{{ 'positive' if trade.mfe is not none and trade.mfe >= 0 else 'negative' }} mfe-positive">{{ trade.mfe | money }}</td>
             <td>{{ trade.mae | money }}</td>
             <td>{{ trade.etd | money }}</td>
             <td>{{ 'REKT' if trade.liquidated else '—' }}</td>

@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from trade_journal.config.accounts import resolve_account_context, resolve_data_path
 from trade_journal.ingest.apex_omni import load_fills
 from trade_journal.models import Trade
 from trade_journal.reconstruct.trades import reconstruct_trades
@@ -15,6 +16,8 @@ from trade_journal.reconstruct.trades import reconstruct_trades
 @dataclass(frozen=True)
 class PnlRecord:
     record_id: str | None
+    source: str
+    account_id: str | None
     symbol: str
     side: str
     size: float
@@ -29,22 +32,30 @@ def main(argv: list[str] | None = None) -> int:
         "fills_path",
         type=Path,
         nargs="?",
-        default=Path("data/fills.json"),
+        default=None,
         help="Path to fills JSON file.",
     )
     parser.add_argument(
         "historical_pnl_path",
         type=Path,
         nargs="?",
-        default=Path("data/historical_pnl.json"),
+        default=None,
         help="Path to historical PnL JSON file.",
     )
+    parser.add_argument("--account", type=str, default=None, help="Account name from accounts config.")
     parser.add_argument("--window-seconds", type=int, default=900, help="Match window for exit time.")
     args = parser.parse_args(argv)
 
-    fills = load_fills(args.fills_path).fills
+    context = resolve_account_context(args.account)
+    fills_path = args.fills_path or resolve_data_path(None, context, "fills.json")
+    if not fills_path.exists():
+        candidate = resolve_data_path(None, context, "fills.csv")
+        fills_path = candidate if candidate.exists() else fills_path
+    pnl_path = args.historical_pnl_path or resolve_data_path(None, context, "historical_pnl.json")
+
+    fills = load_fills(fills_path, source=context.source, account_id=context.account_id).fills
     trades = reconstruct_trades(fills)
-    pnl_records = load_historical_pnl(args.historical_pnl_path)
+    pnl_records = load_historical_pnl(pnl_path, source=context.source, account_id=context.account_id)
 
     matches = match_trades(trades, pnl_records, window_seconds=args.window_seconds)
 
@@ -71,10 +82,19 @@ class TradeMatch:
     record: PnlRecord
 
 
-def load_historical_pnl(path: Path) -> list[PnlRecord]:
+def load_historical_pnl(
+    path: Path, *, source: str | None = None, account_id: str | None = None
+) -> list[PnlRecord]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     records = _extract_records(payload)
-    return [_normalize_record(record) for record in records]
+    return [_normalize_record(record, source=source, account_id=account_id) for record in records]
+
+
+def load_historical_pnl_payload(
+    payload: Any, *, source: str | None = None, account_id: str | None = None
+) -> list[PnlRecord]:
+    records = _extract_records(payload)
+    return [_normalize_record(record, source=source, account_id=account_id) for record in records]
 
 
 def _extract_records(payload: Any) -> Iterable[dict[str, Any]]:
@@ -94,8 +114,11 @@ def _extract_records(payload: Any) -> Iterable[dict[str, Any]]:
     return []
 
 
-def _normalize_record(raw: dict[str, Any]) -> PnlRecord:
+def _normalize_record(
+    raw: dict[str, Any], *, source: str | None, account_id: str | None
+) -> PnlRecord:
     record_id = str(raw.get("id")) if raw.get("id") is not None else None
+    resolved_account = account_id or raw.get("accountId") or raw.get("account_id")
     symbol = str(raw.get("symbol"))
     side = "LONG" if str(raw.get("side", "")).upper() in {"LONG", "BUY"} else "SHORT"
     size = _to_float(raw.get("size"))
@@ -103,6 +126,8 @@ def _normalize_record(raw: dict[str, Any]) -> PnlRecord:
     total_pnl = _to_float(raw.get("totalPnl"))
     return PnlRecord(
         record_id=record_id,
+        source=source or "apex",
+        account_id=str(resolved_account) if resolved_account is not None else None,
         symbol=symbol,
         side=side,
         size=size,

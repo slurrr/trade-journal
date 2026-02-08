@@ -7,26 +7,33 @@ from pathlib import Path
 from datetime import datetime
 from typing import Any, Iterable
 
+from trade_journal.config.app_config import apply_api_settings, load_app_config
 from trade_journal.ingest.apex_api import ApexApiClient, ApexApiConfig, load_dotenv
 
 
 def main(argv: list[str] | None = None) -> int:
+    app_config = load_app_config()
     parser = argparse.ArgumentParser(description="Fetch ApeX Omni fills and print shape.")
     parser.add_argument("--limit", type=int, default=None, help="Number of fills per page.")
     parser.add_argument("--page", type=int, default=0, help="Page number (0-based).")
     parser.add_argument("--raw", action="store_true", help="Print raw JSON instead of summary.")
-    parser.add_argument("--env", type=Path, default=Path(".env"), help="Path to .env file.")
+    parser.add_argument("--env", type=Path, default=app_config.app.env_path, help="Path to .env file.")
     parser.add_argument("--base-url", type=str, default=None, help="Override APEX_BASE_URL.")
+    parser.add_argument("--account", type=str, default=None, help="Account name from accounts config.")
     parser.add_argument("--begin", type=str, default=None, help="Begin datetime (local) or epoch ms.")
     parser.add_argument("--end", type=str, default=None, help="End datetime (local) or epoch ms.")
     parser.add_argument("--all", action="store_true", help="Fetch all pages until empty.")
-    parser.add_argument("--max-pages", type=int, default=200, help="Maximum pages to fetch with --all.")
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=app_config.sync.max_pages,
+        help="Maximum pages to fetch with --all.",
+    )
     args = parser.parse_args(argv)
 
     env = dict(os.environ)
     env.update(load_dotenv(args.env))
-    if args.base_url:
-        env["APEX_BASE_URL"] = args.base_url
+    env = apply_api_settings(env, app_config, base_url_override=args.base_url)
     config = ApexApiConfig.from_env(env)
     client = ApexApiClient(config)
 

@@ -68,6 +68,22 @@ class PriceSeriesConfig:
             max_bars_per_request=max_bars_per_request,
         )
 
+    @classmethod
+    def from_settings(cls, settings) -> "PriceSeriesConfig":
+        return cls(
+            base_url=str(settings.base_url).rstrip("/"),
+            endpoint=str(settings.endpoint),
+            interval=str(settings.interval),
+            timeout_seconds=float(settings.timeout_seconds),
+            symbol_param=str(settings.param_symbol),
+            interval_param=str(settings.param_interval),
+            start_param=str(settings.param_start),
+            end_param=str(settings.param_end),
+            time_unit=str(settings.time_unit).lower(),
+            symbol_transform=str(settings.symbol_transform).lower(),
+            max_bars_per_request=int(settings.max_bars),
+        )
+
 
 class ApexPriceClient:
     def __init__(self, config: PriceSeriesConfig) -> None:

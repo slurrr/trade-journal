@@ -79,7 +79,7 @@ def compute_trade_metrics(trade: Trade) -> TradeMetrics:
     return TradeMetrics(
         trade_id=trade.trade_id,
         symbol=trade.symbol,
-        outcome=classify_outcome(net_pnl, entry_notional),
+        outcome=_resolve_outcome(trade, net_pnl, entry_notional),
         gross_pnl=trade.realized_pnl,
         net_pnl=net_pnl,
         entry_notional=entry_notional,
@@ -228,7 +228,7 @@ def _max_streaks(trades: Iterable[Trade]) -> tuple[int, int]:
 
     for trade in ordered:
         entry_notional = trade.entry_price * trade.entry_size
-        outcome = classify_outcome(trade.realized_pnl_net, entry_notional)
+        outcome = _resolve_outcome(trade, trade.realized_pnl_net, entry_notional)
         if outcome == OUTCOME_WIN:
             current_wins += 1
             current_losses = 0
@@ -242,6 +242,13 @@ def _max_streaks(trades: Iterable[Trade]) -> tuple[int, int]:
         max_losses = max(max_losses, current_losses)
 
     return max_wins, max_losses
+
+
+def _resolve_outcome(trade: Trade, net_pnl: float, entry_notional: float) -> Outcome:
+    override = getattr(trade, "outcome_override", None)
+    if override in {OUTCOME_WIN, OUTCOME_LOSS, OUTCOME_BREAKEVEN}:
+        return override
+    return classify_outcome(net_pnl, entry_notional)
 
 
 def _mean(values: list[float]) -> float | None:
@@ -294,7 +301,7 @@ def _extract_r_values(trades: list[Trade]) -> list[float]:
     return values
 
 
-def compute_time_performance(trades: Iterable[Trade]) -> dict[str, list[dict[str, float | int]]]:
+def compute_time_performance(trades: Iterable[Trade]) -> dict[str, list[dict[str, float | int | None]]]:
     hourly: dict[int, list[float]] = {}
     weekday: dict[int, list[float]] = {}
     for trade in trades:
@@ -412,11 +419,11 @@ def compute_performance_score(trades: Iterable[Trade], metrics: AggregateMetrics
     if total_weight == 0:
         overall = None
     else:
-        weighted_sum = sum(
-            component_scores[key] * weights[key]
-            for key in component_scores
-            if component_scores[key] is not None
-        )
+        weighted_sum = 0.0
+        for key, value in component_scores.items():
+            if value is None:
+                continue
+            weighted_sum += value * weights[key]
         overall = weighted_sum / total_weight
 
     return {

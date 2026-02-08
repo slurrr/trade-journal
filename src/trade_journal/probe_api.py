@@ -6,10 +6,12 @@ import os
 from pathlib import Path
 from typing import Any
 
+from trade_journal.config.app_config import apply_api_settings, load_app_config
 from trade_journal.ingest.apex_api import ApexApiClient, ApexApiConfig, load_dotenv
 
 
 def main(argv: list[str] | None = None) -> int:
+    app_config = load_app_config()
     parser = argparse.ArgumentParser(description="Probe ApeX Omni REST endpoints with signing.")
     parser.add_argument(
         "paths",
@@ -23,19 +25,18 @@ def main(argv: list[str] | None = None) -> int:
         default=[],
         help="Query/body param as key=value. Can be specified multiple times.",
     )
-    parser.add_argument("--env", type=Path, default=Path(".env"), help="Path to .env file.")
+    parser.add_argument("--env", type=Path, default=app_config.app.env_path, help="Path to .env file.")
     parser.add_argument("--base-url", type=str, default=None, help="Override APEX_BASE_URL.")
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
     parser.add_argument("--no-auth", action="store_true", help="Do not send API auth headers.")
     args = parser.parse_args(argv)
 
     if args.no_auth:
-        client = _PublicClient(args.base_url, args.env)
+        client = _PublicClient(args.base_url, args.env, app_config)
     else:
         env = dict(os.environ)
         env.update(load_dotenv(args.env))
-        if args.base_url:
-            env["APEX_BASE_URL"] = args.base_url
+        env = apply_api_settings(env, app_config, base_url_override=args.base_url)
         config = ApexApiConfig.from_env(env)
         client = ApexApiClient(config)
 
@@ -68,12 +69,8 @@ def _parse_params(raw_params: list[str]) -> dict[str, str]:
 
 
 class _PublicClient:
-    def __init__(self, base_url: str | None, env_path: Path) -> None:
-        env = dict(os.environ)
-        env.update(load_dotenv(env_path))
-        base = base_url or env.get("APEX_BASE_URL", "")
-        if not base:
-            raise ValueError("APEX_BASE_URL must be set for --no-auth.")
+    def __init__(self, base_url: str | None, env_path: Path, app_config) -> None:
+        base = base_url or app_config.api.base_url
         self._base_url = base.rstrip("/")
 
     def _request(self, method: str, path: str, params: dict[str, str] | None = None) -> Any:

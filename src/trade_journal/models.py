@@ -16,6 +16,8 @@ class Fill:
     fee: float
     fee_asset: str | None
     timestamp: datetime
+    source: str = "apex"
+    account_id: str | None = None
     raw: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -31,6 +33,8 @@ class FundingEvent:
     funding_time: datetime
     funding_value: float
     status: str | None
+    source: str = "apex"
+    account_id: str | None = None
     raw: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -48,7 +52,10 @@ class Trade:
     max_size: float
     realized_pnl: float
     fees: float
+    source: str = "apex"
+    account_id: str | None = None
     funding_fees: float = 0.0
+    equity_at_entry: float | None = None
     fills: list[Fill] = field(default_factory=list)
     mae: float | None = None
     mfe: float | None = None
@@ -57,3 +64,12 @@ class Trade:
     @property
     def realized_pnl_net(self) -> float:
         return self.realized_pnl - self.fees + self.funding_fees
+
+
+@dataclass
+class EquitySnapshot:
+    timestamp: datetime
+    total_value: float
+    source: str = "apex"
+    account_id: str | None = None
+    raw: Mapping[str, Any] = field(default_factory=dict)

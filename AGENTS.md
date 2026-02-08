@@ -93,9 +93,10 @@ Ask, or record it anyway (cheap to do).
 - All tooling must run inside the active `.venv`
 - Install the package in editable mode before development:
   - `pip install -e .`
-- Environment variables and defaults are documented in `.env.example`.
+- Environment variables for secrets are documented in `.env.example`.
   - Only update `.env.example` in code changes.
   - The user/developer is responsible for copying needed values into `.env`.
+- General (non-secret) app settings live in `config/app.toml` (see `config/app.toml.example`).
 
 Do not modify `sys.path` or bypass the environment.
 
@@ -107,3 +108,5 @@ All Python code MUST adhere to:
 - pyright (default settings unless overridden)
 
 Ruff + Pyright are hygiene only; no refactors requested
+
+Reference files are not required to pass ruff or pyright focus on src/ only
