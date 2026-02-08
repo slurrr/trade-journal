@@ -62,6 +62,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional ISO8601 UTC timestamp to override benchmark end.",
     )
     parser.add_argument(
+        "--benchmark-last-bars",
+        type=int,
+        default=None,
+        help="Convenience: backfill the last N 1m benchmark bars ending now (e.g. 5000).",
+    )
+    parser.add_argument(
         "--benchmark-only",
         action="store_true",
         help="Only backfill benchmark bars (skip Hyperliquid trade windows).",
@@ -116,7 +122,12 @@ def main(argv: list[str] | None = None) -> int:
         hl_merged_by_symbol = {symbol: _merge_windows(windows) for symbol, windows in hl_windows_by_symbol.items()}
         total_hl_windows = sum(len(windows) for windows in hl_merged_by_symbol.values())
 
-    benchmark_window = _resolve_benchmark_window(args.benchmark_start, args.benchmark_end, apex_trades)
+    benchmark_window = _resolve_benchmark_window(
+        args.benchmark_start,
+        args.benchmark_end,
+        args.benchmark_last_bars,
+        apex_trades,
+    )
     print(f"hyperliquid_trades {len(hl_trades)}")
     print(f"hyperliquid_symbols {len(hl_merged_by_symbol)}")
     print(f"hyperliquid_windows {total_hl_windows}")
@@ -183,8 +194,18 @@ def main(argv: list[str] | None = None) -> int:
 def _resolve_benchmark_window(
     start_iso: str | None,
     end_iso: str | None,
+    last_bars: int | None,
     apex_trades: Iterable,
 ) -> tuple[datetime, datetime] | None:
+    if last_bars is not None:
+        if start_iso or end_iso:
+            raise SystemExit("--benchmark-last-bars cannot be combined with --benchmark-start/--benchmark-end.")
+        bars = int(last_bars)
+        if bars <= 0:
+            raise SystemExit("--benchmark-last-bars must be a positive integer.")
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(minutes=bars)
+        return start, end
     if start_iso or end_iso:
         if not start_iso or not end_iso:
             raise SystemExit("--benchmark-start and --benchmark-end must be provided together.")

@@ -130,6 +130,9 @@ def init_db(conn: sqlite3.Connection) -> None:
             account_id TEXT,
             last_timestamp_ms INTEGER,
             last_id TEXT,
+            throttled_count INTEGER NOT NULL DEFAULT 0,
+            cap_detected INTEGER NOT NULL DEFAULT 0,
+            oldest_fill_ts INTEGER,
             last_success_at TEXT NOT NULL
         )
         """
@@ -276,6 +279,9 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "historical_pnl", "account_id", "TEXT")
     _ensure_column(conn, "sync_state", "source", "TEXT")
     _ensure_column(conn, "sync_state", "account_id", "TEXT")
+    _ensure_column(conn, "sync_state", "throttled_count", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "sync_state", "cap_detected", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "sync_state", "oldest_fill_ts", "INTEGER")
 
 
 def _migrate_accounts_table(conn: sqlite3.Connection) -> None:
@@ -441,7 +447,11 @@ def get_sync_state(
     conn: sqlite3.Connection, endpoint: str
 ) -> dict[str, object] | None:
     row = conn.execute(
-        "SELECT endpoint, source, account_id, last_timestamp_ms, last_id, last_success_at FROM sync_state WHERE endpoint = ?",
+        (
+            "SELECT endpoint, source, account_id, last_timestamp_ms, last_id, "
+            "throttled_count, cap_detected, oldest_fill_ts, last_success_at "
+            "FROM sync_state WHERE endpoint = ?"
+        ),
         (endpoint,),
     ).fetchone()
     if row is None:
@@ -456,19 +466,37 @@ def upsert_sync_state(
     account_id: str | None,
     last_timestamp_ms: int | None,
     last_id: str | None,
+    throttled_count: int = 0,
+    cap_detected: bool = False,
+    oldest_fill_ts: int | None = None,
 ) -> None:
     conn.execute(
         """
-        INSERT INTO sync_state (endpoint, source, account_id, last_timestamp_ms, last_id, last_success_at)
-        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        INSERT INTO sync_state (
+            endpoint, source, account_id, last_timestamp_ms, last_id,
+            throttled_count, cap_detected, oldest_fill_ts, last_success_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(endpoint) DO UPDATE SET
             source=excluded.source,
             account_id=excluded.account_id,
             last_timestamp_ms=excluded.last_timestamp_ms,
             last_id=excluded.last_id,
+            throttled_count=excluded.throttled_count,
+            cap_detected=excluded.cap_detected,
+            oldest_fill_ts=excluded.oldest_fill_ts,
             last_success_at=excluded.last_success_at
         """,
-        (endpoint, source, account_id, last_timestamp_ms, last_id),
+        (
+            endpoint,
+            source,
+            account_id,
+            last_timestamp_ms,
+            last_id,
+            int(throttled_count),
+            1 if cap_detected else 0,
+            oldest_fill_ts,
+        ),
     )
     conn.commit()
 

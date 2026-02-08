@@ -466,7 +466,8 @@ def load_sync_states(
         params.append(f"{endpoint_prefix}%")
     where_clause = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     query = (
-        "SELECT endpoint, source, account_id, last_timestamp_ms, last_id, last_success_at "
+        "SELECT endpoint, source, account_id, last_timestamp_ms, last_id, "
+        "throttled_count, cap_detected, oldest_fill_ts, last_success_at "
         f"FROM sync_state{where_clause} ORDER BY endpoint"
     )
     rows = conn.execute(query, params).fetchall()

@@ -28,6 +28,8 @@ Using one venue-scoped OHLC table for all price data keeps storage simpler, elim
 
 The OHLC table should include a place for optional fields (e.g. volume, trade_count, raw payload) without changing the primary key.
 
+Hyperliquid `candleSnapshot` appears to cap responses to the most recent ~5000 candles per request, which limits historical 1m backfills. For now, benchmark coverage is treated as “best effort” based on what is stored locally going forward; long-history benchmark backfill is deferred.
+
 ## Status
 
 Accepted – 2026-02-07

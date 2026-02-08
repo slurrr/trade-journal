@@ -12,6 +12,7 @@ from trade_journal import compute_excursions
 from trade_journal.ingest.hyperliquid import (
     load_hyperliquid_clearinghouse_state_payload,
     load_hyperliquid_fills_payload,
+    load_hyperliquid_funding_payload,
     load_hyperliquid_historical_orders_payload,
     load_hyperliquid_open_orders_payload,
 )
@@ -26,6 +27,7 @@ from trade_journal.metrics.excursions import PriceBar
 from trade_journal.pricing.hyperliquid_prices import HyperliquidPriceClient
 from trade_journal.reconcile import load_historical_pnl_payload
 from trade_journal.reconstruct.trades import reconstruct_trades
+from trade_journal.models import EquitySnapshot
 from trade_journal.storage import sqlite_reader
 from trade_journal.storage.sqlite_store import (
     connect,
@@ -46,6 +48,10 @@ from trade_journal.storage.sqlite_store import (
 _CANONICAL_TIMEFRAME = "1m"
 _CANONICAL_INTERVAL = timedelta(minutes=1)
 _BENCHMARK_SYMBOL = "BTC-USDC"
+_BENCHMARK_TRAILING_BARS = 5000
+_BENCHMARK_FALLBACK_TIMEFRAME = "5m"
+_EQUITY_MIN_SECONDS = 60
+_EQUITY_MIN_CHANGE_USD = 0.01
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -154,35 +160,15 @@ def sync_hyperliquid_benchmark_bars(
     env_path: Path,
     symbol: str,
 ) -> int:
-    conn = connect(db_path)
-    init_db(conn)
-    try:
-        fills = sqlite_reader.load_fills_all(conn)
-        apex_trades = reconstruct_trades([fill for fill in fills if fill.source == "apex"])
-        window = _benchmark_window_from_trades(apex_trades)
-        if window is None:
-            return 0
-        start, end = window
-        latest = _latest_bar_timestamp(
-            conn,
-            source="hyperliquid",
-            symbol=symbol,
-            timeframe=_CANONICAL_TIMEFRAME,
-        )
-    finally:
-        conn.close()
-
-    fetch_start = start
-    if latest is not None:
-        fetch_start = max(start, latest - (_CANONICAL_INTERVAL * 2))
-    if fetch_start >= end:
-        return 0
-
+    now = datetime.now(timezone.utc)
     env = dict(os.environ)
     env.update(load_dotenv(env_path))
     price_client = HyperliquidPriceClient(HyperliquidInfoConfig.from_env(env))
-    bars = price_client.fetch_bars(symbol, fetch_start, end)
-    rows = _bars_to_rows("hyperliquid", symbol, bars)
+    rows: list[dict[str, object]] = []
+    for timeframe in (_CANONICAL_TIMEFRAME, _BENCHMARK_FALLBACK_TIMEFRAME):
+        start, end = _trailing_window(now=now, timeframe=timeframe, bars=_BENCHMARK_TRAILING_BARS)
+        bars = price_client.fetch_bars(symbol, start, end, timeframe=timeframe)
+        rows.extend(_bars_to_rows("hyperliquid", symbol, bars, timeframe=timeframe))
 
     conn = connect(db_path)
     init_db(conn)
@@ -247,7 +233,7 @@ def sync_once(
                 overlap_ms=overlap_ms,
                 end_ms=end_ms,
                 dry_run=dry_run,
-                funding_enabled=_env_truthy(env.get("HYPERLIQUID_ENABLE_FUNDING")),
+                funding_enabled=True,
             )
         )
         return totals
@@ -498,7 +484,7 @@ def _sync_hyperliquid_once(
         end_ms=end_ms,
         dry_run=dry_run,
     )
-    totals["funding"] = _sync_hyperliquid_funding_scaffold(
+    totals["funding"] = _sync_hyperliquid_funding(
         conn,
         client,
         context,
@@ -511,6 +497,9 @@ def _sync_hyperliquid_once(
         conn, client, context, dry_run=dry_run
     )
     totals["account_snapshot"] = _sync_hyperliquid_account_snapshot(
+        conn, client, context, dry_run=dry_run
+    )
+    totals["equity_history"] = _sync_hyperliquid_equity_history(
         conn, client, context, dry_run=dry_run
     )
     return totals
@@ -528,6 +517,7 @@ def _sync_hyperliquid_fills(
 ) -> int:
     endpoint = _sync_key("fills", context)
     begin_ms = _resume_timestamp(conn, endpoint, overlap_ms)
+    throttled_before = client.throttled_total
     cursor_ms = begin_ms if begin_ms is not None else 0
     final_end_ms = int(end_ms) if end_ms is not None else int(datetime.now(timezone.utc).timestamp() * 1000)
     if final_end_ms <= cursor_ms:
@@ -594,6 +584,9 @@ def _sync_hyperliquid_fills(
             context.account_id,
             int(latest_ts.timestamp() * 1000),
             latest_fill_id,
+            throttled_count=(client.throttled_total - throttled_before),
+            cap_detected=bool(saw_cap),
+            oldest_fill_ts=_oldest_fill_timestamp_ms(conn, context),
         )
 
     if saw_cap and begin_ms is None and total_rows >= client.fills_recent_cap:
@@ -612,6 +605,7 @@ def _sync_hyperliquid_account_snapshot(
     *,
     dry_run: bool = False,
 ) -> int:
+    throttled_before = client.throttled_total
     payload = client.fetch_clearinghouse_state(context.account_id or "")
     snapshot = load_hyperliquid_clearinghouse_state_payload(
         payload, source=context.source, account_id=context.account_id
@@ -628,6 +622,9 @@ def _sync_hyperliquid_account_snapshot(
         context.account_id,
         _iso_to_ms(str(snapshot["timestamp"])),
         None,
+        throttled_count=(client.throttled_total - throttled_before),
+        cap_detected=False,
+        oldest_fill_ts=_oldest_fill_timestamp_ms(conn, context),
     )
     return count
 
@@ -640,6 +637,7 @@ def _sync_hyperliquid_orders(
     dry_run: bool = False,
 ) -> int:
     endpoint = _sync_key("orders", context)
+    throttled_before = client.throttled_total
     historical_records = client.fetch_historical_orders(context.account_id or "")
     hist = load_hyperliquid_historical_orders_payload(
         historical_records,
@@ -680,7 +678,16 @@ def _sync_hyperliquid_orders(
     if dry_run:
         return len(merged_orders)
     count = upsert_orders(conn, merged_orders)
-    _update_state(conn, endpoint, context, merged_orders, lambda item: item.created_at)
+    _update_state(
+        conn,
+        endpoint,
+        context,
+        merged_orders,
+        lambda item: item.created_at,
+        throttled_count=(client.throttled_total - throttled_before),
+        cap_detected=False,
+        oldest_fill_ts=_oldest_fill_timestamp_ms(conn, context),
+    )
     return count
 
 
@@ -733,6 +740,156 @@ def _extract_hl_order_status_rows(payload: Mapping[str, Any]) -> list[Mapping[st
     return rows
 
 
+def _sync_hyperliquid_funding(
+    conn,
+    client: HyperliquidInfoClient,
+    context,
+    *,
+    overlap_ms: int,
+    end_ms: int | None,
+    dry_run: bool,
+    enabled: bool,
+) -> int:
+    if not enabled:
+        return 0
+    endpoint = _sync_key("funding", context)
+    begin_ms = _resume_timestamp(conn, endpoint, overlap_ms)
+    cursor_ms = begin_ms if begin_ms is not None else 0
+    final_end_ms = int(end_ms) if end_ms is not None else int(datetime.now(timezone.utc).timestamp() * 1000)
+    if final_end_ms <= cursor_ms:
+        final_end_ms = cursor_ms + 1
+
+    throttled_before = client.throttled_total
+    total_rows = 0
+    latest_ts: datetime | None = None
+    latest_id: str | None = None
+    cap_detected = False
+    stall_count = 0
+
+    for page in range(5000):
+        rows = client.fetch_user_funding(
+            user=context.account_id or "",
+            start_ms=cursor_ms,
+            end_ms=final_end_ms,
+        )
+        if not rows:
+            break
+        result = load_hyperliquid_funding_payload(rows, source=context.source, account_id=context.account_id)
+        if result.events:
+            total_rows += len(result.events)
+            if not dry_run:
+                upsert_funding(conn, result.events)
+            newest = max(result.events, key=lambda item: item.funding_time)
+            if latest_ts is None or newest.funding_time > latest_ts:
+                latest_ts = newest.funding_time
+                latest_id = newest.funding_id
+        cap_hit = len(rows) >= client.funding_page_limit
+        if not cap_hit:
+            break
+        cap_detected = True
+        next_cursor = _max_record_timestamp_ms(rows, "time")
+        if next_cursor is None:
+            break
+        next_cursor += 1
+        if next_cursor <= cursor_ms:
+            stall_count += 1
+            if stall_count >= 2:
+                break
+        else:
+            stall_count = 0
+        cursor_ms = next_cursor
+        if cursor_ms >= final_end_ms:
+            break
+        if page >= 5000:
+            break
+
+    if latest_ts is not None and not dry_run:
+        upsert_sync_state(
+            conn,
+            endpoint,
+            context.source,
+            context.account_id,
+            int(latest_ts.timestamp() * 1000),
+            latest_id,
+            throttled_count=(client.throttled_total - throttled_before),
+            cap_detected=cap_detected,
+            oldest_fill_ts=_oldest_fill_timestamp_ms(conn, context),
+        )
+    return total_rows
+
+
+def _sync_hyperliquid_equity_history(
+    conn,
+    client: HyperliquidInfoClient,
+    context,
+    *,
+    dry_run: bool = False,
+) -> int:
+    throttled_before = client.throttled_total
+    payload = client.fetch_clearinghouse_state(context.account_id or "")
+    snapshot = load_hyperliquid_clearinghouse_state_payload(
+        payload,
+        source=context.source,
+        account_id=context.account_id,
+    )
+    if snapshot is None:
+        return 0
+    timestamp_text = snapshot.get("timestamp")
+    total_equity = snapshot.get("total_equity")
+    if not isinstance(timestamp_text, str) or total_equity is None:
+        return 0
+    ts = datetime.fromisoformat(timestamp_text)
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    current = float(total_equity)
+    previous = conn.execute(
+        """
+        SELECT timestamp, total_value
+        FROM account_equity
+        WHERE source = ? AND account_id = ?
+        ORDER BY timestamp DESC
+        LIMIT 1
+        """,
+        (context.source, context.account_id),
+    ).fetchone()
+    should_write = previous is None
+    if previous is not None:
+        prev_ts = datetime.fromisoformat(str(previous["timestamp"]))
+        if prev_ts.tzinfo is None:
+            prev_ts = prev_ts.replace(tzinfo=timezone.utc)
+        prev_val = float(previous["total_value"])
+        delta_seconds = (ts - prev_ts).total_seconds()
+        should_write = delta_seconds >= _EQUITY_MIN_SECONDS and abs(current - prev_val) >= _EQUITY_MIN_CHANGE_USD
+    if not should_write:
+        return 0
+    if dry_run:
+        return 1
+    rows = upsert_account_equity(
+        conn,
+        [
+            EquitySnapshot(
+                timestamp=ts,
+                total_value=current,
+                source=context.source,
+                account_id=context.account_id,
+                raw={"from": "clearinghouseState", "snapshot": snapshot.get("raw_json")},
+            )
+        ],
+    )
+    upsert_sync_state(
+        conn,
+        _sync_key("equity_history", context),
+        context.source,
+        context.account_id,
+        int(ts.timestamp() * 1000),
+        None,
+        throttled_count=(client.throttled_total - throttled_before),
+        cap_detected=False,
+        oldest_fill_ts=_oldest_fill_timestamp_ms(conn, context),
+    )
+    return rows
+
+
 def _sync_hyperliquid_funding_scaffold(
     conn,
     client: HyperliquidInfoClient,
@@ -743,12 +900,14 @@ def _sync_hyperliquid_funding_scaffold(
     dry_run: bool,
     enabled: bool,
 ) -> int:
-    del conn, client, context, overlap_ms, end_ms, dry_run
-    if not enabled:
-        return 0
-    raise NotImplementedError(
-        "Hyperliquid funding ingestion is not implemented yet. "
-        "Set HYPERLIQUID_ENABLE_FUNDING=false (or unset) to keep funding deferred."
+    return _sync_hyperliquid_funding(
+        conn,
+        client,
+        context,
+        overlap_ms=overlap_ms,
+        end_ms=end_ms,
+        dry_run=dry_run,
+        enabled=enabled,
     )
 
 
@@ -774,7 +933,17 @@ def _resume_timestamp(conn, endpoint: str, overlap_ms: int) -> int | None:
     return max(0, last_ms_int - overlap_ms)
 
 
-def _update_state(conn, endpoint: str, context, items: Iterable[Any], get_time: Callable[[Any], datetime]) -> None:
+def _update_state(
+    conn,
+    endpoint: str,
+    context,
+    items: Iterable[Any],
+    get_time: Callable[[Any], datetime],
+    *,
+    throttled_count: int = 0,
+    cap_detected: bool = False,
+    oldest_fill_ts: int | None = None,
+) -> None:
     latest = _max_timestamp(items, get_time)
     if latest is None:
         return
@@ -785,6 +954,9 @@ def _update_state(conn, endpoint: str, context, items: Iterable[Any], get_time: 
         context.account_id,
         int(latest.timestamp() * 1000),
         None,
+        throttled_count=throttled_count,
+        cap_detected=cap_detected,
+        oldest_fill_ts=oldest_fill_ts,
     )
 
 
@@ -963,7 +1135,13 @@ def _latest_bar_timestamp(
     return _ensure_utc(parsed)
 
 
-def _bars_to_rows(source: str, symbol: str, bars: list[PriceBar]) -> list[dict[str, object]]:
+def _bars_to_rows(
+    source: str,
+    symbol: str,
+    bars: list[PriceBar],
+    *,
+    timeframe: str = _CANONICAL_TIMEFRAME,
+) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for bar in bars:
         start = _ensure_utc(bar.start_time)
@@ -971,7 +1149,7 @@ def _bars_to_rows(source: str, symbol: str, bars: list[PriceBar]) -> list[dict[s
             {
                 "source": source,
                 "symbol": symbol,
-                "timeframe": _CANONICAL_TIMEFRAME,
+                "timeframe": timeframe,
                 "timestamp": start.isoformat(),
                 "open": bar.open,
                 "high": bar.high,
@@ -983,6 +1161,56 @@ def _bars_to_rows(source: str, symbol: str, bars: list[PriceBar]) -> list[dict[s
             }
         )
     return rows
+
+
+def _trailing_window(
+    *,
+    now: datetime,
+    timeframe: str,
+    bars: int,
+) -> tuple[datetime, datetime]:
+    step = _timeframe_to_delta(timeframe)
+    aligned_end = _floor_dt(now, step)
+    aligned_start = aligned_end - (step * int(max(1, bars)))
+    return aligned_start, aligned_end
+
+
+def _timeframe_to_delta(timeframe: str) -> timedelta:
+    text = str(timeframe).strip().lower()
+    if text.endswith("m"):
+        return timedelta(minutes=int(text[:-1] or "1"))
+    raise ValueError(f"Unsupported timeframe: {timeframe}")
+
+
+def _floor_dt(value: datetime, step: timedelta) -> datetime:
+    utc = _ensure_utc(value)
+    step_seconds = int(step.total_seconds())
+    if step_seconds <= 0:
+        return utc
+    epoch = int(utc.timestamp())
+    floored = epoch - (epoch % step_seconds)
+    return datetime.fromtimestamp(floored, tz=timezone.utc)
+
+
+def _oldest_fill_timestamp_ms(conn, context) -> int | None:
+    row = conn.execute(
+        """
+        SELECT MIN(timestamp)
+        FROM fills
+        WHERE source = ? AND account_id = ?
+        """,
+        (context.source, context.account_id),
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    text = str(row[0])
+    try:
+        ts = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return int(ts.timestamp() * 1000)
 
 
 def _ensure_utc(value: datetime) -> datetime:

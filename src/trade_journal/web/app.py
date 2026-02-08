@@ -465,6 +465,8 @@ def sync_state_api(request: Request) -> dict[str, Any]:
         )
     finally:
         conn.close()
+    for row in rows:
+        row["cap_detected"] = bool(row.get("cap_detected"))
     return {
         "source": source,
         "account_id": account_id,
@@ -701,6 +703,8 @@ def _load_journal_state_db(context, db_path: Path, *, venue: str) -> dict[str, A
         data_note = "No fills found in database."
     if unmatched:
         data_note = _append_note(data_note, f"Unmatched funding events: {unmatched}.")
+    if venue in {"hyperliquid", "all"} and not liquidation_events_raw:
+        data_note = _append_note(data_note, "Hyperliquid liquidation events are currently unavailable from source data.")
 
     excursions_map, excursions_found = _load_excursions_map(context, accounts, venue=venue)
     if not excursions_found and trades:
@@ -1555,7 +1559,7 @@ def _capture_heat_pct(trade) -> tuple[float | None, float | None]:
     mfe = trade.mfe
     if mfe is None or mfe <= 0:
         return None, None
-    capture_pct = (trade.realized_pnl_net / mfe) * 100.0
+    capture_pct = (trade.realized_pnl / mfe) * 100.0
     heat_pct = abs((trade.mae / mfe) * 100.0) if trade.mae is not None else None
     return capture_pct, heat_pct
 
@@ -1692,7 +1696,7 @@ def _build_liquidation_events(
             continue
         payload = dict(match)
         if payload.get("total_pnl") is None:
-            payload["total_pnl"] = trade.realized_pnl_net
+            payload["total_pnl"] = trade.realized_pnl
         output.append(payload)
 
     if not output:
@@ -2553,7 +2557,7 @@ def _normalized_trade_items(
             normalized_items.append(item)
             continue
         payload = dict(item)
-        payload["pnl_value"] = trade.realized_pnl_net
+        payload["pnl_value"] = trade.realized_pnl
         payload["mae_value"] = trade.mae
         payload["mfe_value"] = trade.mfe
         payload["etd_value"] = trade.etd
@@ -2578,13 +2582,13 @@ def _diagnostics_phase2(trades: list[Trade], items: list[dict[str, Any]]) -> dic
         item = items_by_id.get(trade.trade_id, {})
         mfe = trade.mfe
         if mfe is not None and mfe > 0:
-            if trade.realized_pnl_net > 0:
-                capture = (trade.realized_pnl_net / mfe) * 100.0
+            if trade.realized_pnl > 0:
+                capture = (trade.realized_pnl / mfe) * 100.0
                 capture_values.append(capture)
                 early_exit_den += 1
                 if capture < _EARLY_EXIT_CAPTURE_PCT:
                     early_exit_count += 1
-                exit_eff_num += trade.realized_pnl_net
+                exit_eff_num += trade.realized_pnl
                 exit_eff_den += mfe
             if trade.mae is not None:
                 heat_values.append(abs(trade.mae) / mfe * 100.0)
@@ -2753,7 +2757,7 @@ def _duration_charts(items: list[dict[str, Any]]) -> dict[str, Any]:
     histogram = _duration_histogram(items)
     for item in items:
         duration = item.get("duration_seconds")
-        pnl = item.get("pnl_value", item.get("realized_pnl_net"))
+        pnl = item.get("pnl_value", item.get("realized_pnl"))
         if duration is None or pnl is None:
             continue
         scatter.append({"x": duration, "y": pnl})
@@ -2937,7 +2941,7 @@ def _benchmark_window(filters: dict[str, Any], trades: list[dict[str, Any]]) -> 
 def _benchmark_candidates() -> tuple[str, list[str], list[str]]:
     source = "hyperliquid"
     symbols = ["BTC-USDC", "BTC-USDT", "BTCUSDT"]
-    timeframes = [_canonical_price_timeframe()]
+    timeframes = [_canonical_price_timeframe(), "5m"]
     return source, symbols, timeframes
 
 
@@ -2953,15 +2957,18 @@ def _benchmark_return(
     try:
         for symbol in symbols:
             for timeframe in timeframes:
+                aligned_start, aligned_end = _benchmark_aligned_window(start, end, timeframe=timeframe)
                 rows = sqlite_reader.load_price_bars(
                     conn,
                     source=source,
                     symbol=symbol,
                     timeframe=timeframe,
-                    start=start,
-                    end=end,
+                    start=aligned_start,
+                    end=aligned_end,
                 )
                 if len(rows) < 2:
+                    continue
+                if not _benchmark_rows_fully_covered(rows, aligned_start, aligned_end, timeframe=timeframe):
                     continue
                 first_open = rows[0].get("open")
                 last_close = rows[-1].get("close")
@@ -2971,6 +2978,62 @@ def _benchmark_return(
     finally:
         conn.close()
     return None
+
+
+def _benchmark_aligned_window(
+    start: datetime,
+    end: datetime,
+    *,
+    timeframe: str,
+) -> tuple[datetime, datetime]:
+    step = _timeframe_delta(timeframe)
+    return _floor_time(start, step), _floor_time(end, step)
+
+
+def _benchmark_rows_fully_covered(
+    rows: list[dict[str, Any]],
+    aligned_start: datetime,
+    aligned_end: datetime,
+    *,
+    timeframe: str,
+) -> bool:
+    if not rows:
+        return False
+    step = _timeframe_delta(timeframe)
+    max_gap = step * 2
+    timestamps: list[datetime] = []
+    for row in rows:
+        raw_ts = row.get("timestamp")
+        if not isinstance(raw_ts, str):
+            continue
+        ts = datetime.fromisoformat(raw_ts)
+        timestamps.append(_ensure_utc(ts))
+    if len(timestamps) < 2:
+        return False
+    timestamps.sort()
+    if timestamps[0] > aligned_start:
+        return False
+    if timestamps[-1] < aligned_end:
+        return False
+    for prev, cur in zip(timestamps, timestamps[1:]):
+        if cur - prev > max_gap:
+            return False
+    return True
+
+
+def _timeframe_delta(timeframe: str) -> timedelta:
+    text = str(timeframe).strip().lower()
+    if text.endswith("m"):
+        minutes = int(text[:-1] or "1")
+        return timedelta(minutes=max(1, minutes))
+    return timedelta(minutes=1)
+
+
+def _floor_time(value: datetime, step: timedelta) -> datetime:
+    ts = int(_ensure_utc(value).timestamp())
+    step_seconds = max(1, int(step.total_seconds()))
+    floored = ts - (ts % step_seconds)
+    return datetime.fromtimestamp(floored, tz=timezone.utc)
 
 
 def _build_comparisons(
@@ -3059,7 +3122,7 @@ def _diagnostics_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
             "y": item.get("mfe_value", item["mfe"]),
             "symbol": item["symbol"],
             "trade_id": item["ui_id"],
-            "pnl": item.get("pnl_value", item["realized_pnl_net"]),
+            "pnl": item.get("pnl_value", item["realized_pnl"]),
             "mae": item.get("mae_value", item["mae"]),
             "mfe": item.get("mfe_value", item["mfe"]),
             "capture_pct": item.get("capture_pct"),
@@ -3072,10 +3135,10 @@ def _diagnostics_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
     mfe_pnl = [
         {
             "x": item.get("mfe_value", item["mfe"]),
-            "y": item.get("pnl_value", item["realized_pnl_net"]),
+            "y": item.get("pnl_value", item["realized_pnl"]),
             "symbol": item["symbol"],
             "trade_id": item["ui_id"],
-            "pnl": item.get("pnl_value", item["realized_pnl_net"]),
+            "pnl": item.get("pnl_value", item["realized_pnl"]),
             "mae": item.get("mae_value", item["mae"]),
             "mfe": item.get("mfe_value", item["mfe"]),
             "capture_pct": item.get("capture_pct"),
@@ -3087,7 +3150,7 @@ def _diagnostics_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
     table = [
         {
             "symbol": item["symbol"],
-            "pnl": item.get("pnl_value", item["realized_pnl_net"]),
+            "pnl": item.get("pnl_value", item["realized_pnl"]),
             "mae": item.get("mae_value", item["mae"]),
             "mfe": item.get("mfe_value", item["mfe"]),
             "etd": item.get("etd_value", item["etd"]),
@@ -3144,7 +3207,7 @@ def _equity_curve(trades: list[dict[str, Any]]) -> dict[str, Any]:
     cumulative = 0.0
     points = []
     for item in ordered:
-        pnl_value = item.get("pnl_value", item["realized_pnl_net"])
+        pnl_value = item.get("pnl_value", item["realized_pnl"])
         cumulative += pnl_value
         points.append(
             {
@@ -3163,7 +3226,7 @@ def _daily_pnl(trades: list[dict[str, Any]]) -> dict[str, Any]:
     buckets: dict[str, float] = defaultdict(float)
     for item in trades:
         day = item["exit_time"].date().isoformat()
-        buckets[day] += item.get("pnl_value", item["realized_pnl_net"])
+        buckets[day] += item.get("pnl_value", item["realized_pnl"])
     series = [
         {"day": day, "pnl": pnl}
         for day, pnl in sorted(buckets.items(), key=lambda pair: pair[0])
@@ -3176,8 +3239,8 @@ def _time_performance(trades: list[dict[str, Any]]) -> dict[str, Any]:
     weekday: dict[int, list[float]] = defaultdict(list)
     for item in trades:
         exit_local = item["exit_time"].astimezone()
-        hourly[exit_local.hour].append(item["realized_pnl_net"])
-        weekday[exit_local.weekday()].append(item["realized_pnl_net"])
+        hourly[exit_local.hour].append(item["realized_pnl"])
+        weekday[exit_local.weekday()].append(item["realized_pnl"])
     return {
         "hourly": [_bucket_summary(hour, values) for hour, values in sorted(hourly.items())],
         "weekday": [_bucket_summary(day, values) for day, values in sorted(weekday.items())],
@@ -3190,13 +3253,13 @@ def _symbol_breakdown(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
         buckets[item["symbol"]].append(item)
     rows = []
     for symbol, items in sorted(buckets.items(), key=lambda pair: pair[0]):
-        wins = sum(1 for item in items if item["realized_pnl_net"] > 0)
-        losses = sum(1 for item in items if item["realized_pnl_net"] < 0)
+        wins = sum(1 for item in items if item["realized_pnl"] > 0)
+        losses = sum(1 for item in items if item["realized_pnl"] < 0)
         total = len(items)
         win_rate = wins / (wins + losses) if wins + losses else None
-        total_net = sum(item["realized_pnl_net"] for item in items)
-        total_win = sum(item["realized_pnl_net"] for item in items if item["realized_pnl_net"] > 0)
-        total_loss = sum(item["realized_pnl_net"] for item in items if item["realized_pnl_net"] < 0)
+        total_net = sum(item["realized_pnl"] for item in items)
+        total_win = sum(item["realized_pnl"] for item in items if item["realized_pnl"] > 0)
+        total_loss = sum(item["realized_pnl"] for item in items if item["realized_pnl"] < 0)
         profit_factor = None
         if total_loss < 0:
             profit_factor = total_win / abs(total_loss)
@@ -3239,12 +3302,12 @@ def _calendar_data(trades: list[dict[str, Any]], month_param: str | None = None)
         day = item["exit_time"].astimezone().date()
         key = day.isoformat()
         bucket = daily_buckets.setdefault(key, {"pnl": 0.0, "trades": []})
-        bucket["pnl"] += item.get("pnl_value", item["realized_pnl_net"])
+        bucket["pnl"] += item.get("pnl_value", item["realized_pnl"])
         bucket["trades"].append(
             {
                 "symbol": item["symbol"],
                 "side": item["side"],
-                "pnl": item.get("pnl_value", item["realized_pnl_net"]),
+                "pnl": item.get("pnl_value", item["realized_pnl"]),
                 "exit_time": item["exit_time"],
             }
         )
@@ -3322,7 +3385,7 @@ def _shift_month(value: date, delta: int) -> date:
 
 
 def _pnl_distribution(trades: list[dict[str, Any]]) -> dict[str, Any]:
-    values = [item["realized_pnl_net"] for item in trades]
+    values = [item["realized_pnl"] for item in trades]
     if not values:
         return {"bins": []}
 

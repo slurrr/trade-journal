@@ -13,6 +13,7 @@ DEFAULT_RETRY_ATTEMPTS = 3
 DEFAULT_RETRY_BACKOFF_SECONDS = 0.75
 DEFAULT_FILLS_PAGE_LIMIT = 2000
 DEFAULT_FILLS_RECENT_CAP = 10000
+DEFAULT_FUNDING_PAGE_LIMIT = 2000
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,7 @@ class HyperliquidInfoConfig:
     retry_backoff_seconds: float
     fills_page_limit: int
     fills_recent_cap: int
+    funding_page_limit: int
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "HyperliquidInfoConfig":
@@ -35,12 +37,16 @@ class HyperliquidInfoConfig:
             ),
             fills_page_limit=int(env.get("HYPERLIQUID_FILLS_PAGE_LIMIT", str(DEFAULT_FILLS_PAGE_LIMIT))),
             fills_recent_cap=int(env.get("HYPERLIQUID_FILLS_RECENT_CAP", str(DEFAULT_FILLS_RECENT_CAP))),
+            funding_page_limit=int(
+                env.get("HYPERLIQUID_FUNDING_PAGE_LIMIT", str(DEFAULT_FUNDING_PAGE_LIMIT))
+            ),
         )
 
 
 class HyperliquidInfoClient:
     def __init__(self, config: HyperliquidInfoConfig) -> None:
         self._config = config
+        self._throttled_total = 0
 
     @property
     def fills_page_limit(self) -> int:
@@ -49,6 +55,14 @@ class HyperliquidInfoClient:
     @property
     def fills_recent_cap(self) -> int:
         return self._config.fills_recent_cap
+
+    @property
+    def funding_page_limit(self) -> int:
+        return self._config.funding_page_limit
+
+    @property
+    def throttled_total(self) -> int:
+        return self._throttled_total
 
     def fetch_clearinghouse_state(self, user: str) -> Mapping[str, Any]:
         payload = {"type": "clearinghouseState", "user": user}
@@ -105,6 +119,28 @@ class HyperliquidInfoClient:
             return response
         return None
 
+    def fetch_user_funding(
+        self,
+        *,
+        user: str,
+        start_ms: int,
+        end_ms: int,
+    ) -> list[Mapping[str, Any]]:
+        payload = {
+            "type": "userFunding",
+            "user": user,
+            "startTime": int(start_ms),
+            "endTime": int(end_ms),
+        }
+        response = self._post_info(payload)
+        if isinstance(response, list):
+            return [row for row in response if isinstance(row, Mapping)]
+        if isinstance(response, Mapping):
+            data = response.get("data")
+            if isinstance(data, list):
+                return [row for row in data if isinstance(row, Mapping)]
+        return []
+
     def _post_info(self, payload: Mapping[str, Any]) -> Mapping[str, Any] | list[Any]:
         body = json.dumps(payload).encode("utf-8")
         last_error: Exception | None = None
@@ -122,7 +158,14 @@ class HyperliquidInfoClient:
                 if not raw:
                     raise RuntimeError("Empty response body from Hyperliquid /info")
                 return json.loads(raw.decode("utf-8"))
-            except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, RuntimeError) as exc:
+            except urllib.error.HTTPError as exc:
+                if exc.code == 429:
+                    self._throttled_total += 1
+                last_error = exc
+                if attempt >= attempts - 1:
+                    break
+                time.sleep(self._config.retry_backoff_seconds * (2**attempt))
+            except (urllib.error.URLError, json.JSONDecodeError, RuntimeError) as exc:
                 last_error = exc
                 if attempt >= attempts - 1:
                     break

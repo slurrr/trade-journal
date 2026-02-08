@@ -49,12 +49,35 @@ Dry-run sync (Hyperliquid only; no DB writes/checkpoint updates):
 .venv/bin/python -m trade_journal.sync_api --account hl_main --max-pages 20 --dry-run
 ```
 
+## Phase 2 Activation Checklist
+
+No manual migration step is required; schema updates are applied by app startup/sync (`init_db`).
+
+1. Restart backend/web process.
+2. Hard refresh browser once (to pick up updated API/UI behavior).
+3. Run one sync cycle (or wait for auto-sync interval):
+
+```bash
+.venv/bin/python -m trade_journal.sync_api --account hl_main --max-pages 20
+```
+
+4. Confirm sync observability fields exist:
+
+```bash
+curl -s "http://127.0.0.1:8010/api/sync-state?source=hyperliquid&account_id=0x371b6d542a2471c1e8f38495e0dea578d00a377c" | jq
+```
+
+Expected per endpoint row:
+- `throttled_count`
+- `cap_detected`
+- `oldest_fill_ts`
+
 ## Debug APIs (Web App)
 
 Open positions:
 
 ```bash
-curl "http://127.0.0.1:8010/api/account/open-positions?source=hyperliquid&account_id=0x..."
+curl "http://127.0.0.1:8010/api/account/open-positions?source=hyperliquid&account_id=0x371b6d542a2471c1e8f38495e0dea578d00a377c"
 ```
 
 Sync checkpoint state (defaults to current account context):
@@ -66,8 +89,8 @@ curl "http://127.0.0.1:8010/api/sync-state"
 Sync checkpoint state with explicit filters:
 
 ```bash
-curl "http://127.0.0.1:8010/api/sync-state?source=hyperliquid&account_id=0x..."
-curl "http://127.0.0.1:8010/api/sync-state?source=hyperliquid&account_id=0x...&endpoint_prefix=fills:"
+curl "http://127.0.0.1:8010/api/sync-state?source=hyperliquid&account_id=0x371b6d542a2471c1e8f38495e0dea578d00a377c"
+curl "http://127.0.0.1:8010/api/sync-state?source=hyperliquid&account_id=0x371b6d542a2471c1e8f38495e0dea578d00a377c&endpoint_prefix=fills:"
 ```
 
 ## What To Expect Before First Fill
@@ -208,11 +231,12 @@ account_snapshot 1
 
 ## Funding Status
 
-Funding ingestion is deferred by default.
+Funding ingestion is enabled for Hyperliquid Phase 2 syncs.
 
-- Default behavior: `funding = 0` for Hyperliquid sync.
-- Guard flag for future implementation testing:
-  - `HYPERLIQUID_ENABLE_FUNDING=true` will currently raise a clear `NotImplementedError`.
+Notes on unmatched funding:
+- Unmatched is expected when funding events occur while you have no reconstructed trade open in the journal window.
+- It can also occur when only partial fill history is available locally (for example after a long offline period/cap window).
+- It should not require any special toggle; a normal sync cycle is sufficient.
 
 ## Backfilling price bars (charts + MAE/MFE prerequisites)
 
@@ -230,3 +254,5 @@ Both commands are idempotent (upserts) and safe to re-run. Use `--dry-run` to pr
 To benchmark-backfill a specific test window:
 
 - `.venv/bin/python -m trade_journal.backfill_price_bars_hyperliquid --benchmark-only --benchmark-symbol BTC-USDC --benchmark-start 2026-02-02T00:00:00+00:00 --benchmark-end 2026-02-02T06:00:00+00:00`
+
+For trailing-window maintenance, rely on post-sync benchmark continuity in `sync_api` (runs from web auto-sync and CLI sync paths).

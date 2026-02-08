@@ -5,12 +5,18 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
 from trade_journal.ingest.apex_orders import OrderRecord, OrdersIngestResult
-from trade_journal.models import Fill
+from trade_journal.models import Fill, FundingEvent
 
 
 @dataclass(frozen=True)
 class IngestResult:
     fills: list[Fill]
+    skipped: int = 0
+
+
+@dataclass(frozen=True)
+class FundingIngestResult:
+    events: list[FundingEvent]
     skipped: int = 0
 
 
@@ -26,6 +32,23 @@ def load_hyperliquid_fills_payload(
         except ValueError:
             skipped += 1
     return IngestResult(fills=fills, skipped=skipped)
+
+
+def load_hyperliquid_funding_payload(
+    payload: Any,
+    *,
+    source: str = "hyperliquid",
+    account_id: str | None = None,
+) -> FundingIngestResult:
+    records = _extract_fill_records(payload)
+    events: list[FundingEvent] = []
+    skipped = 0
+    for raw in records:
+        try:
+            events.append(_normalize_funding(raw, source=source, account_id=account_id))
+        except ValueError:
+            skipped += 1
+    return FundingIngestResult(events=events, skipped=skipped)
 
 
 def load_hyperliquid_clearinghouse_state_payload(
@@ -205,6 +228,58 @@ def _normalize_open_order(
             else (str(raw.get("status")) if raw.get("status") not in (None, "") else "OPEN")
         ),
         created_at=created_at,
+        raw=dict(raw),
+    )
+
+
+def _normalize_funding(
+    raw: Mapping[str, Any],
+    *,
+    source: str,
+    account_id: str | None,
+) -> FundingEvent:
+    event_time = _parse_timestamp(raw.get("time"))
+    hash_id = raw.get("hash")
+    delta = raw.get("delta")
+    if not isinstance(delta, Mapping):
+        raise ValueError("Missing funding delta object")
+    if str(delta.get("type") or "").strip().lower() != "funding":
+        raise ValueError("Not a funding delta row")
+    coin = delta.get("coin")
+    if coin in (None, ""):
+        raise ValueError("Missing coin")
+    symbol = _symbol_from_coin(coin)
+    funding_rate = _to_float(delta.get("fundingRate"), default=0.0)
+    size_signed = _to_float(delta.get("szi"), default=0.0)
+    side = "LONG" if size_signed >= 0 else "SHORT"
+    position_size = abs(size_signed)
+    funding_value = _to_float(delta.get("usdc"), default=0.0)
+
+    denom = abs(size_signed) * abs(funding_rate)
+    if denom > 0:
+        price = abs(funding_value) / denom
+    else:
+        price = 0.0
+
+    funding_id = None
+    if hash_id not in (None, ""):
+        funding_id = f"{hash_id}:{int(event_time.timestamp() * 1000)}:{str(coin).upper()}"
+    else:
+        funding_id = f"fallback:{int(event_time.timestamp() * 1000)}:{str(coin).upper()}"
+
+    return FundingEvent(
+        funding_id=funding_id,
+        transaction_id=str(hash_id) if hash_id not in (None, "") else None,
+        symbol=symbol,
+        side=side,
+        rate=funding_rate,
+        position_size=position_size,
+        price=price,
+        funding_time=event_time,
+        funding_value=funding_value,
+        status="funding",
+        source=source,
+        account_id=account_id,
         raw=dict(raw),
     )
 

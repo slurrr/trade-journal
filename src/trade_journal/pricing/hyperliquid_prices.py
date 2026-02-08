@@ -14,17 +14,24 @@ class HyperliquidPriceClient:
     def __init__(self, config: HyperliquidInfoConfig) -> None:
         self._client = HyperliquidInfoClient(config)
 
-    def fetch_bars(self, symbol: str, start_time: datetime, end_time: datetime) -> list[PriceBar]:
+    def fetch_bars(
+        self,
+        symbol: str,
+        start_time: datetime,
+        end_time: datetime,
+        timeframe: str = "1m",
+    ) -> list[PriceBar]:
+        step_ms = _timeframe_to_ms(timeframe)
         coin = _symbol_to_coin(symbol)
-        start_ms = int(start_time.timestamp() * 1000) - _MINUTE_MS
-        end_ms = int(end_time.timestamp() * 1000) + _MINUTE_MS
-        start_ms = _floor_ms(start_ms, _MINUTE_MS)
-        end_ms = _ceil_ms(end_ms, _MINUTE_MS)
+        start_ms = int(start_time.timestamp() * 1000) - step_ms
+        end_ms = int(end_time.timestamp() * 1000) + step_ms
+        start_ms = _floor_ms(start_ms, step_ms)
+        end_ms = _ceil_ms(end_ms, step_ms)
         payload = {
             "type": "candleSnapshot",
             "req": {
                 "coin": coin,
-                "interval": "1m",
+                "interval": timeframe,
                 "startTime": int(start_ms),
                 "endTime": int(end_ms),
             },
@@ -35,7 +42,7 @@ class HyperliquidPriceClient:
             summary = _describe_payload(response)
             raise RuntimeError(f"No candleSnapshot data returned for {symbol}. {summary}")
         bars.sort(key=lambda bar: bar.start_time)
-        _ensure_coverage(bars, start_time, end_time)
+        _ensure_coverage(bars, start_time, end_time, timeframe=timeframe)
         return bars
 
 
@@ -150,12 +157,26 @@ def _describe_payload(payload: Any) -> str:
     return f"response_type={type(payload).__name__}"
 
 
-def _ensure_coverage(bars: list[PriceBar], start_time: datetime, end_time: datetime) -> None:
+def _ensure_coverage(
+    bars: list[PriceBar],
+    start_time: datetime,
+    end_time: datetime,
+    *,
+    timeframe: str,
+) -> None:
     earliest = bars[0].start_time
     latest = bars[-1].end_time
     if earliest > start_time or latest < end_time:
         raise RuntimeError(
             "Price data does not fully cover trade window: "
             f"{earliest.isoformat()} -> {latest.isoformat()} "
-            f"(needed {start_time.isoformat()} -> {end_time.isoformat()})"
+            f"(needed {start_time.isoformat()} -> {end_time.isoformat()} @ {timeframe})"
         )
+
+
+def _timeframe_to_ms(timeframe: str) -> int:
+    text = str(timeframe).strip().lower()
+    if text.endswith("m"):
+        minutes = int(text[:-1] or "1")
+        return max(1, minutes) * _MINUTE_MS
+    raise ValueError(f"Unsupported timeframe: {timeframe}")
