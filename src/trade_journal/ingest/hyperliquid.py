@@ -63,14 +63,20 @@ def load_hyperliquid_clearinghouse_state_payload(
         "account_id": account_id,
         "source": source,
         "timestamp": timestamp,
-        "total_equity": _first_float(payload, "accountValue", "totalEquity")
-        or _first_float(margin_summary, "accountValue")
-        or _first_float(cross_margin_summary, "accountValue"),
-        "available_balance": _first_float(payload, "withdrawable")
-        or _first_float(margin_summary, "withdrawable")
-        or _first_float(cross_margin_summary, "withdrawable"),
-        "margin_balance": _first_float(margin_summary, "totalMarginUsed")
-        or _first_float(cross_margin_summary, "totalMarginUsed"),
+        "total_equity": _coalesce_float(
+            _first_float(payload, "accountValue", "totalEquity"),
+            _first_float(margin_summary, "accountValue"),
+            _first_float(cross_margin_summary, "accountValue"),
+        ),
+        "available_balance": _coalesce_float(
+            _first_float(payload, "withdrawable"),
+            _first_float(margin_summary, "withdrawable"),
+            _first_float(cross_margin_summary, "withdrawable"),
+        ),
+        "margin_balance": _coalesce_float(
+            _first_float(margin_summary, "totalMarginUsed"),
+            _first_float(cross_margin_summary, "totalMarginUsed"),
+        ),
         "raw_json": dict(payload),
     }
 
@@ -360,4 +366,11 @@ def _first_float(payload: Any, *keys: str) -> float | None:
             return float(value)
         except (TypeError, ValueError):
             continue
+    return None
+
+
+def _coalesce_float(*values: float | None) -> float | None:
+    for value in values:
+        if value is not None:
+            return value
     return None

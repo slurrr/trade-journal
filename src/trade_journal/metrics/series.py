@@ -63,10 +63,12 @@ def compute_trade_series(trade: Trade, bars: Iterable[PriceBar]) -> list[TradeSe
 def downsample_series(points: list[TradeSeriesPoint], max_points: int | None) -> list[TradeSeriesPoint]:
     if max_points is None or max_points <= 0 or len(points) <= max_points:
         return points
-    stride = max(1, len(points) // max_points)
+    stride = max(1, -(-len(points) // max_points))
     sampled = points[::stride]
     if sampled and sampled[-1].timestamp != points[-1].timestamp:
         sampled.append(points[-1])
+    if len(sampled) > max_points:
+        sampled = sampled[: max_points - 1] + [points[-1]]
     return sampled
 
 

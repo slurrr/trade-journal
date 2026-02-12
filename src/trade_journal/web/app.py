@@ -679,7 +679,8 @@ def _load_journal_state_db(context, db_path: Path, *, venue: str) -> dict[str, A
         if venue != "all":
             funding_events = [item for item in funding_events if item.source == venue]
         attributions = apply_funding_events(trades, funding_events)
-        unmatched = sum(1 for item in attributions if item.matched_trade_id is None)
+        likely_open_keys = _latest_open_position_keys(conn, venue=venue)
+        unmatched = _material_unmatched_funding_count(attributions, likely_open_keys)
         orders = sqlite_reader.load_orders_all(conn)
         orders = _filter_by_active_account_keys(orders, active_keys)
         if venue != "all":
@@ -803,7 +804,8 @@ def _load_analytics_state_db(db_path: Path) -> dict[str, Any]:
         funding_events = sqlite_reader.load_funding_all(conn)
         funding_events = _filter_by_active_account_keys(funding_events, active_keys)
         attributions = apply_funding_events(trades, funding_events)
-        unmatched = sum(1 for item in attributions if item.matched_trade_id is None)
+        likely_open_keys = _latest_open_position_keys(conn, venue="all")
+        unmatched = _material_unmatched_funding_count(attributions, likely_open_keys)
         orders = sqlite_reader.load_orders_all(conn)
         orders = _filter_by_active_account_keys(orders, active_keys)
         liquidation_events_raw = sqlite_reader.load_liquidations_all(conn)
@@ -1518,6 +1520,76 @@ def _filter_account_rows_by_active_keys(
         if scoped in active_keys:
             filtered.append(row)
     return filtered
+
+
+def _latest_open_position_keys(conn, *, venue: str) -> set[tuple[str, str | None, str, str]]:
+    rows = conn.execute(
+        "SELECT source, account_id, raw_json, timestamp FROM account_snapshots ORDER BY timestamp DESC"
+    ).fetchall()
+    selected: dict[tuple[str, str | None], dict[str, Any]] = {}
+    for row in rows:
+        source = str(row["source"] or "").strip().lower()
+        if venue != "all" and source != venue:
+            continue
+        account_id = row["account_id"]
+        key = (source, account_id)
+        if key in selected:
+            continue
+        raw_payload: Any = {}
+        raw_json = row["raw_json"]
+        if isinstance(raw_json, str):
+            text = raw_json.strip()
+            if text:
+                try:
+                    raw_payload = json.loads(text)
+                except json.JSONDecodeError:
+                    raw_payload = {}
+        selected[key] = {
+            "source": source,
+            "account_id": account_id,
+            "raw": raw_payload,
+        }
+    keys: set[tuple[str, str | None, str, str]] = set()
+    for item in selected.values():
+        positions = _open_positions_from_snapshot(
+            {"raw": item.get("raw")},
+            source=str(item.get("source") or ""),
+            account_id=item.get("account_id"),
+        )
+        for pos in positions:
+            symbol = str(pos.get("symbol") or "").strip().upper()
+            side = _normalize_position_side(pos.get("side"))
+            if not symbol or side is None:
+                continue
+            keys.add((str(item.get("source") or ""), item.get("account_id"), symbol, side))
+    return keys
+
+
+def _material_unmatched_funding_count(
+    attributions: list[Any],
+    likely_open_keys: set[tuple[str, str | None, str, str]],
+) -> int:
+    count = 0
+    for item in attributions:
+        if item.matched_trade_id is not None:
+            continue
+        event = item.event
+        symbol = str(getattr(event, "symbol", "") or "").strip().upper()
+        side = _normalize_position_side(getattr(event, "side", None))
+        key = (str(getattr(event, "source", "") or ""), getattr(event, "account_id", None), symbol, side or "")
+        if side is not None and key in likely_open_keys:
+            continue
+        count += 1
+    return count
+
+
+def _normalize_position_side(value: Any) -> str | None:
+    text = str(value or "").strip().upper()
+    if text in {"LONG", "BUY", "B"}:
+        return "LONG"
+    if text in {"SHORT", "SELL", "S", "A"}:
+        return "SHORT"
+    return None
 
 
 def _trade_ui_id(trade) -> str:
