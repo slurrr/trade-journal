@@ -24,11 +24,19 @@
           <img class="brand-logo" src="/static/logo.png" alt="Trade Journal logo" />
         </div>
         <nav class="nav">
-          <a href="/" class="{% if page == 'dashboard' %}active{% endif %}">Dashboard</a>
-          <a href="/analytics" class="{% if page == 'analytics' %}active{% endif %}">Analytics</a>
-          <a href="/calendar" class="{% if page == 'calendar' %}active{% endif %}">Calendar</a>
-          <a href="/trades" class="{% if page == 'trades' %}active{% endif %}">Trades</a>
+          <a href="/?venue={{ venue }}" class="{% if page == 'dashboard' %}active{% endif %}">Dashboard</a>
+          <a href="/analytics?venue={{ venue }}" class="{% if page == 'analytics' %}active{% endif %}">Analytics</a>
+          <a href="/calendar?venue={{ venue }}" class="{% if page == 'calendar' %}active{% endif %}">Calendar</a>
+          <a href="/trades?venue={{ venue }}" class="{% if page == 'trades' %}active{% endif %}">Trades</a>
         </nav>
+        <label class="topbar-select">
+          <span>Venue</span>
+          <select id="globalVenueSelect" aria-label="Global venue filter">
+            {% for option in venue_options %}
+            <option value="{{ option.value }}" {% if venue == option.value %}selected{% endif %}>{{ option.label }}</option>
+            {% endfor %}
+          </select>
+        </label>
         <button class="theme-toggle" id="themeToggle" aria-label="Toggle theme">Dark</button>
       </header>
 
@@ -43,6 +51,7 @@
     <script>
       const root = document.documentElement;
       const toggle = document.getElementById('themeToggle');
+      const venueSelect = document.getElementById('globalVenueSelect');
       const stored = localStorage.getItem('theme');
       if (stored) {
         root.dataset.theme = stored;
@@ -57,6 +66,13 @@
         localStorage.setItem('theme', next);
         setLabel();
       });
+      if (venueSelect) {
+        venueSelect.addEventListener('change', () => {
+          const url = new URL(window.location.href);
+          url.searchParams.set('venue', venueSelect.value);
+          window.location.href = `${url.pathname}?${url.searchParams.toString()}`;
+        });
+      }
     </script>
   </body>
 </html>

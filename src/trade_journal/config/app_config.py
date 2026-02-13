@@ -72,6 +72,11 @@ class SessionSettings:
 
 
 @dataclass(frozen=True)
+class AnalyticsSettings:
+    size_buckets: list[float]
+
+
+@dataclass(frozen=True)
 class AppConfig:
     app: AppSettings
     api: ApiSettings
@@ -79,6 +84,7 @@ class AppConfig:
     paths: PathsSettings
     sync: SyncSettings
     sessions: SessionSettings
+    analytics: AnalyticsSettings
 
 
 def apply_api_settings(
@@ -111,6 +117,7 @@ def load_app_config(path: Path | None = None) -> AppConfig:
     paths_raw = _section(raw, "paths")
     sync_raw = _section(raw, "sync")
     sessions_raw = _section(raw, "sessions")
+    analytics_raw = _section(raw, "analytics")
 
     app = AppSettings(
         db_path=Path(app_raw.get("db_path", "data/trade_journal.sqlite")),
@@ -170,7 +177,19 @@ def load_app_config(path: Path | None = None) -> AppConfig:
         auxiliary_windows=aux_windows,
     )
 
-    return AppConfig(app=app, api=api, pricing=pricing, paths=paths, sync=sync, sessions=sessions)
+    analytics = AnalyticsSettings(
+        size_buckets=_float_list(analytics_raw.get("size_buckets")) or _default_size_buckets(),
+    )
+
+    return AppConfig(
+        app=app,
+        api=api,
+        pricing=pricing,
+        paths=paths,
+        sync=sync,
+        sessions=sessions,
+        analytics=analytics,
+    )
 
 
 def _section(raw: Mapping[str, Any], key: str) -> Mapping[str, Any]:
@@ -193,6 +212,22 @@ def _path_or_none(value: Any) -> Path | None:
     if value in (None, ""):
         return None
     return Path(str(value))
+
+
+def _float_list(value: Any) -> list[float]:
+    if not isinstance(value, list):
+        return []
+    output: list[float] = []
+    for item in value:
+        try:
+            output.append(float(item))
+        except (TypeError, ValueError):
+            continue
+    return output
+
+
+def _default_size_buckets() -> list[float]:
+    return [1_000.0, 5_000.0, 10_000.0, 25_000.0, 50_000.0]
 
 
 def _default_auxiliary_windows() -> dict[str, tuple[int, int]]:

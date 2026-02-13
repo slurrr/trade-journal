@@ -1,0 +1,4 @@
+The snapshot builder uses `or` to fall back from `payload` to `marginSummary`/`crossMarginSummary`. Because `0.0` is falsy, legitimate zero balances (e.g., an empty account or fully withdrawn balance) will be overwritten by the fallback value or become `None`. That leads to incorrect account snapshots and equity history whenever the correct value is 0. This should use an explicit `is None` check (or a helper) so `0.0` is preserved.
+
+`downsample_series` calculates `stride` with floor division. For any `len(points)` in `(max_points, 2*max_points)`, `stride` becomes 1, so the function returns more than `max_points` elements. That defeats the `series_max_points` cap and can bloat chart payloads or slow the UI on larger trades. Use a ceiling-based stride (or slice by computed indices) to guarantee the result length stays within `max_points`.
+

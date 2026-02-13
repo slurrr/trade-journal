@@ -42,8 +42,17 @@ def _event_sort_key(event: FundingEvent) -> datetime:
 
 def _find_trade_for_event(trades: list[Trade], event: FundingEvent) -> Trade | None:
     for trade in trades:
-        if trade.side != event.side:
+        if _normalize_position_side(trade.side) != _normalize_position_side(event.side):
             continue
         if trade.entry_time <= event.funding_time <= trade.exit_time:
             return trade
     return None
+
+
+def _normalize_position_side(value: str) -> str:
+    text = str(value or "").strip().upper()
+    if text in {"LONG", "BUY", "B"}:
+        return "LONG"
+    if text in {"SHORT", "SELL", "S", "A"}:
+        return "SHORT"
+    return text

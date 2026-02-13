@@ -20,6 +20,7 @@ DEFAULT_TABLES = [
     "tags",
     "trade_tags",
     "benchmark_prices",
+    "price_bars",
     "regime_series",
     "sync_state",
     "schema_version",

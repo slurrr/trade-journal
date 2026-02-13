@@ -9,7 +9,7 @@ This is not a throwaway build, but it is intentionally under-constrained.
 
 ## Hard Invariants (do not violate)
 
-- Ground truth comes from ApeX Omni data (fills, trades, or positions).
+- Ground truth comes from the venue's source data (fills, trades, positions, etc.).
 - Data ingestion is automated (no manual trade entry).
 - Single-user, local-first (no auth, no cloud assumptions).
 - All derived analytics must be explainable back to source data.

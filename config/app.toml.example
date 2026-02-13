@@ -59,3 +59,6 @@ timezone = "utc"
 tokyo_london_overlap = ["08:00", "09:59"]
 london_ny_overlap = ["16:00", "17:59"]
 
+[analytics]
+# Entry-notional bucket edges (USD). Buckets are [lower, upper) with a final >= bucket.
+size_buckets = [1000, 5000, 10000, 25000, 50000]

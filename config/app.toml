@@ -49,3 +49,16 @@ max_pages = 200
 end_ms = ""
 run_excursions = true
 series_max_points = ""
+
+[sessions]
+# Timezone for session bucketing (UTC by default).
+timezone = "utc"
+
+[sessions.auxiliary_windows]
+# Auxiliary exposure windows used for session overlap filters.
+tokyo_london_overlap = ["08:00", "09:59"]
+london_ny_overlap = ["16:00", "17:59"]
+
+[analytics]
+# Entry-notional bucket edges (USD). Buckets are [lower, upper) with a final >= bucket.
+size_buckets = [1000, 5000, 10000, 25000, 50000]

@@ -16,15 +16,25 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from jinja2 import Undefined
 
-from trade_journal.config.accounts import resolve_account_context, resolve_data_path
+from trade_journal.config.accounts import (
+    AccountContext,
+    account_key,
+    load_accounts_config,
+    resolve_account_context,
+    resolve_data_path,
+)
 from trade_journal.config.app_config import load_app_config
 from trade_journal.ingest.apex_funding import load_funding
 from trade_journal.ingest.apex_equity import load_equity_history
 from trade_journal.ingest.apex_liquidations import load_liquidations
 from trade_journal.ingest.apex_omni import load_fills
+from trade_journal.ingest.apex_api import ApexApiClient, ApexApiConfig, load_dotenv
 from trade_journal.storage import sqlite_reader
 from trade_journal.metrics.equity import apply_equity_at_entry
 from trade_journal.metrics.risk import initial_stop_for_trade
+from trade_journal.metrics.targets import initial_target_for_trade
+from trade_journal.metrics.excursions import PriceBar
+from trade_journal.metrics.series import compute_trade_series, downsample_series
 from trade_journal.metrics.summary import (
     compute_aggregate_metrics,
     compute_trade_metrics,
@@ -35,8 +45,13 @@ from trade_journal.metrics.summary import (
 )
 from trade_journal.models import Trade
 from trade_journal.ingest.apex_orders import load_orders
+from trade_journal.ingest.hyperliquid import load_hyperliquid_clearinghouse_state_payload
+from trade_journal.ingest.hyperliquid_api import HyperliquidInfoClient, HyperliquidInfoConfig
 from trade_journal.reconstruct.funding import apply_funding_events
 from trade_journal.reconstruct.trades import reconstruct_trades
+from trade_journal.storage.sqlite_store import connect as sqlite_connect
+from trade_journal.storage.sqlite_store import init_db, upsert_account_snapshots
+from trade_journal.pricing.apex_prices import ApexPriceClient, PriceSeriesConfig
 
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -54,6 +69,50 @@ _BASE_SESSION_WINDOWS = {
 }
 _BASE_SESSION_LABELS = ("asia", "london", "ny")
 _NORMALIZATION_MODES = ("usd", "percent", "r")
+_EARLY_EXIT_CAPTURE_PCT = 25.0
+_TARGET_TAG_TYPES = {"tp", "target"}
+_DURATION_BINS_SECONDS = [
+    300,
+    900,
+    1800,
+    3600,
+    7200,
+    14400,
+    28800,
+    86400,
+    172800,
+    432000,
+]
+_SUPPORTED_VENUES = ("apex", "hyperliquid")
+_VENUE_LABELS = {
+    "all": "All",
+    "apex": "Apex",
+    "hyperliquid": "Hyperliquid",
+}
+_OPEN_POSITION_SIZE_EPSILON = 1e-8
+_OPEN_POSITION_PRICE_CACHE_TTL_SECONDS = 14
+_OPEN_POSITION_PRICE_CACHE: dict[str, tuple[datetime, float]] = {}
+_OPEN_POSITION_REFRESH_AT: dict[str, datetime] = {}
+
+
+def _resolve_venue(request: Request) -> str:
+    raw = (request.query_params.get("venue") or "").strip().lower()
+    if raw == "all":
+        return "all"
+    if raw in _SUPPORTED_VENUES:
+        return raw
+    context = resolve_account_context(env=os.environ)
+    default = (context.source or "").strip().lower()
+    if default in _SUPPORTED_VENUES:
+        return default
+    return "all"
+
+
+def _venue_context(venue: str) -> dict[str, Any]:
+    return {
+        "venue": venue,
+        "venue_options": [{"value": key, "label": label} for key, label in _VENUE_LABELS.items()],
+    }
 
 
 @app.on_event("startup")
@@ -65,7 +124,8 @@ async def _start_auto_sync() -> None:
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request) -> HTMLResponse:
-    payload = _load_journal_state()
+    venue = _resolve_venue(request)
+    payload = _load_journal_state(venue=venue)
     calendar_data = _calendar_data(payload["trades"])
     data_note = None
     context = {
@@ -78,16 +138,20 @@ def dashboard(request: Request) -> HTMLResponse:
         "recent_trades": payload["recent_trades"],
         "symbols": payload["symbols"],
         "liquidations": payload["liquidations"],
+        "account": payload.get("account"),
+        "open_positions": payload.get("open_positions", []),
         "calendar": calendar_data,
         "data_note": data_note,
         "data_note_class": "",
+        **_venue_context(venue),
     }
     return TEMPLATES.TemplateResponse("dashboard.html", context)
 
 
 @app.get("/trades", response_class=HTMLResponse)
 def trades_page(request: Request) -> HTMLResponse:
-    payload = _load_journal_state()
+    venue = _resolve_venue(request)
+    payload = _load_journal_state(venue=venue)
     context = {
         "request": request,
         "page": "trades",
@@ -95,13 +159,15 @@ def trades_page(request: Request) -> HTMLResponse:
         "symbols": payload["symbols"],
         "data_note": payload["data_note"],
         "data_note_class": _note_class(payload["data_note"]),
+        **_venue_context(venue),
     }
     return TEMPLATES.TemplateResponse("trades.html", context)
 
 
 @app.get("/calendar", response_class=HTMLResponse)
 def calendar_page(request: Request) -> HTMLResponse:
-    payload = _load_journal_state()
+    venue = _resolve_venue(request)
+    payload = _load_journal_state(venue=venue)
     month_param = request.query_params.get("month")
     calendar_data = _calendar_data(payload["trades"], month_param)
     context = {
@@ -110,25 +176,34 @@ def calendar_page(request: Request) -> HTMLResponse:
         "calendar": calendar_data,
         "data_note": None,
         "data_note_class": "",
+        **_venue_context(venue),
     }
     return TEMPLATES.TemplateResponse("calendar.html", context)
 
 
 @app.get("/analytics", response_class=HTMLResponse)
 def analytics_page(request: Request) -> HTMLResponse:
+    venue = _resolve_venue(request)
     context = resolve_account_context(env=os.environ)
     db_path = _resolve_db_path()
     if db_path is not None and db_path.exists():
         payload = _load_analytics_state_db(db_path)
     else:
-        payload = _load_journal_state()
-    trade_items = payload["trades"]
-    trade_objects = payload.get("trade_objects", [])
+        payload = _load_journal_state(venue=venue)
+    trade_items = [item for item in payload["trades"] if venue == "all" or item.get("source") == venue]
+    venue_symbols = sorted({item["symbol"] for item in trade_items})
+    trade_objects = [
+        trade
+        for trade in payload.get("trade_objects", [])
+        if venue == "all" or trade.source == venue
+    ]
 
     accounts = payload.get("accounts") or _accounts_from_trades(trade_items)
+    if venue != "all":
+        accounts = [account for account in accounts if str(account.get("source") or "") == venue]
     strategies = payload.get("strategies") or _strategies_from_trades(trade_items)
     exposure_windows = list(_exposure_windows().keys())
-    filters = _parse_analytics_filters(request, payload["symbols"], accounts, strategies, exposure_windows)
+    filters = _parse_analytics_filters(request, venue_symbols, accounts, strategies, exposure_windows)
     filtered_items = _filter_trade_items(trade_items, filters)
     filtered_ids = {item["trade_id"] for item in filtered_items}
     filtered_trades = [trade for trade in trade_objects if trade.trade_id in filtered_ids]
@@ -147,6 +222,7 @@ def analytics_page(request: Request) -> HTMLResponse:
     daily_pnl = _daily_pnl(chart_items)
     equity_curve = _equity_curve(chart_items)
     diagnostics = _diagnostics_payload(chart_items)
+    diagnostics_phase2 = _diagnostics_phase2(normalized_trades, filtered_items)
     diagnostics_table = [
         {
             "symbol": row["symbol"],
@@ -161,6 +237,10 @@ def analytics_page(request: Request) -> HTMLResponse:
         for row in diagnostics.get("table", [])
     ]
     calendar_data = _calendar_data(chart_items)
+    strategy_attribution = _strategy_attribution(filtered_items, normalized_trades)
+    size_buckets = _size_bucket_attribution(filtered_items, normalized_trades)
+    regime_attribution = _regime_attribution(filtered_items, normalized_trades)
+    duration_charts = _duration_charts(chart_items)
     comparisons = _build_comparisons(
         trade_items=trade_items,
         trade_objects=trade_objects,
@@ -186,23 +266,31 @@ def analytics_page(request: Request) -> HTMLResponse:
         "symbol_breakdown": symbol_breakdown,
         "direction_stats": _direction_analysis(normalized_trades),
         "diagnostics": diagnostics,
+        "diagnostics_phase2": diagnostics_phase2,
         "scatter": diagnostics,
         "diagnostics_table": diagnostics_table,
         "trades": filtered_items,
         "calendar": calendar_data,
-        "symbols": payload["symbols"],
+        "strategy_attribution": strategy_attribution,
+        "size_buckets": size_buckets,
+        "regime_attribution": regime_attribution,
+        "duration_charts": duration_charts,
+        "symbols": venue_symbols,
         "accounts": accounts,
         "strategies": strategies,
+        "exposure_windows": exposure_windows,
         "query_base": filters["query_base"],
         "data_note": payload.get("data_note"),
         "data_note_class": _note_class(payload.get("data_note")),
+        **_venue_context(venue),
     }
     return TEMPLATES.TemplateResponse("analytics.html", context)
 
 
 @app.get("/trades/{trade_id}", response_class=HTMLResponse)
 def trade_detail(request: Request, trade_id: str) -> HTMLResponse:
-    payload = _load_journal_state()
+    venue = _resolve_venue(request)
+    payload = _load_journal_state(venue=venue)
     trade = next((item for item in payload["trades"] if item["ui_id"] == trade_id), None)
     context = {
         "request": request,
@@ -210,13 +298,15 @@ def trade_detail(request: Request, trade_id: str) -> HTMLResponse:
         "trade": trade,
         "data_note": None,
         "data_note_class": "",
+        **_venue_context(venue),
     }
     return TEMPLATES.TemplateResponse("trade_detail.html", context)
 
 
 @app.get("/api/summary")
-def summary_api() -> dict[str, Any]:
-    payload = _load_journal_state()
+def summary_api(request: Request) -> dict[str, Any]:
+    venue = _resolve_venue(request)
+    payload = _load_journal_state(venue=venue)
     return {
         "summary": payload["summary"],
         "equity_curve": payload["equity_curve"],
@@ -226,22 +316,52 @@ def summary_api() -> dict[str, Any]:
 
 
 @app.get("/api/trades")
-def trades_api() -> list[dict[str, Any]]:
-    payload = _load_journal_state()
+def trades_api(request: Request) -> list[dict[str, Any]]:
+    venue = _resolve_venue(request)
+    payload = _load_journal_state(venue=venue)
     return payload["trades"]
 
 
 @app.get("/api/trades/{trade_id}/series")
-def trade_series_api(trade_id: str) -> dict[str, Any]:
+def trade_series_api(request: Request, trade_id: str) -> dict[str, Any]:
+    venue = _resolve_venue(request)
+    payload = _load_journal_state(venue=venue)
+    trade = next((item for item in payload["trade_objects"] if _trade_ui_id(item) == trade_id), None)
+    if trade is None:
+        raise HTTPException(status_code=404, detail="Trade not found.")
+
+    db_path = _resolve_db_path()
+    if db_path is not None and db_path.exists():
+        conn = sqlite_reader.connect(db_path)
+        try:
+            bars = _load_trade_bars_db(conn, trade)
+        finally:
+            conn.close()
+        if bars:
+            series_points = compute_trade_series(trade, bars)
+            series_points = downsample_series(series_points, _series_max_points())
+            return {
+                "trade_id": trade_id,
+                "symbol": trade.symbol,
+                "interval": _canonical_price_timeframe(),
+                "series": [
+                    {
+                        "t": int(point.timestamp.timestamp() * 1000),
+                        "open": point.open,
+                        "high": point.high,
+                        "low": point.low,
+                        "close": point.close,
+                        "entry_return": point.entry_return,
+                        "per_unit_unrealized": point.per_unit_unrealized,
+                    }
+                    for point in series_points
+                ],
+            }
+
     context = resolve_account_context(env=os.environ)
     series_path = _resolve_trade_series_path(context)
     if series_path is None:
         raise HTTPException(status_code=404, detail="Trade series cache not found.")
-
-    payload = _load_journal_state()
-    trade = next((item for item in payload["trade_objects"] if _trade_ui_id(item) == trade_id), None)
-    if trade is None:
-        raise HTTPException(status_code=404, detail="Trade not found.")
 
     series_map = _load_trade_series(series_path)
     key = _excursions_key(trade)
@@ -260,11 +380,109 @@ def trade_series_api(trade_id: str) -> dict[str, Any]:
     }
 
 
-def _load_journal_state() -> dict[str, Any]:
+@app.get("/api/account/open-positions")
+def account_open_positions_api(request: Request) -> dict[str, Any]:
+    venue = _resolve_venue(request)
     context = resolve_account_context(env=os.environ)
+    source_param = request.query_params.get("source")
+    account_id_param = request.query_params.get("account_id")
+    source = (source_param or context.source or "").strip().lower()
+    account_id = account_id_param or context.account_id
+
+    if not source_param and not account_id_param:
+        _refresh_open_position_snapshots(venue)
+
+    account_snapshot: dict[str, Any] | None = None
+    if source_param or account_id_param:
+        db_path = _resolve_db_path()
+        if db_path is not None and db_path.exists():
+            conn = sqlite_reader.connect(db_path)
+            try:
+                snapshot = sqlite_reader.load_account_snapshot(conn, source=source, account_id=account_id)
+            finally:
+                conn.close()
+            account_snapshot = _with_snapshot_positions(snapshot, source=source, account_id=account_id)
+        else:
+            payload = _load_journal_state(venue=venue)
+            account = payload.get("account")
+            if isinstance(account, dict):
+                account_snapshot = account
+    else:
+        payload = _load_journal_state(venue=venue)
+        account = payload.get("account")
+        if isinstance(account, dict):
+            account_snapshot = account
+        if venue != "all":
+            source = venue
+            account_id = None
+        else:
+            source = "all"
+            account_id = None
+
+    account = account_snapshot or {}
+    positions = []
+    if source_param or account_id_param:
+        if isinstance(account, dict):
+            positions = account.get("open_positions") or []
+    else:
+        payload_positions = payload.get("open_positions") if "payload" in locals() else None
+        if isinstance(payload_positions, list):
+            positions = payload_positions
+        elif isinstance(account, dict):
+            positions = account.get("open_positions") or []
+
+    return {
+        "source": source,
+        "account_id": account_id,
+        "account": {
+            "total_equity": account.get("total_equity") if isinstance(account, dict) else None,
+            "available_balance": account.get("available_balance") if isinstance(account, dict) else None,
+            "margin_balance": account.get("margin_balance") if isinstance(account, dict) else None,
+            "timestamp": account.get("timestamp") if isinstance(account, dict) else None,
+        },
+        "open_positions": positions,
+    }
+
+
+@app.get("/api/sync-state")
+def sync_state_api(request: Request) -> dict[str, Any]:
+    db_path = _resolve_db_path()
+    if db_path is None or not db_path.exists():
+        raise HTTPException(status_code=404, detail="Database not found.")
+
+    context = resolve_account_context(env=os.environ)
+    source = request.query_params.get("source") or context.source
+    account_id = request.query_params.get("account_id") or context.account_id
+    endpoint_prefix = request.query_params.get("endpoint_prefix")
+
+    conn = sqlite_reader.connect(db_path)
+    try:
+        rows = sqlite_reader.load_sync_states(
+            conn,
+            source=source,
+            account_id=account_id,
+            endpoint_prefix=endpoint_prefix,
+        )
+    finally:
+        conn.close()
+    for row in rows:
+        row["cap_detected"] = bool(row.get("cap_detected"))
+    return {
+        "source": source,
+        "account_id": account_id,
+        "endpoint_prefix": endpoint_prefix,
+        "states": rows,
+    }
+
+
+def _load_journal_state(*, venue: str | None = None) -> dict[str, Any]:
+    context = resolve_account_context(env=os.environ)
+    selected_venue = (venue or context.source or "all").strip().lower()
+    if selected_venue not in {*_SUPPORTED_VENUES, "all"}:
+        selected_venue = "all"
     db_path = _resolve_db_path()
     if db_path is not None and db_path.exists():
-        return _load_journal_state_db(context, db_path)
+        return _load_journal_state_db(context, db_path, venue=selected_venue)
     (
         fills_path,
         funding_path,
@@ -289,7 +507,35 @@ def _load_journal_state() -> dict[str, Any]:
             "trades": [],
             "symbols": [],
             "liquidations": [],
+            "account": None,
+            "open_positions": [],
             "data_note": note,
+        }
+
+    if selected_venue not in {"all", context.source}:
+        return {
+            "summary": _empty_summary(),
+            "equity_curve": _equity_curve([]),
+            "daily_pnl": _daily_pnl([]),
+            "pnl_distribution": _pnl_distribution([]),
+            "time_performance": _time_performance([]),
+            "symbol_breakdown": _symbol_breakdown([]),
+            "performance_score": None,
+            "account": None,
+            "open_positions": [],
+            "account_context": {
+                "name": context.name,
+                "source": selected_venue,
+                "account_id": None,
+                "data_dir": str(context.data_dir),
+            },
+            "recent_trades": [],
+            "trades": [],
+            "trade_objects": [],
+            "symbols": [],
+            "liquidations": [],
+            "data_note": f"No local file data found for venue '{selected_venue}'.",
+            "orders": [],
         }
 
     ingest_result = load_fills(fills_path, source=context.source, account_id=context.account_id)
@@ -357,6 +603,14 @@ def _load_journal_state() -> dict[str, Any]:
             setattr(trade, "initial_risk", risk.risk_amount)
             risk_map[trade.trade_id] = risk
 
+    target_map: dict[str, Any] = {}
+    if orders:
+        for trade in trades:
+            target = initial_target_for_trade(trade, orders)
+            setattr(trade, "initial_target", target.target_price)
+            setattr(trade, "target_pnl", target.target_pnl)
+            target_map[trade.trade_id] = target
+
     metrics = (
         compute_aggregate_metrics(trades, initial_equity=context.starting_equity) if trades else None
     )
@@ -368,11 +622,20 @@ def _load_journal_state() -> dict[str, Any]:
             trade,
             liquidation_matches.get(trade.trade_id),
             risk_map.get(trade.trade_id),
+            target_map.get(trade.trade_id),
         )
         for trade in trades
     ]
     trade_items.sort(key=lambda item: item["exit_time"], reverse=True)
 
+    account_snapshot = _load_account_snapshot(context)
+    open_positions = _open_positions_from_snapshot(
+        account_snapshot,
+        source=context.source,
+        account_id=context.account_id,
+    )
+
+    account_snapshot = _load_account_snapshot(context)
     return {
         "summary": summary,
         "equity_curve": _equity_curve(trade_items),
@@ -381,10 +644,11 @@ def _load_journal_state() -> dict[str, Any]:
         "time_performance": _time_performance(trade_items),
         "symbol_breakdown": _symbol_breakdown(trade_items),
         "performance_score": performance_score,
-        "account": _load_account_snapshot(context),
+        "account": account_snapshot,
+        "open_positions": open_positions,
         "account_context": {
             "name": context.name,
-            "source": context.source,
+            "source": selected_venue,
             "account_id": context.account_id,
             "data_dir": str(context.data_dir),
         },
@@ -394,27 +658,44 @@ def _load_journal_state() -> dict[str, Any]:
         "symbols": sorted({item["symbol"] for item in trade_items}),
         "liquidations": liquidation_events,
         "data_note": data_note,
+        "orders": orders,
     }
 
 
-def _load_journal_state_db(context, db_path: Path) -> dict[str, Any]:
+def _load_journal_state_db(context, db_path: Path, *, venue: str) -> dict[str, Any]:
     conn = sqlite_reader.connect(db_path)
     from trade_journal.storage.sqlite_store import init_db
 
     init_db(conn)
     try:
-        fills = sqlite_reader.load_fills(conn, source=context.source, account_id=context.account_id)
+        active_keys = _active_account_keys_from_config()
+        fills = sqlite_reader.load_fills_all(conn)
+        fills = _filter_by_active_account_keys(fills, active_keys)
+        if venue != "all":
+            fills = [item for item in fills if item.source == venue]
         trades = reconstruct_trades(fills)
-        funding_events = sqlite_reader.load_funding(conn, source=context.source, account_id=context.account_id)
+        funding_events = sqlite_reader.load_funding_all(conn)
+        funding_events = _filter_by_active_account_keys(funding_events, active_keys)
+        if venue != "all":
+            funding_events = [item for item in funding_events if item.source == venue]
         attributions = apply_funding_events(trades, funding_events)
-        unmatched = sum(1 for item in attributions if item.matched_trade_id is None)
-        orders = sqlite_reader.load_orders(conn, source=context.source, account_id=context.account_id)
-        liquidation_events_raw = sqlite_reader.load_liquidations(
-            conn, source=context.source, account_id=context.account_id
-        )
-        equity_snapshots = sqlite_reader.load_equity_history(
-            conn, source=context.source, account_id=context.account_id
-        )
+        likely_open_keys = _latest_open_position_keys(conn, venue=venue)
+        unmatched = _material_unmatched_funding_count(attributions, likely_open_keys)
+        orders = sqlite_reader.load_orders_all(conn)
+        orders = _filter_by_active_account_keys(orders, active_keys)
+        if venue != "all":
+            orders = [item for item in orders if item.source == venue]
+        liquidation_events_raw = sqlite_reader.load_liquidations_all(conn)
+        liquidation_events_raw = _filter_by_active_account_keys(liquidation_events_raw, active_keys)
+        if venue != "all":
+            liquidation_events_raw = [item for item in liquidation_events_raw if item.source == venue]
+        equity_snapshots = sqlite_reader.load_equity_history_all(conn)
+        equity_snapshots = _filter_by_active_account_keys(equity_snapshots, active_keys)
+        if venue != "all":
+            equity_snapshots = [item for item in equity_snapshots if item.source == venue]
+        accounts = sqlite_reader.load_accounts(conn)
+        accounts = _filter_account_rows_by_active_keys(accounts, active_keys)
+        account_snapshot, open_positions = _load_account_snapshot_view(conn, venue=venue, default_context=context)
     finally:
         conn.close()
 
@@ -423,30 +704,31 @@ def _load_journal_state_db(context, db_path: Path) -> dict[str, Any]:
         data_note = "No fills found in database."
     if unmatched:
         data_note = _append_note(data_note, f"Unmatched funding events: {unmatched}.")
+    if venue in {"hyperliquid", "all"} and not liquidation_events_raw:
+        data_note = _append_note(data_note, "Hyperliquid liquidation events are currently unavailable from source data.")
 
-    app_config = load_app_config()
-    excursions_map: dict[str, dict[str, Any]] = {}
-    excursions_path = None
-    candidate = app_config.paths.excursions
-    if candidate and candidate.exists():
-        excursions_path = candidate
-    else:
-        candidate = resolve_data_path(None, context, "excursions.json")
-        if candidate.exists():
-            excursions_path = candidate
-    if excursions_path is not None:
-        try:
-            excursions_map = json.loads(excursions_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            data_note = _append_note(data_note, "Failed to parse excursions cache.")
-    elif trades:
+    excursions_map, excursions_found = _load_excursions_map(context, accounts, venue=venue)
+    if not excursions_found and trades:
         data_note = _append_note(data_note, "Excursions cache missing: MAE/MFE/ETD shown as n/a.")
 
     if excursions_map:
         _apply_excursions_cache(trades, excursions_map)
 
     if equity_snapshots:
-        _apply_equity(trades, equity_snapshots, context)
+        _apply_equity_multi(trades, equity_snapshots, accounts)
+
+    derived_open_positions = _open_positions_from_fills(fills)
+    if derived_open_positions:
+        existing_keys = {
+            (str(item.get("account_key") or ""), str(item.get("symbol") or ""), str(item.get("side") or ""))
+            for item in open_positions
+        }
+        for item in derived_open_positions:
+            key = (str(item.get("account_key") or ""), str(item.get("symbol") or ""), str(item.get("side") or ""))
+            if key in existing_keys:
+                continue
+            open_positions.append(item)
+        open_positions.sort(key=lambda item: (str(item.get("symbol") or ""), str(item.get("side") or "")))
 
     liquidation_matches = _match_liquidations(trades, liquidation_events_raw)
     liquidation_events = _build_liquidation_events(trades, liquidation_events_raw, liquidation_matches)
@@ -459,6 +741,14 @@ def _load_journal_state_db(context, db_path: Path) -> dict[str, Any]:
             setattr(trade, "initial_risk", risk.risk_amount)
             risk_map[trade.trade_id] = risk
 
+    target_map: dict[str, Any] = {}
+    if orders:
+        for trade in trades:
+            target = initial_target_for_trade(trade, orders)
+            setattr(trade, "initial_target", target.target_price)
+            setattr(trade, "target_pnl", target.target_pnl)
+            target_map[trade.trade_id] = target
+
     metrics = (
         compute_aggregate_metrics(trades, initial_equity=context.starting_equity) if trades else None
     )
@@ -470,11 +760,11 @@ def _load_journal_state_db(context, db_path: Path) -> dict[str, Any]:
             trade,
             liquidation_matches.get(trade.trade_id),
             risk_map.get(trade.trade_id),
+            target_map.get(trade.trade_id),
         )
         for trade in trades
     ]
     trade_items.sort(key=lambda item: item["exit_time"], reverse=True)
-
     return {
         "summary": summary,
         "equity_curve": _equity_curve(trade_items),
@@ -483,11 +773,12 @@ def _load_journal_state_db(context, db_path: Path) -> dict[str, Any]:
         "time_performance": _time_performance(trade_items),
         "symbol_breakdown": _symbol_breakdown(trade_items),
         "performance_score": performance_score,
-        "account": _load_account_snapshot(context),
+        "account": account_snapshot,
+        "open_positions": open_positions,
         "account_context": {
             "name": context.name,
-            "source": context.source,
-            "account_id": context.account_id,
+            "source": venue,
+            "account_id": None,
             "data_dir": str(context.data_dir),
             "db_path": str(db_path),
         },
@@ -506,17 +797,26 @@ def _load_analytics_state_db(db_path: Path) -> dict[str, Any]:
 
     init_db(conn)
     try:
+        active_keys = _active_account_keys_from_config()
         fills = sqlite_reader.load_fills_all(conn)
+        fills = _filter_by_active_account_keys(fills, active_keys)
         trades = reconstruct_trades(fills)
         funding_events = sqlite_reader.load_funding_all(conn)
+        funding_events = _filter_by_active_account_keys(funding_events, active_keys)
         attributions = apply_funding_events(trades, funding_events)
-        unmatched = sum(1 for item in attributions if item.matched_trade_id is None)
+        likely_open_keys = _latest_open_position_keys(conn, venue="all")
+        unmatched = _material_unmatched_funding_count(attributions, likely_open_keys)
         orders = sqlite_reader.load_orders_all(conn)
+        orders = _filter_by_active_account_keys(orders, active_keys)
         liquidation_events_raw = sqlite_reader.load_liquidations_all(conn)
+        liquidation_events_raw = _filter_by_active_account_keys(liquidation_events_raw, active_keys)
         equity_snapshots = sqlite_reader.load_equity_history_all(conn)
+        equity_snapshots = _filter_by_active_account_keys(equity_snapshots, active_keys)
         accounts = sqlite_reader.load_accounts(conn)
+        accounts = _filter_account_rows_by_active_keys(accounts, active_keys)
         tags = sqlite_reader.load_tags(conn, active_only=True)
         trade_tags = sqlite_reader.load_trade_tags(conn)
+        regimes = sqlite_reader.load_regime_series(conn)
     finally:
         conn.close()
 
@@ -526,22 +826,9 @@ def _load_analytics_state_db(db_path: Path) -> dict[str, Any]:
     if unmatched:
         data_note = _append_note(data_note, f"Unmatched funding events: {unmatched}.")
 
-    app_config = load_app_config()
-    excursions_map: dict[str, dict[str, Any]] = {}
-    excursions_path = None
-    candidate = app_config.paths.excursions
-    if candidate and candidate.exists():
-        excursions_path = candidate
-    else:
-        candidate = resolve_data_path(None, resolve_account_context(env=os.environ), "excursions.json")
-        if candidate.exists():
-            excursions_path = candidate
-    if excursions_path is not None:
-        try:
-            excursions_map = json.loads(excursions_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            data_note = _append_note(data_note, "Failed to parse excursions cache.")
-    elif trades:
+    context = resolve_account_context(env=os.environ)
+    excursions_map, excursions_found = _load_excursions_map(context, accounts, venue="all")
+    if not excursions_found and trades:
         data_note = _append_note(data_note, "Excursions cache missing: MAE/MFE/ETD shown as n/a.")
 
     if excursions_map:
@@ -561,18 +848,41 @@ def _load_analytics_state_db(db_path: Path) -> dict[str, Any]:
             setattr(trade, "initial_risk", risk.risk_amount)
             risk_map[trade.trade_id] = risk
 
+    target_map: dict[str, Any] = {}
+    if orders:
+        for trade in trades:
+            target = initial_target_for_trade(trade, orders)
+            setattr(trade, "initial_target", target.target_price)
+            setattr(trade, "target_pnl", target.target_pnl)
+            target_map[trade.trade_id] = target
+
     trade_items = [
         _trade_payload(
             trade,
             liquidation_matches.get(trade.trade_id),
             risk_map.get(trade.trade_id),
+            target_map.get(trade.trade_id),
         )
         for trade in trades
     ]
     trade_items.sort(key=lambda item: item["exit_time"], reverse=True)
 
     strategies = _apply_trade_tags(trade_items, tags, trade_tags)
-    active_accounts = [row for row in accounts if row.get("active", 1)]
+    _apply_regimes(trade_items, trades, regimes)
+    active_accounts = []
+    for row in accounts:
+        source = str(row.get("source") or "")
+        acct_id = str(row.get("account_id") or "")
+        scoped_key = account_key(source, acct_id)
+        label_name = str(row.get("name") or acct_id or scoped_key)
+        active_accounts.append(
+            {
+                **row,
+                "active": 1,
+                "account_key": scoped_key,
+                "label": f"{label_name} ({source})" if source else label_name,
+            }
+        )
 
     return {
         "trades": trade_items,
@@ -582,6 +892,8 @@ def _load_analytics_state_db(db_path: Path) -> dict[str, Any]:
         "data_note": data_note,
         "accounts": active_accounts,
         "strategies": strategies,
+        "orders": orders,
+        "regimes": regimes,
     }
 
 
@@ -638,6 +950,116 @@ def _resolve_paths(
     return fills_path, funding_path, liquidations_path, excursions_path, orders_path, equity_path
 
 
+def _load_excursions_map(
+    context,
+    accounts: list[dict[str, Any]],
+    *,
+    venue: str,
+) -> tuple[dict[str, dict[str, Any]], bool]:
+    app_config = load_app_config()
+    candidate = app_config.paths.excursions
+    paths: list[Path] = []
+    if candidate and candidate.exists():
+        paths.append(candidate)
+    else:
+        for account in accounts:
+            source = str(account.get("source") or "").strip().lower()
+            if venue != "all" and source != venue:
+                continue
+            raw = account.get("raw_json")
+            data_dir: str | None = None
+            if isinstance(raw, dict):
+                raw_dir = raw.get("data_dir")
+                if raw_dir:
+                    data_dir = str(raw_dir)
+            if not data_dir:
+                continue
+            path = Path(data_dir) / "excursions.json"
+            if path.exists():
+                paths.append(path)
+        fallback = resolve_data_path(None, context, "excursions.json")
+        if fallback.exists():
+            paths.append(fallback)
+
+    seen: set[Path] = set()
+    merged: dict[str, dict[str, Any]] = {}
+    found_any = False
+    for path in paths:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        found_any = True
+        for key, value in payload.items():
+            if isinstance(value, dict):
+                merged[str(key)] = value
+    return merged, found_any
+
+
+def _open_positions_from_fills(fills: list[Any]) -> list[dict[str, Any]]:
+    positions: dict[tuple[str, str], dict[str, Any]] = {}
+    for fill in fills:
+        source = getattr(fill, "source", "")
+        account_id = getattr(fill, "account_id", None)
+        symbol = getattr(fill, "symbol", None)
+        side = str(getattr(fill, "side", "")).upper()
+        size = getattr(fill, "size", None)
+        price = getattr(fill, "price", None)
+        if not symbol:
+            continue
+        try:
+            size_value = float(size)
+        except (TypeError, ValueError):
+            continue
+        if size_value <= 0:
+            continue
+        direction = 1.0 if side in {"BUY", "LONG"} else -1.0
+        key = (account_key(str(source or ""), account_id), str(symbol))
+        slot = positions.setdefault(
+            key,
+            {
+                "account_key": key[0],
+                "symbol": str(symbol),
+                "net_size": 0.0,
+                "last_price": None,
+            },
+        )
+        slot["net_size"] = float(slot["net_size"]) + direction * size_value
+        try:
+            slot["last_price"] = float(price)
+        except (TypeError, ValueError):
+            pass
+
+    output: list[dict[str, Any]] = []
+    for item in positions.values():
+        net_size = float(item.get("net_size") or 0.0)
+        if abs(net_size) <= _OPEN_POSITION_SIZE_EPSILON:
+            continue
+        output.append(
+            {
+                "account_key": item["account_key"],
+                "symbol": item["symbol"],
+                "side": "LONG" if net_size > 0 else "SHORT",
+                "size": abs(net_size),
+                "entry_price": item.get("last_price"),
+                "position_value": None,
+                "unrealized_pnl": None,
+                "leverage": None,
+                "margin_used": None,
+                "liquidation_price": None,
+                "return_on_equity": None,
+            }
+        )
+    output.sort(key=lambda item: (str(item.get("symbol") or ""), str(item.get("side") or "")))
+    return output
+
+
 def _resolve_db_path() -> Path | None:
     app_config = load_app_config()
     return app_config.app.db_path
@@ -654,7 +1076,7 @@ def _apply_equity_multi(
 ) -> None:
     fallback_equity = None
     account_map = {
-        str(account.get("account_id")): account
+        account_key(str(account.get("source") or ""), account.get("account_id")): account
         for account in accounts
         if account.get("account_id")
     }
@@ -667,10 +1089,10 @@ def _apply_equity_multi(
         snapshots_by_key[(snap.source, snap.account_id)].append(snap)
 
     for key, trade_group in trades_by_key.items():
-        account_id = key[1]
+        scoped_account_key = account_key(key[0], key[1])
         fallback = None
-        if account_id and account_id in account_map:
-            fallback = account_map[account_id].get("starting_equity")
+        if scoped_account_key in account_map:
+            fallback = account_map[scoped_account_key].get("starting_equity")
         if fallback is None:
             fallback = fallback_equity
         apply_equity_at_entry(
@@ -700,41 +1122,179 @@ async def _run_auto_sync_once() -> None:
         if _SYNC_LOCK.locked():
             return
         async with _SYNC_LOCK:
-            await asyncio.to_thread(_sync_once)
-            if _sync_runs_excursions():
+            did_sync = await asyncio.to_thread(_sync_once)
+            if did_sync and _sync_runs_excursions():
                 await asyncio.to_thread(_run_excursions, db_path)
+            if did_sync:
+                await asyncio.to_thread(_run_benchmark_bar_sync, db_path)
     except Exception as exc:
         print(f"Auto-sync failed: {exc}")
 
 
-def _sync_once() -> None:
+def _sync_once() -> bool:
     from trade_journal import sync_api
 
     app_config = load_app_config()
     env_path = app_config.app.env_path
-    sync_api.sync_once(
-        db_path=_resolve_db_path() or Path("data/trade_journal.sqlite"),
-        account=os.environ.get("TRADE_JOURNAL_ACCOUNT_NAME"),
-        env_path=env_path,
-        base_url=app_config.api.base_url,
-        limit=_sync_limit(),
-        max_pages=_sync_max_pages(),
-        overlap_hours=_sync_overlap_hours(),
-        end_ms=_sync_end_ms(),
-    )
+    db_path = _resolve_db_path() or Path("data/trade_journal.sqlite")
+    account_names = _auto_sync_account_names()
+    if not account_names:
+        return False
+    for account_name in account_names:
+        sync_api.sync_once(
+            db_path=db_path,
+            account=account_name,
+            env_path=env_path,
+            base_url=app_config.api.base_url,
+            limit=_sync_limit(),
+            max_pages=_sync_max_pages(),
+            overlap_hours=_sync_overlap_hours(),
+            end_ms=_sync_end_ms(),
+        )
+    return True
+
+
+def _auto_sync_account_names() -> list[str | None]:
+    forced_account = os.environ.get("TRADE_JOURNAL_ACCOUNT_NAME")
+    if forced_account:
+        return [forced_account]
+    config_path = Path(os.environ.get("TRADE_JOURNAL_ACCOUNTS_CONFIG", "config/accounts.toml"))
+    cfg = load_accounts_config(config_path)
+    if not cfg.accounts:
+        return [None]
+    active = [name for name, account in cfg.accounts.items() if account.active]
+    if active:
+        return active
+    return []
 
 
 def _run_excursions(db_path: Path) -> None:
     from trade_journal import compute_excursions
 
-    args = ["--db", str(db_path)]
-    account = os.environ.get("TRADE_JOURNAL_ACCOUNT_NAME")
-    if account:
-        args += ["--account", account]
+    app_config = load_app_config()
     max_points = _series_max_points()
-    if max_points is not None:
-        args += ["--series-max-points", str(max_points)]
-    compute_excursions.main(args)
+
+    def build_args(account_name: str | None) -> list[str]:
+        args = ["--db", str(db_path)]
+        if account_name:
+            args += ["--account", account_name]
+        if max_points is not None:
+            args += ["--series-max-points", str(max_points)]
+        return args
+
+    # If output paths are globally pinned, keep single-run behavior to avoid overwrite churn.
+    if app_config.paths.excursions is not None or app_config.paths.trade_series is not None:
+        compute_excursions.main(build_args(os.environ.get("TRADE_JOURNAL_ACCOUNT_NAME")))
+        return
+
+    forced_account = os.environ.get("TRADE_JOURNAL_ACCOUNT_NAME")
+    if forced_account:
+        compute_excursions.main(build_args(forced_account))
+        return
+
+    configured_names = [name for name in _auto_sync_account_names() if isinstance(name, str) and name]
+    if not configured_names:
+        compute_excursions.main(build_args(None))
+        return
+
+    for name in sorted(set(configured_names)):
+        compute_excursions.main(build_args(name))
+
+
+def _run_benchmark_bar_sync(db_path: Path) -> None:
+    from trade_journal import sync_api
+
+    app_config = load_app_config()
+    sync_api.sync_hyperliquid_benchmark_bars(
+        db_path=db_path,
+        env_path=app_config.app.env_path,
+        symbol="BTC-USDC",
+    )
+
+
+def _refresh_open_position_snapshots(venue: str) -> None:
+    now = datetime.now(timezone.utc)
+    targets = _contexts_for_venue(venue)
+    for context in targets:
+        source = context.source
+        last = _OPEN_POSITION_REFRESH_AT.get(source)
+        if last is not None and (now - last).total_seconds() < 15:
+            continue
+        if _refresh_single_snapshot(context):
+            _OPEN_POSITION_REFRESH_AT[source] = now
+
+
+def _contexts_for_venue(venue: str) -> list[AccountContext]:
+    env = os.environ
+    config_path = Path(env.get("TRADE_JOURNAL_ACCOUNTS_CONFIG", "config/accounts.toml"))
+    cfg = load_accounts_config(config_path)
+    if not cfg.accounts:
+        context = resolve_account_context(env=env)
+        return [context] if venue in {"all", context.source} else []
+    targets: list[AccountContext] = []
+    for name in cfg.accounts:
+        try:
+            context = resolve_account_context(name, env=env, config_path=config_path)
+        except Exception:
+            continue
+        if not context.active:
+            continue
+        if venue != "all" and context.source != venue:
+            continue
+        targets.append(context)
+    return targets
+
+
+def _refresh_single_snapshot(context: AccountContext) -> bool:
+    db_path = _resolve_db_path()
+    if db_path is None:
+        return False
+    conn = sqlite_connect(db_path)
+    init_db(conn)
+    try:
+        if context.source == "hyperliquid":
+            config = HyperliquidInfoConfig.from_env(os.environ)
+            client = HyperliquidInfoClient(config)
+            payload = client.fetch_clearinghouse_state(context.account_id or "")
+            snapshot = load_hyperliquid_clearinghouse_state_payload(
+                payload,
+                source=context.source,
+                account_id=context.account_id,
+            )
+            if snapshot is None:
+                return False
+            return upsert_account_snapshots(conn, [snapshot]) > 0
+        if context.source == "apex":
+            app_config = load_app_config()
+            env = dict(os.environ)
+            env.update(load_dotenv(app_config.app.env_path))
+            config = ApexApiConfig.from_env(env)
+            client = ApexApiClient(config)
+            payload = client.fetch_account()
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(data, dict):
+                return False
+            snapshot = {
+                "account_id": context.account_id,
+                "source": context.source,
+                "timestamp": _first_timestamp(data, "updatedTime", "updateTime", "timestamp")
+                or datetime.now(timezone.utc).isoformat(),
+                "total_equity": _first_float(data, "totalEquity", "totalAccountValue", "equity"),
+                "available_balance": _first_float(
+                    data,
+                    "availableBalance",
+                    "availableBalanceValue",
+                    "available",
+                ),
+                "margin_balance": _first_float(data, "marginBalance", "marginBalanceValue", "balance"),
+                "raw_json": data,
+            }
+            return upsert_account_snapshots(conn, [snapshot]) > 0
+        return False
+    except Exception:
+        return False
+    finally:
+        conn.close()
 
 
 def _sync_interval_seconds() -> int:
@@ -800,6 +1360,7 @@ def _trade_payload(
     trade,
     liquidation: dict[str, Any] | None,
     risk_summary,
+    target_summary,
 ) -> dict[str, Any]:
     metrics = compute_trade_metrics(trade)
     ui_id = _trade_ui_id(trade)
@@ -812,6 +1373,7 @@ def _trade_payload(
         "trade_id": trade.trade_id,
         "source": trade.source,
         "account_id": trade.account_id,
+        "account_key": account_key(trade.source, trade.account_id),
         "symbol": trade.symbol,
         "side": trade.side,
         "entry_time": trade.entry_time,
@@ -845,6 +1407,9 @@ def _trade_payload(
         "initial_risk": risk_summary.risk_amount if risk_summary else None,
         "r_multiple": risk_summary.r_multiple if risk_summary else None,
         "stop_source": risk_summary.source if risk_summary else None,
+        "initial_target": target_summary.target_price if target_summary else None,
+        "target_pnl": target_summary.target_pnl if target_summary else None,
+        "target_source": target_summary.source if target_summary else None,
     }
     for window, seconds in exposures.items():
         payload[f"exp_{window}_seconds"] = seconds
@@ -888,14 +1453,23 @@ def _apply_trade_tags(
 
 
 def _accounts_from_trades(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    account_ids_set: set[str] = set()
+    active_keys = _active_account_keys_from_config()
+    accounts: dict[str, dict[str, str]] = {}
     for item in items:
         account_id = item.get("account_id")
+        source = item.get("source")
         if not account_id:
             continue
-        account_ids_set.add(str(account_id))
-    account_ids = sorted(account_ids_set)
-    return [{"account_id": account_id, "name": account_id} for account_id in account_ids]
+        key = account_key(str(source or ""), account_id)
+        if active_keys is not None and key not in active_keys:
+            continue
+        accounts[key] = {
+            "account_key": key,
+            "account_id": str(account_id),
+            "source": str(source or ""),
+            "label": key,
+        }
+    return [accounts[key] for key in sorted(accounts)]
 
 
 def _strategies_from_trades(items: list[dict[str, Any]]) -> list[str]:
@@ -906,6 +1480,116 @@ def _strategies_from_trades(items: list[dict[str, Any]]) -> list[str]:
                 continue
             strategies.add(str(strategy))
     return sorted(strategies)
+
+
+def _active_account_keys_from_config() -> set[str] | None:
+    config_path = Path(os.environ.get("TRADE_JOURNAL_ACCOUNTS_CONFIG", "config/accounts.toml"))
+    cfg = load_accounts_config(config_path)
+    if not cfg.accounts:
+        return None
+    keys: set[str] = set()
+    for account in cfg.accounts.values():
+        if not account.active:
+            continue
+        keys.add(account_key(account.source, account.account_id or account.name))
+    return keys
+
+
+def _filter_by_active_account_keys(items: list[Any], active_keys: set[str] | None) -> list[Any]:
+    if active_keys is None:
+        return items
+    filtered: list[Any] = []
+    for item in items:
+        source = getattr(item, "source", "")
+        account_id = getattr(item, "account_id", None)
+        scoped = account_key(str(source or ""), account_id)
+        if scoped in active_keys:
+            filtered.append(item)
+    return filtered
+
+
+def _filter_account_rows_by_active_keys(
+    rows: list[dict[str, Any]],
+    active_keys: set[str] | None,
+) -> list[dict[str, Any]]:
+    if active_keys is None:
+        return rows
+    filtered: list[dict[str, Any]] = []
+    for row in rows:
+        scoped = account_key(str(row.get("source") or ""), row.get("account_id"))
+        if scoped in active_keys:
+            filtered.append(row)
+    return filtered
+
+
+def _latest_open_position_keys(conn, *, venue: str) -> set[tuple[str, str | None, str, str]]:
+    rows = conn.execute(
+        "SELECT source, account_id, raw_json, timestamp FROM account_snapshots ORDER BY timestamp DESC"
+    ).fetchall()
+    selected: dict[tuple[str, str | None], dict[str, Any]] = {}
+    for row in rows:
+        source = str(row["source"] or "").strip().lower()
+        if venue != "all" and source != venue:
+            continue
+        account_id = row["account_id"]
+        key = (source, account_id)
+        if key in selected:
+            continue
+        raw_payload: Any = {}
+        raw_json = row["raw_json"]
+        if isinstance(raw_json, str):
+            text = raw_json.strip()
+            if text:
+                try:
+                    raw_payload = json.loads(text)
+                except json.JSONDecodeError:
+                    raw_payload = {}
+        selected[key] = {
+            "source": source,
+            "account_id": account_id,
+            "raw": raw_payload,
+        }
+    keys: set[tuple[str, str | None, str, str]] = set()
+    for item in selected.values():
+        positions = _open_positions_from_snapshot(
+            {"raw": item.get("raw")},
+            source=str(item.get("source") or ""),
+            account_id=item.get("account_id"),
+        )
+        for pos in positions:
+            symbol = str(pos.get("symbol") or "").strip().upper()
+            side = _normalize_position_side(pos.get("side"))
+            if not symbol or side is None:
+                continue
+            keys.add((str(item.get("source") or ""), item.get("account_id"), symbol, side))
+    return keys
+
+
+def _material_unmatched_funding_count(
+    attributions: list[Any],
+    likely_open_keys: set[tuple[str, str | None, str, str]],
+) -> int:
+    count = 0
+    for item in attributions:
+        if item.matched_trade_id is not None:
+            continue
+        event = item.event
+        symbol = str(getattr(event, "symbol", "") or "").strip().upper()
+        side = _normalize_position_side(getattr(event, "side", None))
+        key = (str(getattr(event, "source", "") or ""), getattr(event, "account_id", None), symbol, side or "")
+        if side is not None and key in likely_open_keys:
+            continue
+        count += 1
+    return count
+
+
+def _normalize_position_side(value: Any) -> str | None:
+    text = str(value or "").strip().upper()
+    if text in {"LONG", "BUY", "B"}:
+        return "LONG"
+    if text in {"SHORT", "SELL", "S", "A"}:
+        return "SHORT"
+    return None
 
 
 def _trade_ui_id(trade) -> str:
@@ -947,7 +1631,7 @@ def _capture_heat_pct(trade) -> tuple[float | None, float | None]:
     mfe = trade.mfe
     if mfe is None or mfe <= 0:
         return None, None
-    capture_pct = (trade.realized_pnl_net / mfe) * 100.0
+    capture_pct = (trade.realized_pnl / mfe) * 100.0
     heat_pct = abs((trade.mae / mfe) * 100.0) if trade.mae is not None else None
     return capture_pct, heat_pct
 
@@ -959,6 +1643,14 @@ def _base_session_label(timestamp: datetime) -> str:
         if start <= minute < end:
             return label
     return "asia"
+
+
+def _timestamp_in_window(timestamp: datetime, window: tuple[int, int]) -> bool:
+    minute = _utc_minutes(timestamp)
+    start, end = window
+    if start <= end:
+        return start <= minute < end
+    return minute >= start or minute < end
 
 
 @lru_cache
@@ -1076,7 +1768,7 @@ def _build_liquidation_events(
             continue
         payload = dict(match)
         if payload.get("total_pnl") is None:
-            payload["total_pnl"] = trade.realized_pnl_net
+            payload["total_pnl"] = trade.realized_pnl
         output.append(payload)
 
     if not output:
@@ -1210,14 +1902,121 @@ def _empty_summary() -> dict[str, Any]:
     }
 
 
+def _load_account_snapshot_view(
+    conn,
+    *,
+    venue: str,
+    default_context,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    active_keys = _active_account_keys_from_config()
+    rows = conn.execute(
+        "SELECT source, account_id, total_equity, available_balance, margin_balance, timestamp, raw_json "
+        "FROM account_snapshots ORDER BY timestamp DESC"
+    ).fetchall()
+
+    selected: dict[tuple[str, str | None], dict[str, Any]] = {}
+    for row in rows:
+        source = str(row["source"] or "").strip().lower()
+        if venue != "all" and source != venue:
+            continue
+        account_id = row["account_id"]
+        scoped = account_key(source, account_id)
+        if active_keys is not None and scoped not in active_keys:
+            continue
+        key = (source, account_id)
+        if key in selected:
+            continue
+        raw_payload: Any = {}
+        raw_json = row["raw_json"]
+        if isinstance(raw_json, str):
+            text = raw_json.strip()
+            if text:
+                try:
+                    raw_payload = json.loads(text)
+                except json.JSONDecodeError:
+                    raw_payload = raw_json
+        selected[key] = {
+            "source": source,
+            "account_id": account_id,
+            "total_equity": row["total_equity"],
+            "available_balance": row["available_balance"],
+            "margin_balance": row["margin_balance"],
+            "timestamp": row["timestamp"],
+            "raw": raw_payload,
+        }
+
+    if not selected and venue in _SUPPORTED_VENUES:
+        fallback = sqlite_reader.load_account_snapshot(
+            conn, source=venue, account_id=default_context.account_id
+        )
+        if fallback is not None:
+            selected[(venue, default_context.account_id)] = {
+                "source": venue,
+                "account_id": default_context.account_id,
+                **fallback,
+            }
+
+    if not selected:
+        return None, []
+
+    open_positions: list[dict[str, Any]] = []
+    total_equity = 0.0
+    available_balance = 0.0
+    margin_balance = 0.0
+    has_total_equity = False
+    has_available_balance = False
+    has_margin_balance = False
+    latest_timestamp: str | None = None
+    for snapshot in selected.values():
+        wrapped = _with_snapshot_positions(
+            {
+                "total_equity": snapshot.get("total_equity"),
+                "available_balance": snapshot.get("available_balance"),
+                "margin_balance": snapshot.get("margin_balance"),
+                "timestamp": snapshot.get("timestamp"),
+                "raw": snapshot.get("raw"),
+            },
+            source=str(snapshot.get("source") or ""),
+            account_id=snapshot.get("account_id"),
+        )
+        if not wrapped:
+            continue
+        open_positions.extend(wrapped.get("open_positions") or [])
+        equity_value = wrapped.get("total_equity")
+        if equity_value is not None:
+            total_equity += float(equity_value)
+            has_total_equity = True
+        available_value = wrapped.get("available_balance")
+        if available_value is not None:
+            available_balance += float(available_value)
+            has_available_balance = True
+        margin_value = wrapped.get("margin_balance")
+        if margin_value is not None:
+            margin_balance += float(margin_value)
+            has_margin_balance = True
+        ts = wrapped.get("timestamp")
+        if isinstance(ts, str) and (latest_timestamp is None or ts > latest_timestamp):
+            latest_timestamp = ts
+
+    open_positions.sort(key=lambda item: (str(item.get("symbol") or ""), str(item.get("side") or "")))
+    aggregate = {
+        "total_equity": total_equity if has_total_equity else None,
+        "available_balance": available_balance if has_available_balance else None,
+        "margin_balance": margin_balance if has_margin_balance else None,
+        "timestamp": latest_timestamp,
+    }
+    return aggregate, open_positions
+
+
 def _load_account_snapshot(context) -> dict[str, Any] | None:
     db_path = _resolve_db_path()
-    if db_path is not None:
+    if db_path is not None and db_path.exists():
         conn = sqlite_reader.connect(db_path)
         try:
-            return sqlite_reader.load_account_snapshot(
+            snapshot = sqlite_reader.load_account_snapshot(
                 conn, source=context.source, account_id=context.account_id
             )
+            return _with_snapshot_positions(snapshot, source=context.source, account_id=context.account_id)
         finally:
             conn.close()
 
@@ -1243,7 +2042,118 @@ def _load_account_snapshot(context) -> dict[str, Any] | None:
     }
     if snapshot["total_equity"] is None and snapshot["available_balance"] is None:
         return None
-    return snapshot
+    return _with_snapshot_positions(snapshot, source=context.source, account_id=context.account_id)
+
+
+def _with_snapshot_positions(
+    snapshot: dict[str, Any] | None, *, source: str, account_id: str | None
+) -> dict[str, Any] | None:
+    if snapshot is None:
+        return None
+    merged = dict(snapshot)
+    merged["open_positions"] = _open_positions_from_snapshot(snapshot, source=source, account_id=account_id)
+    return merged
+
+
+def _open_positions_from_snapshot(
+    snapshot: dict[str, Any] | None, *, source: str, account_id: str | None
+) -> list[dict[str, Any]]:
+    if not snapshot:
+        return []
+    raw = snapshot.get("raw")
+    if not isinstance(raw, dict):
+        return []
+    account_scoped = account_key(source, account_id)
+    if source == "hyperliquid":
+        return _hyperliquid_open_positions(raw, account_scoped)
+    if source == "apex":
+        return _apex_open_positions(raw, account_scoped)
+    return []
+
+
+def _hyperliquid_open_positions(raw: dict[str, Any], account_scoped: str) -> list[dict[str, Any]]:
+    positions_raw = raw.get("assetPositions")
+    if not isinstance(positions_raw, list):
+        return []
+    positions: list[dict[str, Any]] = []
+    for item in positions_raw:
+        if not isinstance(item, dict):
+            continue
+        position = item.get("position")
+        if not isinstance(position, dict):
+            continue
+        coin = position.get("coin")
+        if not coin:
+            continue
+        size = _first_float(position, "szi", "size")
+        if size is None or abs(size) <= _OPEN_POSITION_SIZE_EPSILON:
+            continue
+        side = "LONG" if size > 0 else "SHORT"
+        symbol = f"{coin}-USDC"
+        positions.append(
+            {
+                "account_key": account_scoped,
+                "symbol": symbol,
+                "side": side,
+                "size": abs(size),
+                "entry_price": _first_float(position, "entryPx", "entryPrice"),
+                "position_value": _first_float(position, "positionValue"),
+                "unrealized_pnl": _first_float(position, "unrealizedPnl"),
+                "leverage": _first_float(position, "leverage", "leverageValue"),
+                "margin_used": _first_float(position, "marginUsed"),
+                "liquidation_price": _first_float(position, "liquidationPx", "liquidationPrice"),
+                "return_on_equity": _first_float(position, "returnOnEquity"),
+            }
+        )
+    positions.sort(key=lambda item: (item["symbol"], item["side"]))
+    return positions
+
+
+def _apex_open_positions(raw: dict[str, Any], account_scoped: str) -> list[dict[str, Any]]:
+    positions_raw = raw.get("positions")
+    if not isinstance(positions_raw, list):
+        return []
+    positions: list[dict[str, Any]] = []
+    for item in positions_raw:
+        if not isinstance(item, dict):
+            continue
+        size = _first_float(item, "size", "positionSize")
+        if size is None or abs(size) <= _OPEN_POSITION_SIZE_EPSILON:
+            continue
+        symbol = item.get("symbol")
+        side_text = str(item.get("side") or "").strip().upper()
+        side = "SHORT" if side_text == "SHORT" else "LONG"
+        entry_price = _first_float(item, "entryPrice", "avgEntryPrice")
+        unrealized_pnl = _first_float(item, "unrealizedPnl", "unrealizePnl")
+        position_value = _first_float(item, "positionValue")
+        if unrealized_pnl is None:
+            estimated_pnl, estimated_value = _estimate_open_position_pnl(
+                symbol=str(symbol) if symbol else "",
+                side=side,
+                size=abs(size),
+                entry_price=entry_price,
+            )
+            if estimated_pnl is not None:
+                unrealized_pnl = estimated_pnl
+            if position_value is None and estimated_value is not None:
+                position_value = estimated_value
+        positions.append(
+            {
+                "account_key": account_scoped,
+                "symbol": str(symbol) if symbol else "n/a",
+                "side": side,
+                "size": abs(size),
+                "entry_price": entry_price,
+                "position_value": position_value,
+                "unrealized_pnl": unrealized_pnl,
+                "leverage": _first_float(item, "leverage"),
+                "margin_used": _first_float(item, "marginUsed"),
+                "liquidation_price": _first_float(item, "liquidationPrice", "liqPrice"),
+                "return_on_equity": _first_float(item, "returnOnEquity"),
+            }
+        )
+    positions.sort(key=lambda item: (item["symbol"], item["side"]))
+    return positions
 
 
 def _resolve_trade_series_path(context) -> Path | None:
@@ -1268,6 +2178,90 @@ def _load_trade_series(path: Path) -> dict[str, list[dict[str, float | None]]]:
 def _price_interval() -> str:
     app_config = load_app_config()
     return str(app_config.pricing.interval)
+
+
+def _canonical_price_timeframe() -> str:
+    return "1m"
+
+
+def _load_trade_bars_db(conn, trade) -> list[PriceBar]:
+    start = trade.entry_time - timedelta(minutes=1)
+    end = trade.exit_time + timedelta(minutes=1)
+    rows = sqlite_reader.load_price_bars(
+        conn,
+        source=trade.source,
+        symbol=trade.symbol,
+        timeframe=_canonical_price_timeframe(),
+        start=start,
+        end=end,
+    )
+    output: list[PriceBar] = []
+    for row in rows:
+        ts = row.get("timestamp")
+        if not isinstance(ts, str):
+            continue
+        start_time = datetime.fromisoformat(ts)
+        if start_time.tzinfo is None:
+            start_time = start_time.replace(tzinfo=timezone.utc)
+        output.append(
+            PriceBar(
+                start_time=start_time,
+                end_time=start_time + timedelta(minutes=1),
+                open=float(row.get("open") or 0.0),
+                high=float(row.get("high") or 0.0),
+                low=float(row.get("low") or 0.0),
+                close=float(row.get("close") or 0.0),
+            )
+        )
+    output.sort(key=lambda item: item.start_time)
+    return output
+
+
+@lru_cache(maxsize=1)
+def _price_client_cached() -> ApexPriceClient:
+    app_config = load_app_config()
+    return ApexPriceClient(PriceSeriesConfig.from_settings(app_config.pricing))
+
+
+def _latest_symbol_price(symbol: str) -> float | None:
+    if not symbol:
+        return None
+    now = datetime.now(timezone.utc)
+    cached = _OPEN_POSITION_PRICE_CACHE.get(symbol)
+    if cached is not None:
+        ts, value = cached
+        if (now - ts).total_seconds() <= _OPEN_POSITION_PRICE_CACHE_TTL_SECONDS:
+            return value
+    # Use a short trailing window to avoid partial-current-bar coverage failures.
+    window_end = now - timedelta(minutes=1)
+    window_start = window_end - timedelta(minutes=15)
+    try:
+        bars = _price_client_cached().fetch_bars(symbol, window_start, window_end)
+    except Exception:
+        return None
+    if not bars:
+        return None
+    value = float(bars[-1].close)
+    _OPEN_POSITION_PRICE_CACHE[symbol] = (now, value)
+    return value
+
+
+def _estimate_open_position_pnl(
+    *,
+    symbol: str,
+    side: str,
+    size: float,
+    entry_price: float | None,
+) -> tuple[float | None, float | None]:
+    if entry_price is None:
+        return None, None
+    mark_price = _latest_symbol_price(symbol)
+    if mark_price is None:
+        return None, None
+    direction = -1.0 if side == "SHORT" else 1.0
+    unrealized = (mark_price - entry_price) * size * direction
+    position_value = mark_price * size
+    return unrealized, position_value
 
 
 def _first_float(data: dict[str, Any], *keys: str) -> float | None:
@@ -1313,7 +2307,7 @@ def _parse_analytics_filters(
     if outcome not in {"all", "win", "loss", "breakeven"}:
         outcome = "all"
 
-    account_ids = [str(account.get("account_id")) for account in accounts if account.get("account_id")]
+    account_ids = [str(account.get("account_key")) for account in accounts if account.get("account_key")]
     account = params.get("account", "all").strip()
     if not account or account.lower() == "all":
         account = "all"
@@ -1324,15 +2318,29 @@ def _parse_analytics_filters(
     if entry_session not in _BASE_SESSION_LABELS:
         entry_session = "all"
 
-    exit_session = params.get("exit_session", "all").strip().lower()
-    if exit_session not in _BASE_SESSION_LABELS:
+    exit_session_raw = params.get("exit_session", "all")
+    exit_session: str | list[str]
+    if not exit_session_raw:
         exit_session = "all"
+    else:
+        cleaned = [item.strip().lower() for item in exit_session_raw.split(",") if item.strip()]
+        valid_sessions = [item for item in cleaned if item in _BASE_SESSION_LABELS]
+        exit_session = valid_sessions or "all"
 
     session_alias = params.get("session")
     if exit_session == "all" and session_alias:
         alias_value = session_alias.strip().lower()
         if alias_value in _BASE_SESSION_LABELS:
-            exit_session = alias_value
+            exit_session = [alias_value]
+
+    exit_window_raw = params.get("exit_window", "all")
+    exit_window: str | list[str]
+    if not exit_window_raw:
+        exit_window = "all"
+    else:
+        cleaned = [item.strip().lower() for item in exit_window_raw.split(",") if item.strip()]
+        valid_windows = [item for item in cleaned if item in exposure_windows]
+        exit_window = valid_windows or "all"
 
     strategy = params.get("strategy", "all").strip()
     if not strategy or strategy.lower() == "all":
@@ -1364,7 +2372,15 @@ def _parse_analytics_filters(
     if entry_session != "all":
         query_parts.append(f"entry_session={entry_session}")
     if exit_session != "all":
-        query_parts.append(f"exit_session={exit_session}")
+        if isinstance(exit_session, list):
+            query_parts.append(f"exit_session={','.join(exit_session)}")
+        else:
+            query_parts.append(f"exit_session={exit_session}")
+    if exit_window != "all":
+        if isinstance(exit_window, list):
+            query_parts.append(f"exit_window={','.join(exit_window)}")
+        else:
+            query_parts.append(f"exit_window={exit_window}")
     if strategy != "all":
         query_parts.append(f"strategy={strategy}")
     if normalization != "usd":
@@ -1396,6 +2412,7 @@ def _parse_analytics_filters(
         "account": account,
         "entry_session": entry_session,
         "exit_session": exit_session,
+        "exit_window": exit_window,
         "strategy": strategy,
         "normalization": normalization,
         "exposure_filters": exposure_filters,
@@ -1449,12 +2466,33 @@ def _filter_trade_items(
             continue
         if filters["outcome"] != "all" and item["outcome"] != filters["outcome"]:
             continue
-        if filters["account"] != "all" and item.get("account_id") != filters["account"]:
+        if filters["account"] != "all" and item.get("account_key") != filters["account"]:
             continue
         if filters["entry_session"] != "all" and item.get("entry_session") != filters["entry_session"]:
             continue
-        if filters["exit_session"] != "all" and item.get("exit_session") != filters["exit_session"]:
-            continue
+        exit_session_filter = filters["exit_session"]
+        exit_window_filter = filters.get("exit_window", "all")
+        if exit_session_filter != "all" or exit_window_filter != "all":
+            match_session = False
+            match_window = False
+            if exit_session_filter != "all":
+                if isinstance(exit_session_filter, list):
+                    match_session = item.get("exit_session") in exit_session_filter
+                else:
+                    match_session = item.get("exit_session") == exit_session_filter
+            if exit_window_filter != "all":
+                windows = _exposure_windows()
+                if isinstance(exit_window_filter, list):
+                    for window_name in exit_window_filter:
+                        window = windows.get(window_name)
+                        if window and _timestamp_in_window(item["exit_time"], window):
+                            match_window = True
+                            break
+                else:
+                    window = windows.get(exit_window_filter)
+                    match_window = bool(window and _timestamp_in_window(item["exit_time"], window))
+            if not (match_session or match_window):
+                continue
         if filters["strategy"] != "all":
             strategies = item.get("strategy_tags") or []
             if filters["strategy"] not in strategies:
@@ -1591,12 +2629,300 @@ def _normalized_trade_items(
             normalized_items.append(item)
             continue
         payload = dict(item)
-        payload["pnl_value"] = trade.realized_pnl_net
+        payload["pnl_value"] = trade.realized_pnl
         payload["mae_value"] = trade.mae
         payload["mfe_value"] = trade.mfe
         payload["etd_value"] = trade.etd
         normalized_items.append(payload)
     return normalized_items
+
+
+def _diagnostics_phase2(trades: list[Trade], items: list[dict[str, Any]]) -> dict[str, Any]:
+    items_by_id = {item["trade_id"]: item for item in items}
+    capture_values: list[float] = []
+    heat_values: list[float] = []
+    early_exit_count = 0
+    early_exit_den = 0
+    exit_eff_num = 0.0
+    exit_eff_den = 0.0
+    stop_hit_count = 0
+    stop_hit_den = 0
+    target_hit_count = 0
+    target_hit_den = 0
+
+    for trade in trades:
+        item = items_by_id.get(trade.trade_id, {})
+        mfe = trade.mfe
+        if mfe is not None and mfe > 0:
+            if trade.realized_pnl > 0:
+                capture = (trade.realized_pnl / mfe) * 100.0
+                capture_values.append(capture)
+                early_exit_den += 1
+                if capture < _EARLY_EXIT_CAPTURE_PCT:
+                    early_exit_count += 1
+                exit_eff_num += trade.realized_pnl
+                exit_eff_den += mfe
+            if trade.mae is not None:
+                heat_values.append(abs(trade.mae) / mfe * 100.0)
+
+        initial_risk = getattr(trade, "initial_risk", None)
+        if initial_risk and trade.mae is not None:
+            stop_hit_den += 1
+            if trade.mae <= -initial_risk:
+                stop_hit_count += 1
+
+        target_hit, target_defined = _target_hit(trade, item)
+        if target_defined:
+            target_hit_den += 1
+            if target_hit:
+                target_hit_count += 1
+
+    return {
+        "mfe_capture_pct": _mean_value(capture_values),
+        "mae_tolerance_pct": _mean_value(heat_values),
+        "early_exit_rate": (early_exit_count / early_exit_den) if early_exit_den else None,
+        "exit_efficiency_pct": (exit_eff_num / exit_eff_den * 100.0) if exit_eff_den else None,
+        "stop_hit_rate": (stop_hit_count / stop_hit_den) if stop_hit_den else None,
+        "target_hit_rate": (target_hit_count / target_hit_den) if target_hit_den else None,
+        "counts": {
+            "early_exit_den": early_exit_den,
+            "stop_hit_den": stop_hit_den,
+            "target_hit_den": target_hit_den,
+        },
+    }
+
+
+def _target_hit(trade: Trade, item: dict[str, Any]) -> tuple[bool, bool]:
+    tags_by_type = item.get("tags_by_type") or {}
+    for tag_type in _TARGET_TAG_TYPES:
+        if tags_by_type.get(tag_type):
+            return True, True
+    target_pnl = getattr(trade, "target_pnl", None)
+    if target_pnl is None:
+        return False, False
+    if trade.mfe is None:
+        return False, True
+    return trade.mfe >= target_pnl, True
+
+
+def _strategy_attribution(
+    items: list[dict[str, Any]],
+    normalized_trades: list[Trade],
+) -> list[dict[str, Any]]:
+    trade_map = {trade.trade_id: trade for trade in normalized_trades}
+    buckets: dict[str, list[Trade]] = defaultdict(list)
+    for item in items:
+        strategies = item.get("strategy_tags") or []
+        for strategy in strategies:
+            trade = trade_map.get(item["trade_id"])
+            if trade is None:
+                continue
+            buckets[strategy].append(trade)
+
+    rows = []
+    for strategy, trades in sorted(buckets.items(), key=lambda pair: pair[0]):
+        metrics = compute_aggregate_metrics(trades) if trades else None
+        rows.append(
+            {
+                "strategy": strategy,
+                "trades": len(trades),
+                "win_rate": metrics.win_rate if metrics else None,
+                "profit_factor": metrics.profit_factor if metrics else None,
+                "expectancy": metrics.expectancy if metrics else None,
+                "net_pnl": metrics.total_net_pnl if metrics else 0.0,
+            }
+        )
+    rows.sort(key=lambda row: row["net_pnl"], reverse=True)
+    return rows
+
+
+def _size_bucket_attribution(
+    items: list[dict[str, Any]],
+    normalized_trades: list[Trade],
+) -> list[dict[str, Any]]:
+    edges = _size_bucket_edges()
+    trade_map = {trade.trade_id: trade for trade in normalized_trades}
+    buckets: dict[str, list[Trade]] = defaultdict(list)
+    for item in items:
+        notional = item.get("entry_price", 0.0) * item.get("entry_size", 0.0)
+        label = _size_bucket_label(notional, edges)
+        trade = trade_map.get(item["trade_id"])
+        if trade is None:
+            continue
+        buckets[label].append(trade)
+
+    rows = []
+    for label, trades in buckets.items():
+        metrics = compute_aggregate_metrics(trades) if trades else None
+        rows.append(
+            {
+                "bucket": label,
+                "trades": len(trades),
+                "win_rate": metrics.win_rate if metrics else None,
+                "profit_factor": metrics.profit_factor if metrics else None,
+                "expectancy": metrics.expectancy if metrics else None,
+                "net_pnl": metrics.total_net_pnl if metrics else 0.0,
+            }
+        )
+    return rows
+
+
+def _size_bucket_edges() -> list[float]:
+    app_config = load_app_config()
+    edges = list(app_config.analytics.size_buckets)
+    edges = [edge for edge in edges if edge > 0]
+    edges.sort()
+    return edges
+
+
+def _size_bucket_label(value: float, edges: list[float]) -> str:
+    for edge in edges:
+        if value < edge:
+            return f"<{_format_bucket(edge)}"
+    if edges:
+        return f">={_format_bucket(edges[-1])}"
+    return "all"
+
+
+def _format_bucket(value: float) -> str:
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.0f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.0f}k"
+    return f"{value:.0f}"
+
+
+def _regime_attribution(
+    items: list[dict[str, Any]],
+    normalized_trades: list[Trade],
+) -> list[dict[str, Any]]:
+    trade_map = {trade.trade_id: trade for trade in normalized_trades}
+    buckets: dict[str, list[Trade]] = defaultdict(list)
+    for item in items:
+        label = item.get("entry_regime")
+        if not label:
+            continue
+        trade = trade_map.get(item["trade_id"])
+        if trade is None:
+            continue
+        buckets[label].append(trade)
+
+    rows = []
+    for label, trades in sorted(buckets.items(), key=lambda pair: pair[0]):
+        metrics = compute_aggregate_metrics(trades) if trades else None
+        rows.append(
+            {
+                "regime": label,
+                "trades": len(trades),
+                "win_rate": metrics.win_rate if metrics else None,
+                "profit_factor": metrics.profit_factor if metrics else None,
+                "expectancy": metrics.expectancy if metrics else None,
+                "net_pnl": metrics.total_net_pnl if metrics else 0.0,
+            }
+        )
+    rows.sort(key=lambda row: row["net_pnl"], reverse=True)
+    return rows
+
+
+def _duration_charts(items: list[dict[str, Any]]) -> dict[str, Any]:
+    scatter = []
+    histogram = _duration_histogram(items)
+    for item in items:
+        duration = item.get("duration_seconds")
+        pnl = item.get("pnl_value", item.get("realized_pnl"))
+        if duration is None or pnl is None:
+            continue
+        scatter.append({"x": duration, "y": pnl})
+    return {"scatter": scatter, "histogram": histogram}
+
+
+def _duration_histogram(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    counts = [0 for _ in range(len(_DURATION_BINS_SECONDS) + 1)]
+    for item in items:
+        duration = item.get("duration_seconds")
+        if duration is None:
+            continue
+        idx = _duration_bucket_index(float(duration))
+        counts[idx] += 1
+
+    bins = []
+    prev = 0.0
+    for idx, edge in enumerate(_DURATION_BINS_SECONDS):
+        bins.append(
+            {
+                "label": _duration_label(prev, edge),
+                "start": prev,
+                "end": edge,
+                "count": counts[idx],
+            }
+        )
+        prev = edge
+    bins.append(
+        {
+            "label": f">{_format_duration(prev)}",
+            "start": prev,
+            "end": None,
+            "count": counts[-1],
+        }
+    )
+    return bins
+
+
+def _duration_bucket_index(value: float) -> int:
+    for idx, edge in enumerate(_DURATION_BINS_SECONDS):
+        if value < edge:
+            return idx
+    return len(_DURATION_BINS_SECONDS)
+
+
+def _duration_label(start: float, end: float) -> str:
+    return f"{_format_duration(start)}–{_format_duration(end)}"
+
+
+def _apply_regimes(
+    trade_items: list[dict[str, Any]],
+    trades: list[Trade],
+    regimes: list[dict[str, Any]],
+) -> None:
+    if not regimes:
+        return
+    regimes_by_key: dict[tuple[str, str | None], list[dict[str, Any]]] = defaultdict(list)
+    for regime in regimes:
+        source = regime.get("source") or ""
+        key = (str(source), regime.get("account_id"))
+        regimes_by_key[key].append(regime)
+    for series in regimes_by_key.values():
+        series.sort(key=lambda item: item.get("ts_start") or datetime.min.replace(tzinfo=timezone.utc))
+
+    items_by_id = {item["trade_id"]: item for item in trade_items}
+    for trade in trades:
+        item = items_by_id.get(trade.trade_id)
+        if item is None:
+            continue
+        key = (trade.source, trade.account_id)
+        series = regimes_by_key.get(key, [])
+        item["entry_regime"] = _regime_for_time(series, trade.entry_time)
+        item["exit_regime"] = _regime_for_time(series, trade.exit_time)
+
+
+def _regime_for_time(series: list[dict[str, Any]], timestamp: datetime) -> str | None:
+    ts = _ensure_utc(timestamp)
+    candidate = None
+    for regime in series:
+        start = regime.get("ts_start")
+        end = regime.get("ts_end")
+        if start is None:
+            continue
+        start = _ensure_utc(start)
+        end = _ensure_utc(end) if end is not None else None
+        if ts < start:
+            continue
+        if end is not None and ts > end:
+            continue
+        candidate = regime
+    if candidate is None:
+        return None
+    return candidate.get("regime_label")
 
 
 def _trades_from_items(trades: list[Trade], items: list[dict[str, Any]]) -> list[Trade]:
@@ -1684,18 +3010,11 @@ def _benchmark_window(filters: dict[str, Any], trades: list[dict[str, Any]]) -> 
     return start, end
 
 
-def _benchmark_candidates() -> tuple[list[str], list[str]]:
-    app_config = load_app_config()
-    interval = str(app_config.pricing.interval)
-    timeframes = []
-    if interval.endswith(("m", "h", "d")):
-        timeframes.append(interval)
-    else:
-        timeframes.extend([f"{interval}m", interval])
-    if "1m" not in timeframes:
-        timeframes.append("1m")
-    symbols = ["BTCUSDT", "BTC-USD", "BTC-USDT"]
-    return symbols, timeframes
+def _benchmark_candidates() -> tuple[str, list[str], list[str]]:
+    source = "hyperliquid"
+    symbols = ["BTC-USDC", "BTC-USDT", "BTCUSDT"]
+    timeframes = [_canonical_price_timeframe(), "5m"]
+    return source, symbols, timeframes
 
 
 def _benchmark_return(
@@ -1705,19 +3024,23 @@ def _benchmark_return(
     if db_path is None or window is None or not db_path.exists():
         return None
     start, end = window
-    symbols, timeframes = _benchmark_candidates()
+    source, symbols, timeframes = _benchmark_candidates()
     conn = sqlite_reader.connect(db_path)
     try:
         for symbol in symbols:
             for timeframe in timeframes:
-                rows = sqlite_reader.load_benchmark_prices(
+                aligned_start, aligned_end = _benchmark_aligned_window(start, end, timeframe=timeframe)
+                rows = sqlite_reader.load_price_bars(
                     conn,
+                    source=source,
                     symbol=symbol,
                     timeframe=timeframe,
-                    start=start,
-                    end=end,
+                    start=aligned_start,
+                    end=aligned_end,
                 )
                 if len(rows) < 2:
+                    continue
+                if not _benchmark_rows_fully_covered(rows, aligned_start, aligned_end, timeframe=timeframe):
                     continue
                 first_open = rows[0].get("open")
                 last_close = rows[-1].get("close")
@@ -1727,6 +3050,62 @@ def _benchmark_return(
     finally:
         conn.close()
     return None
+
+
+def _benchmark_aligned_window(
+    start: datetime,
+    end: datetime,
+    *,
+    timeframe: str,
+) -> tuple[datetime, datetime]:
+    step = _timeframe_delta(timeframe)
+    return _floor_time(start, step), _floor_time(end, step)
+
+
+def _benchmark_rows_fully_covered(
+    rows: list[dict[str, Any]],
+    aligned_start: datetime,
+    aligned_end: datetime,
+    *,
+    timeframe: str,
+) -> bool:
+    if not rows:
+        return False
+    step = _timeframe_delta(timeframe)
+    max_gap = step * 2
+    timestamps: list[datetime] = []
+    for row in rows:
+        raw_ts = row.get("timestamp")
+        if not isinstance(raw_ts, str):
+            continue
+        ts = datetime.fromisoformat(raw_ts)
+        timestamps.append(_ensure_utc(ts))
+    if len(timestamps) < 2:
+        return False
+    timestamps.sort()
+    if timestamps[0] > aligned_start:
+        return False
+    if timestamps[-1] < aligned_end:
+        return False
+    for prev, cur in zip(timestamps, timestamps[1:]):
+        if cur - prev > max_gap:
+            return False
+    return True
+
+
+def _timeframe_delta(timeframe: str) -> timedelta:
+    text = str(timeframe).strip().lower()
+    if text.endswith("m"):
+        minutes = int(text[:-1] or "1")
+        return timedelta(minutes=max(1, minutes))
+    return timedelta(minutes=1)
+
+
+def _floor_time(value: datetime, step: timedelta) -> datetime:
+    ts = int(_ensure_utc(value).timestamp())
+    step_seconds = max(1, int(step.total_seconds()))
+    floored = ts - (ts % step_seconds)
+    return datetime.fromtimestamp(floored, tz=timezone.utc)
 
 
 def _build_comparisons(
@@ -1815,7 +3194,7 @@ def _diagnostics_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
             "y": item.get("mfe_value", item["mfe"]),
             "symbol": item["symbol"],
             "trade_id": item["ui_id"],
-            "pnl": item.get("pnl_value", item["realized_pnl_net"]),
+            "pnl": item.get("pnl_value", item["realized_pnl"]),
             "mae": item.get("mae_value", item["mae"]),
             "mfe": item.get("mfe_value", item["mfe"]),
             "capture_pct": item.get("capture_pct"),
@@ -1828,10 +3207,10 @@ def _diagnostics_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
     mfe_pnl = [
         {
             "x": item.get("mfe_value", item["mfe"]),
-            "y": item.get("pnl_value", item["realized_pnl_net"]),
+            "y": item.get("pnl_value", item["realized_pnl"]),
             "symbol": item["symbol"],
             "trade_id": item["ui_id"],
-            "pnl": item.get("pnl_value", item["realized_pnl_net"]),
+            "pnl": item.get("pnl_value", item["realized_pnl"]),
             "mae": item.get("mae_value", item["mae"]),
             "mfe": item.get("mfe_value", item["mfe"]),
             "capture_pct": item.get("capture_pct"),
@@ -1843,7 +3222,7 @@ def _diagnostics_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
     table = [
         {
             "symbol": item["symbol"],
-            "pnl": item.get("pnl_value", item["realized_pnl_net"]),
+            "pnl": item.get("pnl_value", item["realized_pnl"]),
             "mae": item.get("mae_value", item["mae"]),
             "mfe": item.get("mfe_value", item["mfe"]),
             "etd": item.get("etd_value", item["etd"]),
@@ -1900,7 +3279,7 @@ def _equity_curve(trades: list[dict[str, Any]]) -> dict[str, Any]:
     cumulative = 0.0
     points = []
     for item in ordered:
-        pnl_value = item.get("pnl_value", item["realized_pnl_net"])
+        pnl_value = item.get("pnl_value", item["realized_pnl"])
         cumulative += pnl_value
         points.append(
             {
@@ -1919,7 +3298,7 @@ def _daily_pnl(trades: list[dict[str, Any]]) -> dict[str, Any]:
     buckets: dict[str, float] = defaultdict(float)
     for item in trades:
         day = item["exit_time"].date().isoformat()
-        buckets[day] += item.get("pnl_value", item["realized_pnl_net"])
+        buckets[day] += item.get("pnl_value", item["realized_pnl"])
     series = [
         {"day": day, "pnl": pnl}
         for day, pnl in sorted(buckets.items(), key=lambda pair: pair[0])
@@ -1932,8 +3311,8 @@ def _time_performance(trades: list[dict[str, Any]]) -> dict[str, Any]:
     weekday: dict[int, list[float]] = defaultdict(list)
     for item in trades:
         exit_local = item["exit_time"].astimezone()
-        hourly[exit_local.hour].append(item["realized_pnl_net"])
-        weekday[exit_local.weekday()].append(item["realized_pnl_net"])
+        hourly[exit_local.hour].append(item["realized_pnl"])
+        weekday[exit_local.weekday()].append(item["realized_pnl"])
     return {
         "hourly": [_bucket_summary(hour, values) for hour, values in sorted(hourly.items())],
         "weekday": [_bucket_summary(day, values) for day, values in sorted(weekday.items())],
@@ -1946,13 +3325,13 @@ def _symbol_breakdown(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
         buckets[item["symbol"]].append(item)
     rows = []
     for symbol, items in sorted(buckets.items(), key=lambda pair: pair[0]):
-        wins = sum(1 for item in items if item["realized_pnl_net"] > 0)
-        losses = sum(1 for item in items if item["realized_pnl_net"] < 0)
+        wins = sum(1 for item in items if item["realized_pnl"] > 0)
+        losses = sum(1 for item in items if item["realized_pnl"] < 0)
         total = len(items)
         win_rate = wins / (wins + losses) if wins + losses else None
-        total_net = sum(item["realized_pnl_net"] for item in items)
-        total_win = sum(item["realized_pnl_net"] for item in items if item["realized_pnl_net"] > 0)
-        total_loss = sum(item["realized_pnl_net"] for item in items if item["realized_pnl_net"] < 0)
+        total_net = sum(item["realized_pnl"] for item in items)
+        total_win = sum(item["realized_pnl"] for item in items if item["realized_pnl"] > 0)
+        total_loss = sum(item["realized_pnl"] for item in items if item["realized_pnl"] < 0)
         profit_factor = None
         if total_loss < 0:
             profit_factor = total_win / abs(total_loss)
@@ -1995,12 +3374,12 @@ def _calendar_data(trades: list[dict[str, Any]], month_param: str | None = None)
         day = item["exit_time"].astimezone().date()
         key = day.isoformat()
         bucket = daily_buckets.setdefault(key, {"pnl": 0.0, "trades": []})
-        bucket["pnl"] += item.get("pnl_value", item["realized_pnl_net"])
+        bucket["pnl"] += item.get("pnl_value", item["realized_pnl"])
         bucket["trades"].append(
             {
                 "symbol": item["symbol"],
                 "side": item["side"],
-                "pnl": item.get("pnl_value", item["realized_pnl_net"]),
+                "pnl": item.get("pnl_value", item["realized_pnl"]),
                 "exit_time": item["exit_time"],
             }
         )
@@ -2078,7 +3457,7 @@ def _shift_month(value: date, delta: int) -> date:
 
 
 def _pnl_distribution(trades: list[dict[str, Any]]) -> dict[str, Any]:
-    values = [item["realized_pnl_net"] for item in trades]
+    values = [item["realized_pnl"] for item in trades]
     if not values:
         return {"bins": []}
 
@@ -2151,6 +3530,12 @@ def _pnl_distribution(trades: list[dict[str, Any]]) -> dict[str, Any]:
     return {"bins": bins, "low": low, "high": high}
 
 
+def _mean_value(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
 def _format_money(value: float) -> str:
     sign = "-" if value < 0 else ""
     return f"{sign}${abs(value):.2f}"
@@ -2193,24 +3578,50 @@ def duration_filter(seconds: float | None) -> str:
     return _format_duration(seconds)
 
 
-def timestamp_filter(value: datetime | None) -> str:
-    if value is None:
+def _coerce_datetime(value: Any) -> datetime | None:
+    if value is None or isinstance(value, Undefined):
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    return None
+
+
+def timestamp_filter(value: Any) -> str:
+    parsed = _coerce_datetime(value)
+    if parsed is None:
         return "n/a"
-    local = value.astimezone()
+    local = parsed.astimezone()
     return local.strftime("%b %d, %Y %H:%M")
 
 
-def date_only_filter(value: datetime | None) -> str:
-    if value is None:
+def date_only_filter(value: Any) -> str:
+    parsed = _coerce_datetime(value)
+    if parsed is None:
         return "n/a"
-    local = value.astimezone()
+    local = parsed.astimezone()
     return local.strftime("%b %d, %Y")
 
 
-def iso_filter(value: datetime | None) -> str:
-    if value is None:
+def iso_filter(value: Any) -> str:
+    parsed = _coerce_datetime(value)
+    if parsed is None:
         return ""
-    return value.astimezone().isoformat()
+    return parsed.astimezone().isoformat()
 
 
 def json_filter(value: Any) -> str:
